@@ -64,6 +64,7 @@ TEST(gemm_rectangular) {
 
 int main(){
     printf("\n=== DX12 GEMM Tests ===\n\n");
+
     dx12_result r=dx12_device_create(-1,&g_dev);
     if(r!=DX12_OK){printf("Device creation failed: %d\n",r);return 1;}
     RUN(gemm_f16_small);

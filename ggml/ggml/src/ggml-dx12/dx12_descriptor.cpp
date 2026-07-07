@@ -84,21 +84,25 @@ static ComPtr<ID3D12RootSignature> dx12_build_root_signature(dx12_device* dev,
             // Param 0: CBV (constants)
             CD3DX12_ROOT_PARAMETER1 cbv_param;
             cbv_param.InitAsConstants(8, 0); // b0, 8 uints
+            cbv_param.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
             params.push_back(cbv_param);
 
             // Param 1: SRV (input A) - via root descriptor
             CD3DX12_ROOT_PARAMETER1 srv0_param;
             srv0_param.InitAsShaderResourceView(0); // t0
+            srv0_param.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
             params.push_back(srv0_param);
 
             // Param 2: SRV (input B) - via root descriptor
             CD3DX12_ROOT_PARAMETER1 srv1_param;
             srv1_param.InitAsShaderResourceView(1); // t1
+            srv1_param.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
             params.push_back(srv1_param);
 
             // Param 3: UAV (output) - via root descriptor
             CD3DX12_ROOT_PARAMETER1 uav_param;
             uav_param.InitAsUnorderedAccessView(0); // u0
+            uav_param.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
             params.push_back(uav_param);
             break;
         }
@@ -221,18 +225,11 @@ static ComPtr<ID3D12RootSignature> dx12_build_root_signature(dx12_device* dev,
         }
     }
 
-    // Static sampler (not needed for compute, but include for completeness)
-    CD3DX12_STATIC_SAMPLER_DESC static_sampler(
-        0, D3D12_FILTER_MIN_MAG_MIP_LINEAR,
-        D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-        D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
-
     CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC sig_desc;
     sig_desc.Init_1_1(
         static_cast<UINT>(params.size()), params.data(),
-        1, &static_sampler,
-        D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT |
-        D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED);
+        0, nullptr,
+        D3D12_ROOT_SIGNATURE_FLAG_NONE);
 
     ComPtr<ID3DBlob> sig_blob;
     ComPtr<ID3DBlob> error_blob;

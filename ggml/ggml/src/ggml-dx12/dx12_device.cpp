@@ -25,10 +25,25 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // These are consumed by the Windows loader before D3D12CreateDevice is called
-// Only effective when built as DLL; for EXE builds, define DX12_SYSTEM_D3D12
+// When built as DLL, exports work automatically.
+// When built as EXE, link with agility_exports.def or define DX12_SYSTEM_D3D12
+// and load agility_shim.dll before D3D12CreateDevice.
 #if !defined(DX12_SYSTEM_D3D12)
 extern "C" { __declspec(dllexport) extern const UINT D3D12SDKVersion = 721; }
 extern "C" { __declspec(dllexport) extern const char* D3D12SDKPath = ".\\D3D12\\"; }
+#elif defined(DX12_AGILITY_EXPORTS)
+extern "C" { extern const UINT D3D12SDKVersion = 721; }
+extern "C" { extern const char* D3D12SDKPath = ".\\D3D12\\"; }
+#else
+static HMODULE g_agility_shim = nullptr;
+
+static void dx12_load_agility_shim() {
+    if (g_agility_shim) return;
+    g_agility_shim = LoadLibraryA("agility_shim.dll");
+    if (g_agility_shim) {
+        dx12_log(DX12_LOG_INFO, "Loaded Agility SDK shim (agility_shim.dll)");
+    }
+}
 #endif
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -401,12 +416,29 @@ dx12_result dx12_device_create(int32_t adapter_index, dx12_device** out_device) 
     if (!out_device) return DX12_ERROR_INVALID_ARGUMENT;
     *out_device = nullptr;
 
+    // Enable SM 6.10 experimental features (DXLA, wave matrix, etc.)
+    static bool s_features_enabled = false;
+    if (!s_features_enabled) {
+        UUID experimental[] = { D3D12ExperimentalShaderModels };
+        HRESULT hr_exp = D3D12EnableExperimentalFeatures(1, experimental, nullptr, nullptr);
+        s_features_enabled = true;
+        if (SUCCEEDED(hr_exp)) {
+            dx12_log(DX12_LOG_INFO, "Experimental shader models enabled (SM 6.10+)");
+        } else if (hr_exp != E_NOTIMPL) {
+            dx12_log(DX12_LOG_WARN, "D3D12EnableExperimentalFeatures failed: 0x%08X", hr_exp);
+        }
+    }
+
     // Enable debug layer in debug builds
 #ifdef DX12_DEBUG_LAYER
     dx12_enable_debug_layer();
 #ifdef DX12_GPU_VALIDATION
     dx12_enable_gpu_validation();
 #endif
+#endif
+
+#if defined(DX12_SYSTEM_D3D12) && !defined(DX12_AGILITY_EXPORTS)
+    dx12_load_agility_shim();
 #endif
 
     auto* dev = new dx12_device();
