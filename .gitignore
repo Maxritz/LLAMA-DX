@@ -1,0 +1,46 @@
+# Build artifacts
+build/
+build-*/
+out/
+cmake-build-*/
+
+# VS
+.vs/
+*.vcxproj*
+*.sln
+*.user
+*.suo
+*.sdf
+*.opensdf
+*.filters
+*.log
+Debug/
+Release/
+x64/
+x86/
+ARM64/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+CMakeUserPresets.json
+_deps/
+
+# Compiled shaders
+*.cso
+*.dxil
+*.pdb
+
+# Windows SDK temp
+D3D12/
