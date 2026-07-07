@@ -1,0 +1,14 @@
+# Target labels
+ agilitysdk-populate
+# Source files and their labels
+E:/DXllama/LLAMA-DX/ggml/ggml/src/ggml-dx12/build/_deps/agilitysdk-subbuild/CMakeFiles/agilitysdk-populate
+E:/DXllama/LLAMA-DX/ggml/ggml/src/ggml-dx12/build/_deps/agilitysdk-subbuild/CMakeFiles/49826b3e71671fc1c768f32d253bea9b/agilitysdk-populate.rule
+E:/DXllama/LLAMA-DX/ggml/ggml/src/ggml-dx12/build/_deps/agilitysdk-subbuild/CMakeFiles/0db5c16f7bc0f56626782ca65808cb15/agilitysdk-populate-complete.rule
+E:/DXllama/LLAMA-DX/ggml/ggml/src/ggml-dx12/build/_deps/agilitysdk-subbuild/CMakeFiles/f0e8c1e126d23a4e599fca2b2ad0c564/agilitysdk-populate-build.rule
+E:/DXllama/LLAMA-DX/ggml/ggml/src/ggml-dx12/build/_deps/agilitysdk-subbuild/CMakeFiles/f0e8c1e126d23a4e599fca2b2ad0c564/agilitysdk-populate-configure.rule
+E:/DXllama/LLAMA-DX/ggml/ggml/src/ggml-dx12/build/_deps/agilitysdk-subbuild/CMakeFiles/f0e8c1e126d23a4e599fca2b2ad0c564/agilitysdk-populate-download.rule
+E:/DXllama/LLAMA-DX/ggml/ggml/src/ggml-dx12/build/_deps/agilitysdk-subbuild/CMakeFiles/f0e8c1e126d23a4e599fca2b2ad0c564/agilitysdk-populate-install.rule
+E:/DXllama/LLAMA-DX/ggml/ggml/src/ggml-dx12/build/_deps/agilitysdk-subbuild/CMakeFiles/f0e8c1e126d23a4e599fca2b2ad0c564/agilitysdk-populate-mkdir.rule
+E:/DXllama/LLAMA-DX/ggml/ggml/src/ggml-dx12/build/_deps/agilitysdk-subbuild/CMakeFiles/f0e8c1e126d23a4e599fca2b2ad0c564/agilitysdk-populate-patch.rule
+E:/DXllama/LLAMA-DX/ggml/ggml/src/ggml-dx12/build/_deps/agilitysdk-subbuild/CMakeFiles/f0e8c1e126d23a4e599fca2b2ad0c564/agilitysdk-populate-test.rule
+E:/DXllama/LLAMA-DX/ggml/ggml/src/ggml-dx12/build/_deps/agilitysdk-subbuild/CMakeFiles/f0e8c1e126d23a4e599fca2b2ad0c564/agilitysdk-populate-update.rule

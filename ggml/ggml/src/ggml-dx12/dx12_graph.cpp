@@ -8,6 +8,7 @@
 #include "dx12_shader.h"
 #include "dx12_gemm.h"
 #include "dx12_quantize.h"
+#include <ggml-impl.h>
 #include <cstring>
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -24,11 +25,10 @@ bool dx12_op_supported(ggml_op op, const ggml_tensor* src0, const ggml_tensor* s
         case GGML_OP_MUL:
         case GGML_OP_MUL_MAT:
         case GGML_OP_SCALE:
-        case GGML_OP_SILU:
-        case GGML_OP_GELU:
+        case GGML_OP_UNARY:
         case GGML_OP_SOFT_MAX:
         case GGML_OP_RMS_NORM:
-        case GGML_OP_LAYER_NORM:
+        case GGML_OP_NORM:
         case GGML_OP_ROPE:
         case GGML_OP_DIAG_MASK_INF:
         case GGML_OP_GET_ROWS:
@@ -39,17 +39,20 @@ bool dx12_op_supported(ggml_op op, const ggml_tensor* src0, const ggml_tensor* s
             return true;
 
         // Partially supported / needs attention fusion
-        case GGML_OP_FLASH_ATTN:
-        case GGML_OP_FLASH_FF:
+        // FLASH_ATTN and FLASH_FF merged into FLASH_ATTN_EXT in this ggml version
+        case GGML_OP_FLASH_ATTN_EXT:
             return true; // Decomposed into individual ops
 
+        // SSM ops — used by Mamba-family models (not yet implemented)
+        case GGML_OP_SSM_CONV:
+        case GGML_OP_SSM_SCAN:
+
         // Not yet supported
-        case GGML_OP_CONV_1D:
         case GGML_OP_CONV_2D:
         case GGML_OP_POOL_1D:
         case GGML_OP_POOL_2D:
-        case GGML_OP_MAP_UNARY:
-        case GGML_OP_MAP_BINARY:
+        case GGML_OP_MAP_CUSTOM1:
+        case GGML_OP_MAP_CUSTOM2:
         default:
             return false;
     }
@@ -114,15 +117,32 @@ void dx12_graph_compute(dx12_device* dev, ggml_cgraph* graph) {
             case GGML_OP_MUL:           ok = dx12_dispatch_mul(dev, cmd, node); break;
             case GGML_OP_MUL_MAT:       ok = dx12_dispatch_mul_mat(dev, cmd, node); break;
             case GGML_OP_SCALE:         ok = dx12_dispatch_scale(dev, cmd, node); break;
-            case GGML_OP_SILU:          ok = dx12_dispatch_silu(dev, cmd, node); break;
-            case GGML_OP_GELU:          ok = dx12_dispatch_gelu(dev, cmd, node); break;
+            case GGML_OP_UNARY:
+                switch (ggml_get_unary_op(node)) {
+                    case GGML_UNARY_OP_SILU: ok = dx12_dispatch_silu(dev, cmd, node); break;
+                    case GGML_UNARY_OP_GELU: ok = dx12_dispatch_gelu(dev, cmd, node); break;
+                    default:
+                        dx12_log(DX12_LOG_WARN, "Unary op %s not dispatched", ggml_unary_op_name(ggml_get_unary_op(node)));
+                        ok = true;
+                        break;
+                }
+                break;
             case GGML_OP_SOFT_MAX:      ok = dx12_dispatch_soft_max(dev, cmd, node); break;
             case GGML_OP_RMS_NORM:      ok = dx12_dispatch_rms_norm(dev, cmd, node); break;
-            case GGML_OP_LAYER_NORM:    ok = dx12_dispatch_layer_norm(dev, cmd, node); break;
+            case GGML_OP_NORM:    ok = dx12_dispatch_layer_norm(dev, cmd, node); break;
             case GGML_OP_ROPE:          ok = dx12_dispatch_rope(dev, cmd, node); break;
             case GGML_OP_DIAG_MASK_INF: ok = dx12_dispatch_diag_mask_inf(dev, cmd, node); break;
             case GGML_OP_GET_ROWS:      ok = dx12_dispatch_get_rows(dev, cmd, node); break;
             case GGML_OP_PERMUTE:       ok = dx12_dispatch_permute(dev, cmd, node); break;
+            // SSM ops — used by Mamba-family models (not yet implemented on DX12)
+            // Unreachable in the normal ggml_backend_sched path — the scheduler
+            // filters these via dx12_op_supported() before this switch ever sees them.
+            // Kept as a hard-fail guard for standalone/direct graph_compute calls.
+            case GGML_OP_SSM_CONV:
+            case GGML_OP_SSM_SCAN:
+                dx12_log(DX12_LOG_ERROR, "SSM op %s not implemented on DX12", ggml_op_name(node->op));
+                ok = false;
+                break;
             case GGML_OP_CPY:           ok = dx12_dispatch_cpy(dev, cmd, node); break;
             case GGML_OP_NONE:          ok = dx12_dispatch_none(dev, cmd, node); break;
             case GGML_OP_COUNT:         ok = dx12_dispatch_count(dev, cmd, node); break;

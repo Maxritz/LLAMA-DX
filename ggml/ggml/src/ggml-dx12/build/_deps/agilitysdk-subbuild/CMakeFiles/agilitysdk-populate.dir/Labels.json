@@ -1,0 +1,46 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "E:/DXllama/LLAMA-DX/ggml/ggml/src/ggml-dx12/build/_deps/agilitysdk-subbuild/CMakeFiles/agilitysdk-populate"
+		},
+		{
+			"file" : "E:/DXllama/LLAMA-DX/ggml/ggml/src/ggml-dx12/build/_deps/agilitysdk-subbuild/CMakeFiles/49826b3e71671fc1c768f32d253bea9b/agilitysdk-populate.rule"
+		},
+		{
+			"file" : "E:/DXllama/LLAMA-DX/ggml/ggml/src/ggml-dx12/build/_deps/agilitysdk-subbuild/CMakeFiles/0db5c16f7bc0f56626782ca65808cb15/agilitysdk-populate-complete.rule"
+		},
+		{
+			"file" : "E:/DXllama/LLAMA-DX/ggml/ggml/src/ggml-dx12/build/_deps/agilitysdk-subbuild/CMakeFiles/f0e8c1e126d23a4e599fca2b2ad0c564/agilitysdk-populate-build.rule"
+		},
+		{
+			"file" : "E:/DXllama/LLAMA-DX/ggml/ggml/src/ggml-dx12/build/_deps/agilitysdk-subbuild/CMakeFiles/f0e8c1e126d23a4e599fca2b2ad0c564/agilitysdk-populate-configure.rule"
+		},
+		{
+			"file" : "E:/DXllama/LLAMA-DX/ggml/ggml/src/ggml-dx12/build/_deps/agilitysdk-subbuild/CMakeFiles/f0e8c1e126d23a4e599fca2b2ad0c564/agilitysdk-populate-download.rule"
+		},
+		{
+			"file" : "E:/DXllama/LLAMA-DX/ggml/ggml/src/ggml-dx12/build/_deps/agilitysdk-subbuild/CMakeFiles/f0e8c1e126d23a4e599fca2b2ad0c564/agilitysdk-populate-install.rule"
+		},
+		{
+			"file" : "E:/DXllama/LLAMA-DX/ggml/ggml/src/ggml-dx12/build/_deps/agilitysdk-subbuild/CMakeFiles/f0e8c1e126d23a4e599fca2b2ad0c564/agilitysdk-populate-mkdir.rule"
+		},
+		{
+			"file" : "E:/DXllama/LLAMA-DX/ggml/ggml/src/ggml-dx12/build/_deps/agilitysdk-subbuild/CMakeFiles/f0e8c1e126d23a4e599fca2b2ad0c564/agilitysdk-populate-patch.rule"
+		},
+		{
+			"file" : "E:/DXllama/LLAMA-DX/ggml/ggml/src/ggml-dx12/build/_deps/agilitysdk-subbuild/CMakeFiles/f0e8c1e126d23a4e599fca2b2ad0c564/agilitysdk-populate-test.rule"
+		},
+		{
+			"file" : "E:/DXllama/LLAMA-DX/ggml/ggml/src/ggml-dx12/build/_deps/agilitysdk-subbuild/CMakeFiles/f0e8c1e126d23a4e599fca2b2ad0c564/agilitysdk-populate-update.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"agilitysdk-populate"
+		],
+		"name" : "agilitysdk-populate"
+	}
+}

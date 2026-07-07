@@ -23,6 +23,7 @@
 
 #include <ggml.h>
 #include <ggml-backend.h>
+#include <ggml-backend-impl.h>
 
 #include <cstring>
 #include <cstdlib>
@@ -61,6 +62,13 @@ void ggml_backend_dx12_set_log_callback(dx12_log_callback_t callback) {
 void ggml_backend_dx12_set_log_level(dx12_log_level level) {
     g_log_level = level;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// C++ helpers for macro expansion (must be before version string)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#define STRINGIFY_(x) #x
+#define STRINGIFY(x) STRINGIFY_(x)
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Version Info
@@ -401,9 +409,6 @@ void ggml_backend_dx12_get_vram_usage(ggml_backend_t backend,
 // Registration Entry Point (called by ggml/src/ggml.c)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// Forward declaration from ggml-backend
-struct ggml_backend_reg;
-
 ggml_backend_reg_t ggml_backend_dx12_reg(void) {
     static struct ggml_backend_reg reg;
     reg.name = "DX12";
@@ -411,18 +416,3 @@ ggml_backend_reg_t ggml_backend_dx12_reg(void) {
     reg.free_fn = nullptr;
     return &reg;
 }
-
-// Compatibility with older ggml versions that expect different signature
-struct ggml_backend_reg* ggml_backend_dx12_reg(void) {
-    static struct ggml_backend_reg reg;
-    reg.name = "DX12";
-    // reg.init_fn = (ggml_backend_t(*)(const char*))ggml_backend_dx12_init_impl;
-    return &reg;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// C++ helpers for macro expansion
-// ═══════════════════════════════════════════════════════════════════════════════
-
-#define STRINGIFY_(x) #x
-#define STRINGIFY(x) STRINGIFY_(x)

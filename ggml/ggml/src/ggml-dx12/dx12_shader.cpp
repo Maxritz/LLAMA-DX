@@ -161,7 +161,7 @@ bool dx12_shader_dispatch_simple(dx12_device* dev,
     uint32_t tg_size = entry ? entry->thread_group_x : 256;
     uint32_t dispatch_x = (elements + tg_size - 1) / tg_size;
 
-    dx12_shader_dispatch dispatch{};
+    struct dx12_shader_dispatch dispatch{};
     dispatch.shader_name = shader_name;
     dispatch.sig_type = dx12_root_signature_type::simple_2in_1out;
     dispatch.thread_group_x = dispatch_x;
@@ -225,7 +225,7 @@ bool dx12_shader_dispatch_gemm(dx12_device* dev,
     uint32_t dispatch_x = (N + tile_n - 1) / tile_n;
     uint32_t dispatch_y = (M + tile_m - 1) / tile_m;
 
-    dx12_shader_dispatch dispatch{};
+    struct dx12_shader_dispatch dispatch{};
     dispatch.shader_name = shader_name;
     dispatch.sig_type = dx12_root_signature_type::gemm;
     dispatch.thread_group_x = dispatch_x;

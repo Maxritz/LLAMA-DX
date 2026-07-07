@@ -1,0 +1,10 @@
+^E:\DXLLAMA\LLAMA-DX\GGML\GGML\SRC\GGML-DX12\BUILD\_DEPS\AGILITYSDK-SUBBUILD\CMAKEFILES\49826B3E71671FC1C768F32D253BEA9B\GENERATE.STAMP.RULE
+setlocal
+C:\Strawberry\c\bin\cmake.exe -SE:/DXllama/LLAMA-DX/ggml/ggml/src/ggml-dx12/build/_deps/agilitysdk-subbuild -BE:/DXllama/LLAMA-DX/ggml/ggml/src/ggml-dx12/build/_deps/agilitysdk-subbuild --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file E:/DXllama/LLAMA-DX/ggml/ggml/src/ggml-dx12/build/_deps/agilitysdk-subbuild/agilitysdk-populate.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

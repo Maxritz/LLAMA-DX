@@ -210,7 +210,7 @@ bool dx12_dequantize_dispatch(dx12_device* dev,
     dx12_buffer_transition(cmd, quantized, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     dx12_buffer_transition(cmd, dequantized, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
-    dx12_shader_dispatch dispatch{};
+    struct dx12_shader_dispatch dispatch{};
     dispatch.shader_name = shader_name;
     dispatch.sig_type = dx12_root_signature_type::reduction; // 1 SRV in, 1 UAV out
     dispatch.thread_group_x = dispatch_x;

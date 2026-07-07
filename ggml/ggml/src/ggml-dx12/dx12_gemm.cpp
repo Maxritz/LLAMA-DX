@@ -132,7 +132,7 @@ bool dx12_gemm_dispatch_standard(dx12_device* dev,
     gc.transposed_b = params->transposed_b ? 1 : 0;
     gc.alpha_f16 = 0x3C00; // 1.0 in F16
 
-    dx12_shader_dispatch dispatch{};
+    struct dx12_shader_dispatch dispatch{};
     dispatch.shader_name = shader_name;
     dispatch.sig_type = dx12_root_signature_type::gemm;
     dispatch.thread_group_x = dispatch_x;
@@ -190,7 +190,7 @@ bool dx12_gemm_dispatch_dxla_wave(dx12_device* dev,
     dc.K = params->K;
     dc.wave_size = wave_size;
 
-    dx12_shader_dispatch dispatch{};
+    struct dx12_shader_dispatch dispatch{};
     dispatch.shader_name = shader_name;
     dispatch.sig_type = dx12_root_signature_type::gemm;
     dispatch.thread_group_x = dispatch_x;
@@ -239,7 +239,7 @@ bool dx12_gemm_dispatch_dxla_tg(dx12_device* dev,
     tc.K = params->K;
     tc.tile_size = tile;
 
-    dx12_shader_dispatch dispatch{};
+    struct dx12_shader_dispatch dispatch{};
     dispatch.shader_name = shader_name;
     dispatch.sig_type = dx12_root_signature_type::gemm;
     dispatch.thread_group_x = dispatch_x;
@@ -292,7 +292,7 @@ bool dx12_gemm_dispatch_quantized(dx12_device* dev,
     qgc.transposed_b = params->transposed_b ? 1 : 0;
     qgc.quant_type = (uint32_t)params->quant_a;
 
-    dx12_shader_dispatch dispatch{};
+    struct dx12_shader_dispatch dispatch{};
     dispatch.shader_name = shader_name;
     dispatch.sig_type = dx12_root_signature_type::dequant_gemm;
     dispatch.thread_group_x = dispatch_x;

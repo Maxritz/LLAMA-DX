@@ -1,0 +1,3 @@
+E:/DXllama/LLAMA-DX/ggml/ggml/src/ggml-dx12/build/_deps/agilitysdk-subbuild/CMakeFiles/agilitysdk-populate.dir
+E:/DXllama/LLAMA-DX/ggml/ggml/src/ggml-dx12/build/_deps/agilitysdk-subbuild/CMakeFiles/ALL_BUILD.dir
+E:/DXllama/LLAMA-DX/ggml/ggml/src/ggml-dx12/build/_deps/agilitysdk-subbuild/CMakeFiles/ZERO_CHECK.dir

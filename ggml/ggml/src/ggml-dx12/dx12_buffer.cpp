@@ -6,6 +6,7 @@
 
 #include "dx12_buffer.h"
 #include "dx12_command.h"
+#include <ggml.h>
 #include <cstring>
 #include <algorithm>
 
