@@ -112,15 +112,15 @@ bool dx12_gemm_dispatch_standard(dx12_device* dev,
 
     uint32_t dispatch_x = (params->N + tile_n - 1) / tile_n;
     uint32_t dispatch_y = (params->M + tile_m - 1) / tile_m;
-    uint32_t dispatch_z = params->batch_count;
+    uint32_t dispatch_z = params->batch_count > 0 ? params->batch_count : 1;
 
-    // GEMM constants
+    // GEMM constants (must match GEMMParams in mul_mat_f16_f16.hlsl exactly)
     struct gemm_constants {
         uint32_t M, N, K;
         uint32_t stride_a, stride_b, stride_c;
         uint32_t transposed_b;
         uint32_t alpha_f16; // F16 encoded
-        uint32_t reserved[7]; // Pad to 16 uints
+        uint32_t reserved[8]; // Pad to 16 uints = 64 bytes (shader has [8])
     } gc{};
 
     gc.M = params->M;
@@ -135,9 +135,18 @@ bool dx12_gemm_dispatch_standard(dx12_device* dev,
     struct dx12_shader_dispatch dispatch{};
     dispatch.shader_name = shader_name;
     dispatch.sig_type = dx12_root_signature_type::gemm;
-    dispatch.thread_group_x = dispatch_x;
-    dispatch.thread_group_y = dispatch_y;
-    dispatch.thread_group_z = dispatch_z;
+    // dispatch_x/y/z = number of thread groups to dispatch
+    dispatch.dispatch_x = dispatch_x;
+    dispatch.dispatch_y = dispatch_y;
+    dispatch.dispatch_z = dispatch_z;
+    // thread_group_x/y/z = 0 (use shader defaults: 32x32x1)
+
+    dx12_log(DX12_LOG_INFO, "GEMM: M=%u N=%u K=%u stride_a=%u stride_b=%u stride_c=%u transposed=%u",
+             gc.M, gc.N, gc.K, gc.stride_a, gc.stride_b, gc.stride_c, gc.transposed_b);
+    dx12_log(DX12_LOG_INFO, "GEMM: A=%p B=%p C=%p",
+             (void*)matrix_a->gpu_address, (void*)matrix_b->gpu_address, (void*)result->gpu_address);
+    dx12_log(DX12_LOG_INFO, "GEMM: dispatch_x=%u dispatch_y=%u dispatch_z=%u",
+             dispatch.dispatch_x, dispatch.dispatch_y, dispatch.dispatch_z);
 
     dx12_buffer* srvs[2] = { matrix_a, matrix_b };
 

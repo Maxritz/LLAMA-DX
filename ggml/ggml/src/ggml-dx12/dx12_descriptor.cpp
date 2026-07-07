@@ -81,36 +81,47 @@ static ComPtr<ID3D12RootSignature> dx12_build_root_signature(dx12_device* dev,
 
     switch (type) {
         case dx12_root_signature_type::simple_2in_1out: {
-            // Param 0: CBV (constants)
+            // Param 0: CBV (constant buffer) at b0 — matches ConstantBuffer<GEMMParams> in shader
             CD3DX12_ROOT_PARAMETER1 cbv_param;
-            cbv_param.InitAsConstants(8, 0); // b0, 8 uints
-            cbv_param.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            cbv_param.InitAsConstantBufferView(
+                0, 0,
+                D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                D3D12_SHADER_VISIBILITY_ALL);
             params.push_back(cbv_param);
 
-            // Param 1: SRV (input A) - via root descriptor
+            // Param 1: SRV (input A) - root descriptor at t0
             CD3DX12_ROOT_PARAMETER1 srv0_param;
-            srv0_param.InitAsShaderResourceView(0); // t0
-            srv0_param.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            srv0_param.InitAsShaderResourceView(
+                0, 0,
+                D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                D3D12_SHADER_VISIBILITY_ALL);
             params.push_back(srv0_param);
 
-            // Param 2: SRV (input B) - via root descriptor
+            // Param 2: SRV (input B) - root descriptor at t1
             CD3DX12_ROOT_PARAMETER1 srv1_param;
-            srv1_param.InitAsShaderResourceView(1); // t1
-            srv1_param.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            srv1_param.InitAsShaderResourceView(
+                1, 0,
+                D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                D3D12_SHADER_VISIBILITY_ALL);
             params.push_back(srv1_param);
 
-            // Param 3: UAV (output) - via root descriptor
+            // Param 3: UAV (output) - root descriptor at u0
             CD3DX12_ROOT_PARAMETER1 uav_param;
-            uav_param.InitAsUnorderedAccessView(0); // u0
-            uav_param.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            uav_param.InitAsUnorderedAccessView(
+                0, 0,
+                D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                D3D12_SHADER_VISIBILITY_ALL);
             params.push_back(uav_param);
             break;
         }
 
         case dx12_root_signature_type::gemm: {
-            // Param 0: CBV with M, N, K, stride_A, stride_B, stride_C
+            // Param 0: CBV (constant buffer) at b0 — matches ConstantBuffer<GEMMParams> in shader
             CD3DX12_ROOT_PARAMETER1 cbv_param;
-            cbv_param.InitAsConstants(16, 0); // b0, 16 uints for GEMM params
+            cbv_param.InitAsConstantBufferView(
+                0, 0,
+                D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                D3D12_SHADER_VISIBILITY_ALL);
             params.push_back(cbv_param);
 
             // Param 1: SRV matrix A

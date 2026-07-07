@@ -8,6 +8,7 @@
 #include "dx12_buffer.h"
 #include "dx12_command.h"
 #include "dx12_gemm.h"
+#include "dx12_shader.h"
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -32,7 +33,7 @@ TEST(gemm_f16_small) {
     auto* c=dx12_buffer_create(g_dev,sz_c,dx12_heap_type::default_);
     ASSERT(a&&b&&c);
     half ha[256],hb[256];
-    for(int i=0;i<256;i++){ha[i]=(half)0x3C00u;hb[i]=(half)0x3C00u;} // F16 1.0
+    for(int i=0;i<256;i++){ha[i]=(half)0x3C00u;hb[i]=(half)0x3C00u;}
     dx12_buffer_upload(a,ha,sz_a);dx12_buffer_upload(b,hb,sz_b);
 
     dx12_command_list* cmd=dx12_cmd_list_create(g_dev);
@@ -41,8 +42,32 @@ TEST(gemm_f16_small) {
     bool ok=dx12_gemm_dispatch(g_dev,cmd,a,b,c,&p);
     ASSERT(ok);
     dx12_cmd_list_submit_and_wait(cmd);
-    dx12_cmd_list_destroy(cmd);
 
+    // Download result for verification
+    auto* c_rb=dx12_buffer_create(g_dev,sz_c,dx12_heap_type::readback);
+    if(c_rb){
+        dx12_cmd_list_reset(cmd);
+        dx12_buffer_transition(cmd,c,D3D12_RESOURCE_STATE_COPY_SOURCE);
+        dx12_buffer_copy(cmd,c_rb,0,c,0,sz_c);
+        dx12_cmd_list_submit_and_wait(cmd);
+        half* result=(half*)dx12_buffer_map(c_rb);
+        if(result){
+            float mx=0; uint32_t nz=0;
+            for(uint32_t i=0;i<M*N;i++){ float v=(float)result[i]; if(fabs(v)>mx)mx=fabs(v); if(v!=0)nz++; }
+            printf("(max=%.3f nonzero=%u) ", mx, nz);
+            for(uint32_t r=0;r<M;r++){
+                for(uint32_t c=0;c<N;c++){
+                    float v=(float)result[r*N+c];
+                    printf("%c", (v!=0)?(v<8?'L':'H'):'.');
+                }
+                printf("\n");
+            }
+            for(uint32_t i=0;i<M*N;i++) ASSERT_NEAR((float)result[i],(float)K,0.5f);
+            dx12_buffer_unmap(c_rb);
+        }
+        dx12_buffer_destroy(c_rb);
+    }
+    dx12_cmd_list_destroy(cmd);
     dx12_buffer_destroy(a);dx12_buffer_destroy(b);dx12_buffer_destroy(c);
     PASS();
 }
@@ -64,7 +89,6 @@ TEST(gemm_rectangular) {
 
 int main(){
     printf("\n=== DX12 GEMM Tests ===\n\n");
-
     dx12_result r=dx12_device_create(-1,&g_dev);
     if(r!=DX12_OK){printf("Device creation failed: %d\n",r);return 1;}
     RUN(gemm_f16_small);

@@ -59,9 +59,12 @@ struct dx12_shader_db {
 struct dx12_shader_dispatch {
     const char*                 shader_name;
     dx12_root_signature_type    sig_type;
-    uint32_t                    thread_group_x;
-    uint32_t                    thread_group_y;
-    uint32_t                    thread_group_z;
+    uint32_t                    thread_group_x;  // Thread group size X (from shader, 0 = use default)
+    uint32_t                    thread_group_y;  // Thread group size Y
+    uint32_t                    thread_group_z;  // Thread group size Z
+    uint32_t                    dispatch_x;      // Number of thread groups to dispatch in X
+    uint32_t                    dispatch_y;      // Number of thread groups to dispatch in Y
+    uint32_t                    dispatch_z;      // Number of thread groups to dispatch in Z
 };
 
 /**

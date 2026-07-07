@@ -86,6 +86,13 @@ struct dx12_device {
 
     // Thread safety
     mutable std::mutex              device_mutex;
+
+    // Constant buffer ring buffer (256-byte aligned, 64KB upload heap)
+    ComPtr<ID3D12Resource>          cbv_ring_buffer;
+    uint8_t*                        cbv_ring_cpu_address = nullptr;
+    uint64_t                        cbv_ring_gpu_address = 0;
+    uint32_t                        cbv_ring_size = 0;
+    uint32_t                        cbv_ring_offset = 0;
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -187,5 +194,21 @@ void dx12_set_info_queue_break_on_error(dx12_device* dev);
 // Required for Agility SDK - tells Windows to use our D3D12Core.dll
 extern "C" { __declspec(dllexport) extern const UINT D3D12SDKVersion; }
 extern "C" { __declspec(dllexport) extern const char* D3D12SDKPath; }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Constant Buffer Ring Buffer (for root signature CBV bindings)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * dx12_device_allocate_cbv — Allocate space in CBV ring buffer
+ *
+ * @param dev:  Device pointer
+ * @param data: Constant data to copy (must be 256-byte aligned size)
+ * @param size: Size of constant data in bytes
+ * @return GPU virtual address of the allocated constant buffer
+ */
+D3D12_GPU_VIRTUAL_ADDRESS dx12_device_allocate_cbv(dx12_device* dev,
+                                                     const void* data,
+                                                     uint32_t size);
 
 #endif // DX12_DEVICE_H

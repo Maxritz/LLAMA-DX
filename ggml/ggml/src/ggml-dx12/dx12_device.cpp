@@ -15,6 +15,7 @@
 
 #include <windows.h>
 #include <d3d12sdklayers.h>
+#include <cstdio>
 #include <iostream>
 #include <sstream>
 #include <cstring>
@@ -267,10 +268,38 @@ void dx12_enable_gpu_validation() {
     }
 }
 
+static void __stdcall dx12_info_queue_callback(
+    D3D12_MESSAGE_CATEGORY category,
+    D3D12_MESSAGE_SEVERITY severity,
+    D3D12_MESSAGE_ID id,
+    LPCWSTR pDescription,
+    void* pContext) {
+    if (severity >= D3D12_MESSAGE_SEVERITY_WARNING) {
+        const char* sev = severity == D3D12_MESSAGE_SEVERITY_CORRUPTION ? "CORRUPTION"
+                        : severity == D3D12_MESSAGE_SEVERITY_ERROR ? "ERROR"
+                        : "WARNING";
+        FILE* f = fopen("C:\\dx12_err.log", "a");
+        if (f) {
+            fprintf(f, "[D3D12 %s] %S\n", sev, pDescription ? pDescription : L"(no description)");
+            fclose(f);
+        }
+        printf("[D3D12 %s] %S\n", sev, pDescription ? pDescription : L"(no description)");
+        fflush(stdout);
+    }
+}
+
 void dx12_set_info_queue_break_on_error(dx12_device* dev) {
     if (!dev || !dev->info_queue) return;
-    dev->info_queue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, TRUE);
-    dev->info_queue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, TRUE);
+
+    DWORD cookie = 0;
+    dev->info_queue->RegisterMessageCallback(
+        (D3D12MessageFunc)dx12_info_queue_callback,
+        D3D12_MESSAGE_CALLBACK_FLAG_NONE,
+        nullptr, &cookie);
+
+    // Break disabled temporarily to capture diagnostics without terminating the process.
+    // dev->info_queue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, TRUE);
+    // dev->info_queue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, TRUE);
 
     // Suppress noisy warnings
     D3D12_MESSAGE_ID deny_ids[] = {
@@ -550,6 +579,56 @@ dx12_result dx12_device_create(int32_t adapter_index, dx12_device** out_device) 
     // Detect capabilities
     dx12_detect_device_caps(dev);
 
+    // Create CBV ring buffer (64KB upload heap, 256-byte aligned)
+    {
+        D3D12_HEAP_PROPERTIES heap_props = {};
+        heap_props.Type = D3D12_HEAP_TYPE_UPLOAD;
+        heap_props.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+        heap_props.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+        heap_props.CreationNodeMask = 1;
+        heap_props.VisibleNodeMask = 1;
+
+        D3D12_RESOURCE_DESC desc = {};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = 65536;  // 64KB
+        desc.Height = 1;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+        ComPtr<ID3D12Resource> cbv_buffer;
+        HRESULT hr = dev->device->CreateCommittedResource(
+            &heap_props, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+            IID_PPV_ARGS(&cbv_buffer));
+        if (FAILED(hr)) {
+            dx12_log(DX12_LOG_ERROR,
+                     "Failed to create CBV ring buffer: 0x%08X", (unsigned)hr);
+            delete dev;
+            return DX12_ERROR_OUT_OF_MEMORY;
+        }
+        dev->cbv_ring_buffer = cbv_buffer;
+
+        // Map for CPU write access (keep mapped)
+        D3D12_RANGE read_range = {};
+        hr = dev->cbv_ring_buffer->Map(0, &read_range,
+                                        (void**)&dev->cbv_ring_cpu_address);
+        if (FAILED(hr)) {
+            dx12_log(DX12_LOG_ERROR,
+                     "Failed to map CBV ring buffer: 0x%08X", (unsigned)hr);
+            delete dev;
+            return DX12_ERROR_OUT_OF_MEMORY;
+        }
+        dev->cbv_ring_gpu_address =
+            dev->cbv_ring_buffer->GetGPUVirtualAddress();
+        dev->cbv_ring_size = 65536;
+        dev->cbv_ring_offset = 0;
+
+        dx12_log(DX12_LOG_INFO, "CBV ring buffer created: 64KB");
+    }
+
     // Verify minimum requirements
     if (!dev->caps.wave_ops) {
         dx12_log(DX12_LOG_ERROR, "GPU does not support wave operations (SM 6.0+)");
@@ -569,6 +648,15 @@ void dx12_device_destroy(dx12_device* dev) {
 
     // Wait for GPU to finish
     dx12_device_wait_idle(dev);
+
+    // Cleanup CBV ring buffer
+    if (dev->cbv_ring_cpu_address) {
+        if (dev->cbv_ring_buffer) {
+            dev->cbv_ring_buffer->Unmap(0, nullptr);
+        }
+        dev->cbv_ring_cpu_address = nullptr;
+    }
+    dev->cbv_ring_buffer.Reset();
 
     if (dev->fence_event) {
         CloseHandle(dev->fence_event);
@@ -621,4 +709,49 @@ uint64_t dx12_device_signal_fence(dx12_device* dev) {
     uint64_t value = dev->fence_value.fetch_add(1);
     dev->command_queue->Signal(dev->fence.Get(), value);
     return value;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Constant Buffer Ring Buffer Allocation
+// ═══════════════════════════════════════════════════════════════════════════════
+
+D3D12_GPU_VIRTUAL_ADDRESS dx12_device_allocate_cbv(dx12_device* dev,
+                                                     const void* data,
+                                                     uint32_t size) {
+    if (!dev || !dev->cbv_ring_buffer || !data || size == 0) return 0;
+
+    // Align size to 256 bytes (D3D12 constant buffer requirement)
+    uint32_t aligned_size = (size + 255) & ~255;
+
+    // Simple ring buffer allocation (no synchronization for now)
+    uint32_t offset = dev->cbv_ring_offset;
+
+    // Ensure offset is 256-byte aligned
+    offset = (offset + 255) & ~255;
+
+    if (offset + aligned_size > dev->cbv_ring_size) {
+        offset = 0;  // Wrap around (must also be 256-byte aligned, which 0 is)
+    }
+
+    // Copy data to ring buffer
+    memcpy(dev->cbv_ring_cpu_address + offset, data, size);
+
+    // Calculate GPU virtual address
+    D3D12_GPU_VIRTUAL_ADDRESS gpu_address =
+        dev->cbv_ring_gpu_address + offset;
+
+    {
+        const uint32_t* src = (const uint32_t*)data;
+        const uint32_t* dst = (const uint32_t*)(dev->cbv_ring_cpu_address + offset);
+        dx12_log(DX12_LOG_INFO,
+                 "CBV write: cpu=%p gpu=%llx M=%u N=%u K=%u sa=%u sb=%u sc=%u tb=%u (dst0=%u)",
+                 (void*)(dev->cbv_ring_cpu_address + offset),
+                 (unsigned long long)gpu_address,
+                 src[0], src[1], src[2], src[3], src[4], src[5], src[6], dst[0]);
+    }
+
+    // Update offset (256-byte aligned)
+    dev->cbv_ring_offset = offset + aligned_size;
+
+    return gpu_address;
 }

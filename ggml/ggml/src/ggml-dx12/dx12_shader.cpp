@@ -71,8 +71,11 @@ bool dx12_shader_dispatch(dx12_device* dev,
         return false;
     }
 
-    // Get or create PSO
-    dx12_pso_cache pso_cache(dev);
+    // Get or create PSO. Use a function-local static cache so the PSO and its
+    // root signature stay alive until the command list is submitted and executed
+    // (a local cache would be destroyed on return, deleting the root signature
+    // while the command list still references it -> OBJECT_DELETED_WHILE_STILL_IN_USE).
+    static dx12_pso_cache pso_cache(dev);
     std::array<uint32_t, 3> tg_size = {
         dispatch.thread_group_x ? dispatch.thread_group_x : entry->thread_group_x,
         dispatch.thread_group_y ? dispatch.thread_group_y : entry->thread_group_y,
@@ -91,12 +94,20 @@ bool dx12_shader_dispatch(dx12_device* dev,
     dx12_cmd_list_set_root_signature(cmd, pso->root_signature.Get());
     dx12_cmd_list_set_pso(cmd, pso->pipeline_state.Get());
 
-    // Bind constants (root param 0)
+    // Bind constants (root param 0) - CBV via ring buffer
     if (constants && constants_size > 0) {
-        uint32_t num_32bit_values = static_cast<uint32_t>(constants_size / 4);
-        // Pad to multiple of 4 bytes
-        if (constants_size % 4 != 0) num_32bit_values++;
-        dx12_cmd_list_set_compute_root_32bit_constants(cmd, 0, num_32bit_values, constants, 0);
+        D3D12_GPU_VIRTUAL_ADDRESS cbv_address =
+            dx12_device_allocate_cbv(dev, constants, constants_size);
+        if (cbv_address) {
+            dx12_log(DX12_LOG_INFO, "CBV: binding GPU address %p (size=%zu)",
+                     (void*)cbv_address, constants_size);
+            cmd->d3d_list->SetComputeRootConstantBufferView(0, cbv_address);
+        } else {
+            dx12_log(DX12_LOG_ERROR,
+                     "Failed to allocate CBV for shader '%s'",
+                     dispatch.shader_name);
+            return false;
+        }
     }
 
     // Bind SRVs (root params 1+)
@@ -120,7 +131,11 @@ bool dx12_shader_dispatch(dx12_device* dev,
     }
 
     // Dispatch
-    dx12_cmd_list_dispatch(cmd, tg_size[0], tg_size[1], tg_size[2]);
+    // Use dispatch_x/y/z if set, otherwise fall back to tg_size (backward compat)
+    uint32_t dx = dispatch.dispatch_x ? dispatch.dispatch_x : tg_size[0];
+    uint32_t dy = dispatch.dispatch_y ? dispatch.dispatch_y : tg_size[1];
+    uint32_t dz = dispatch.dispatch_z ? dispatch.dispatch_z : tg_size[2];
+    dx12_cmd_list_dispatch(cmd, dx, dy, dz);
     return true;
 }
 

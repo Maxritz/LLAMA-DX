@@ -22,38 +22,40 @@
 // Q4_0: 32 elements, 1 scale (F16), 16 bytes of 4-bit weights
 struct block_q4_0 {
     uint16_t d;         // scale as F16
-    uint8_t  qs[16];    // 32 nibbles
+    uint     qs[16];    // 32 nibbles (packed as uint)
 };
 
 // Q8_0: 32 elements, 1 scale (F16), 32 signed bytes
 struct block_q8_0 {
     uint16_t d;
-    int8_t   qs[32];
+    int      qs[32];
 };
 
 // Q6_K: 256-element superblock
 struct block_q6_K {
-    uint8_t  ql[128];   // lower 4 bits of 256 elements
-    uint8_t  qh[64];    // upper 2 bits
-    int8_t   scales[16];
+    uint     ql[128];   // lower 4 bits of 256 elements (packed)
+    uint     qh[64];    // upper 2 bits (packed)
+    int      scales[16];
     uint16_t d;
 };
 
 // Q4_K: 256-element superblock  
 struct block_q4_K {
-    uint8_t  scales[12];
+    uint     scales[12];
     uint16_t d;
     uint16_t dmin;
-    uint8_t  qs[128];
+    uint     qs[128];
 };
 
 // Q5_K: 256-element superblock
+// NOTE: byte-packed layout; use uint arrays (HLSL has no 8-bit types) until
+// quantized kernels are wired to byte-level accessors.
 struct block_q5_K {
-    uint8_t  scales[12];
+    uint  scales[12];
     uint16_t d;
     uint16_t dmin;
-    uint8_t  qh[32];
-    uint8_t  qs[128];
+    uint  qh[32];
+    uint  qs[128];
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -72,7 +74,7 @@ float f16_to_f32(uint16_t h) {
         return (sign ? -1.0f : 1.0f) * f * pow(2.0f, -14.0f);
     }
     if (exp == 31) {
-        return (mant == 0) ? (sign ? -INFINITY : INFINITY) : NAN;
+        return (mant == 0) ? (sign ? asfloat(0xFF800000) : asfloat(0x7F800000)) : asfloat(0x7FC00000);
     }
 
     float f = 1.0f + mant / 1024.0f;
@@ -110,7 +112,7 @@ uint16_t f32_to_f16(float f) {
 
 float4 dequant_q4_0(block_q4_0 block, uint lane) {
     float d = f16_to_f32(block.d);
-    uint8_t qs = block.qs[lane / 2];
+    uint qs = block.qs[lane / 2];
     float q = (lane & 1) ? (qs >> 4) : (qs & 0xF);
     return d * (q - 8.0f); // 4-bit values are 0-15, subtract 8 for signed
 }
