@@ -57,7 +57,7 @@ void dx12_shader_db_init() {
 
 bool dx12_shader_dispatch(dx12_device* dev,
                           dx12_command_list* cmd,
-                          const dx12_shader_dispatch& dispatch,
+                           const struct dx12_shader_dispatch& dispatch,
                           const void* constants, size_t constants_size,
                           dx12_buffer** srvs, uint32_t num_srvs,
                           dx12_buffer* uav) {
@@ -73,7 +73,7 @@ bool dx12_shader_dispatch(dx12_device* dev,
 
     // Get or create PSO
     dx12_pso_cache pso_cache(dev);
-    uint3 tg_size = {
+    std::array<uint32_t, 3> tg_size = {
         dispatch.thread_group_x ? dispatch.thread_group_x : entry->thread_group_x,
         dispatch.thread_group_y ? dispatch.thread_group_y : entry->thread_group_y,
         dispatch.thread_group_z ? dispatch.thread_group_z : entry->thread_group_z
@@ -138,7 +138,7 @@ bool dx12_shader_dispatch(dx12_device* dev,
     }
 
     // Dispatch
-    dx12_cmd_list_dispatch(cmd, tg_size.x, tg_size.y, tg_size.z);
+    dx12_cmd_list_dispatch(cmd, tg_size[0], tg_size[1], tg_size[2]);
     return true;
 }
 

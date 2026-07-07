@@ -35,7 +35,7 @@ extern "C" { __declspec(dllexport) extern const char* D3D12SDKPath = ".\\D3D12\\
 static dx12_log_callback_t g_log_callback = nullptr;
 static dx12_log_level      g_log_level    = DX12_LOG_INFO;
 
-static void dx12_log(dx12_log_level level, const char* fmt, ...) {
+void dx12_log(dx12_log_level level, const char* fmt, ...) {
     if (level < g_log_level) return;
     char buf[1024];
     va_list args;
@@ -51,6 +51,17 @@ static void dx12_log(dx12_log_level level, const char* fmt, ...) {
                                                          "[DX12 VRB]";
         fprintf(stderr, "%s %s\n", prefix, buf);
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Public Logging API — set the real state so every translation unit sees it
+// ═══════════════════════════════════════════════════════════════════════════════
+
+void ggml_backend_dx12_set_log_callback(dx12_log_callback_t callback) {
+    g_log_callback = callback;
+}
+void ggml_backend_dx12_set_log_level(dx12_log_level level) {
+    g_log_level = level;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

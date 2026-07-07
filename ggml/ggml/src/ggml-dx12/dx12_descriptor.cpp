@@ -298,7 +298,7 @@ void dx12_root_signature_cache::clear() {
 dx12_pso* dx12_pso_cache::get_or_create(const char* shader_name,
                                          const void* cso_data, size_t cso_size,
                                          dx12_root_signature_type sig_type,
-                                         uint3 thread_group_size) {
+                                         std::array<uint32_t, 3> thread_group_size) {
     if (!shader_name || !cso_data || cso_size == 0) return nullptr;
 
     std::string key = shader_name;

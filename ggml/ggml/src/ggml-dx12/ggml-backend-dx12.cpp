@@ -31,39 +31,6 @@
 #include <mutex>
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Logging (mirrors dx12_device.cpp logging)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-static dx12_log_callback_t g_log_callback = nullptr;
-static dx12_log_level      g_log_level    = DX12_LOG_INFO;
-
-static void dx12_log(dx12_log_level level, const char* fmt, ...) {
-    if (level < g_log_level) return;
-    char buf[1024];
-    va_list args;
-    va_start(args, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, args);
-    va_end(args);
-    if (g_log_callback) {
-        g_log_callback(level, buf);
-    } else {
-        const char* prefix = (level == DX12_LOG_ERROR) ? "[DX12 ERR]" :
-                             (level == DX12_LOG_WARN)  ? "[DX12 WRN]" :
-                             (level == DX12_LOG_INFO)  ? "[DX12 INF]" :
-                                                         "[DX12 VRB]";
-        fprintf(stderr, "%s %s\n", prefix, buf);
-    }
-}
-
-void ggml_backend_dx12_set_log_callback(dx12_log_callback_t callback) {
-    g_log_callback = callback;
-}
-
-void ggml_backend_dx12_set_log_level(dx12_log_level level) {
-    g_log_level = level;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
 // C++ helpers for macro expansion (must be before version string)
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -288,23 +255,26 @@ static bool ggml_backend_dx12_supports_buft(ggml_backend_t backend,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Backend VTable
+// Backend VTable (16 fields, matching ggml_backend_i in ggml-backend-impl.h)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 static struct ggml_backend_i ggml_backend_dx12_interface = {
-    /* .get_name                = */ ggml_backend_dx12_name,
-    /* .free                    = */ ggml_backend_dx12_free,
-    /* .get_default_buffer_type = */ ggml_backend_dx12_get_default_buffer_type,
-    /* .set_tensor_async        = */ ggml_backend_dx12_set_tensor_async,
-    /* .get_tensor_async        = */ ggml_backend_dx12_get_tensor_async,
-    /* .synchronize             = */ ggml_backend_dx12_synchronize,
-    /* .graph_plan_create       = */ nullptr, // Not using graph plans
-    /* .graph_plan_free         = */ nullptr,
-    /* .graph_plan_compute      = */ nullptr,
-    /* .graph_compute           = */ ggml_backend_dx12_graph_compute,
-    /* .supports_op             = */ ggml_backend_dx12_supports_op,
-    /* .supports_buft           = */ ggml_backend_dx12_supports_buft,
-    /* .get_event               = */ nullptr,
+    /* get_name          */ ggml_backend_dx12_name,
+    /* free              */ ggml_backend_dx12_free,
+    /* set_tensor_async  */ ggml_backend_dx12_set_tensor_async,
+    /* get_tensor_async  */ ggml_backend_dx12_get_tensor_async,
+    /* set_tensor_2d_async */ nullptr,
+    /* get_tensor_2d_async */ nullptr,
+    /* cpy_tensor_async  */ nullptr,
+    /* synchronize       */ ggml_backend_dx12_synchronize,
+    /* graph_plan_create */ nullptr,
+    /* graph_plan_free   */ nullptr,
+    /* graph_plan_update */ nullptr,
+    /* graph_plan_compute*/ nullptr,
+    /* graph_compute     */ ggml_backend_dx12_graph_compute,
+    /* event_record      */ nullptr,
+    /* event_wait        */ nullptr,
+    /* graph_optimize    */ nullptr,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -349,7 +319,7 @@ static ggml_backend_t ggml_backend_dx12_init_impl(const char* params) {
 
     // Create GGML backend
     ggml_backend_t backend = new ggml_backend();
-    backend->interface = &ggml_backend_dx12_interface;
+    backend->iface = ggml_backend_dx12_interface;
     backend->context = ctx;
     backend->device = nullptr; // Not using device abstraction
 
@@ -405,14 +375,229 @@ void ggml_backend_dx12_get_vram_usage(ggml_backend_t backend,
     if (kv_cache_bytes)  *kv_cache_bytes  = ctx->vram_kv_cache;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Registration Entry Point (called by ggml/src/ggml.c)
-// ═══════════════════════════════════════════════════════════════════════════════
+// ---------------------------------------------------------------------------
+// DX12 backend registration + helpers
+// Replaces the old registration that used the deprecated reg.name / init_fn
+// / free_fn fields. Implements the current ggml_backend_reg layout:
+//   struct ggml_backend_reg { int api_version; struct ggml_backend_reg_i iface; void *context; };
+// Populates a std::vector<ggml_backend_device> (by value) using the existing
+// dx12_enumerate_adapters() helper from the DX12 device code.
+// ---------------------------------------------------------------------------
 
+// File-scope static registration struct so device entries can reference it.
+static struct ggml_backend_reg g_dx12_reg;
+
+// Module-global device list and mutex
+static std::mutex g_dx12_devices_mutex;
+static std::vector<ggml_backend_device> g_dx12_devices; // stores by value
+
+// Forward declaration for device accessor (device layer can be implemented later)
+static ggml_backend_device *ggml_backend_dx12_device_i(size_t i);
+
+// -------------------------
+// Device-level iface implementations (stubs matching ggml_backend_device_i)
+// Minimal, header-matching stubs so the backend registers and the project builds.
+// Replace with full implementations when implementing allocation, mapping,
+// submission, and event handling.
+// -------------------------
+static const char * dx12_dev_get_name(ggml_backend_dev_t dev) {
+    (void)dev;
+    return "DX12";
+}
+
+static const char * dx12_dev_get_description(ggml_backend_dev_t dev) {
+    (void)dev;
+    return "DirectX 12 backend device";
+}
+
+static void dx12_dev_get_memory(ggml_backend_dev_t dev, size_t *free, size_t *total) {
+    (void)dev;
+    if (free) *free = 0;
+    if (total) *total = 0;
+}
+
+static enum ggml_backend_dev_type dx12_dev_get_type(ggml_backend_dev_t dev) {
+    (void)dev;
+    return GGML_BACKEND_DEVICE_TYPE_GPU;
+}
+
+static void dx12_dev_get_props(ggml_backend_dev_t dev, struct ggml_backend_dev_props *props) {
+    if (!props) return;
+    props->name = "DX12 GPU";
+    props->description = "DirectX 12 compatible GPU";
+    props->memory_free = 0;
+    props->memory_total = 0;
+    props->type = GGML_BACKEND_DEVICE_TYPE_GPU;
+    props->device_id = nullptr;
+    memset(&props->caps, 0, sizeof(props->caps));
+}
+
+static ggml_backend_t dx12_dev_init_backend(ggml_backend_dev_t dev, const char * params) {
+    (void)dev; (void)params;
+    return nullptr;
+}
+
+static ggml_backend_buffer_type_t dx12_dev_get_buffer_type(ggml_backend_dev_t dev) {
+    (void)dev;
+    return nullptr;
+}
+
+static ggml_backend_buffer_type_t dx12_dev_get_host_buffer_type(ggml_backend_dev_t dev) {
+    (void)dev;
+    return nullptr;
+}
+
+static ggml_backend_buffer_t dx12_dev_buffer_from_host_ptr(ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size) {
+    (void)dev; (void)ptr; (void)size; (void)max_tensor_size;
+    return nullptr;
+}
+
+static bool dx12_dev_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+    (void)dev; (void)op;
+    return false;
+}
+
+static bool dx12_dev_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+    (void)dev; (void)buft;
+    return false;
+}
+
+static bool dx12_dev_offload_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+    (void)dev; (void)op;
+    return false;
+}
+
+static ggml_backend_event_t dx12_dev_event_new(ggml_backend_dev_t dev) {
+    (void)dev;
+    return nullptr;
+}
+
+static void dx12_dev_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    (void)dev; (void)event;
+}
+
+static void dx12_dev_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    (void)dev; (void)event;
+}
+
+// Device iface instance (value so we can copy into ggml_backend_device.iface)
+static struct ggml_backend_device_i const dx12_device_iface = {
+    /* get_name */            &dx12_dev_get_name,
+    /* get_description */     &dx12_dev_get_description,
+    /* get_memory */          &dx12_dev_get_memory,
+    /* get_type */            &dx12_dev_get_type,
+    /* get_props */           &dx12_dev_get_props,
+    /* init_backend */        &dx12_dev_init_backend,
+    /* get_buffer_type */     &dx12_dev_get_buffer_type,
+    /* get_host_buffer_type */&dx12_dev_get_host_buffer_type,
+    /* buffer_from_host_ptr */&dx12_dev_buffer_from_host_ptr,
+    /* supports_op */         &dx12_dev_supports_op,
+    /* supports_buft */       &dx12_dev_supports_buft,
+    /* offload_op */          &dx12_dev_offload_op,
+    /* event_new */           &dx12_dev_event_new,
+    /* event_free */          &dx12_dev_event_free,
+    /* event_synchronize */   &dx12_dev_event_synchronize
+};
+
+// -------------------------
+// Ensure devices enumerated once. Uses existing dx12_enumerate_adapters()
+// to obtain adapter info and populate g_dx12_devices with value-type
+// ggml_backend_device entries. We store the adapter index in device.context
+// as (void*)(uintptr_t)index so device-level code can look it up later.
+// -------------------------
+static void ensure_dx12_devices_initialized() {
+    std::lock_guard<std::mutex> lk(g_dx12_devices_mutex);
+    if (!g_dx12_devices.empty()) return;
+
+    // Use the project's existing enumerator to get adapter info.
+    std::vector<dx12_adapter_info> adapters = dx12_enumerate_adapters();
+    if (adapters.empty()) return;
+
+    // Optionally pick a preferred adapter index (not required for enumeration).
+    uint32_t preferred = dx12_select_best_adapter(adapters);
+
+    for (const auto &a : adapters) {
+        if (!a.supports_dx12) continue; // skip adapters that don't support DX12
+
+        ggml_backend_device dev = {};
+        dev.iface = dx12_device_iface; // copy the device iface
+        dev.reg = &g_dx12_reg;         // point back to this backend reg
+        // store adapter index in context for later device-specific init
+        dev.context = (void*)(uintptr_t)a.index;
+
+        // push by value so callers can take &g_dx12_devices[i]
+        g_dx12_devices.push_back(dev);
+    }
+
+    // If no DX12-capable adapters were added but adapters exist, add the preferred
+    // adapter as a fallback (keeps behavior predictable).
+    if (g_dx12_devices.empty() && !adapters.empty()) {
+        const auto &a = adapters[preferred];
+        ggml_backend_device dev = {};
+        dev.iface = dx12_device_iface;
+        dev.reg = &g_dx12_reg;
+        dev.context = (void*)(uintptr_t)a.index;
+        g_dx12_devices.push_back(dev);
+    }
+}
+
+// Simple accessor used by the backend reg iface
+static ggml_backend_device *ggml_backend_dx12_device_i(size_t i) {
+    std::lock_guard<std::mutex> lk(g_dx12_devices_mutex);
+    if (i >= g_dx12_devices.size()) return nullptr;
+    return &g_dx12_devices[i];
+}
+
+// -------------------------
+// ggml_backend_reg iface implementations (match ggml_backend_reg_i)
+//   const char *(*get_name)(ggml_backend_reg_t reg);
+//   size_t (*get_device_count)(ggml_backend_reg_t reg);
+//   ggml_backend_dev_t (*get_device)(ggml_backend_reg_t reg, size_t index);
+//   void *(*get_proc_address)(ggml_backend_reg_t reg, const char * name);
+// -------------------------
+static const char * dx12_reg_get_name(ggml_backend_reg_t reg) {
+    (void)reg;
+    return "DX12";
+}
+
+static size_t dx12_reg_get_device_count(ggml_backend_reg_t reg) {
+    (void)reg;
+    ensure_dx12_devices_initialized();
+    std::lock_guard<std::mutex> lk(g_dx12_devices_mutex);
+    return g_dx12_devices.size();
+}
+
+static ggml_backend_dev_t dx12_reg_get_device(ggml_backend_reg_t reg, size_t index) {
+    (void)reg;
+    ensure_dx12_devices_initialized();
+    return (ggml_backend_dev_t) ggml_backend_dx12_device_i(index);
+}
+
+static void * dx12_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    (void)reg; (void)name;
+    return nullptr;
+}
+
+// -------------------------
+// New registration function (current API)
+// Returns pointer to file-scope g_dx12_reg so device entries can reference it.
+// -------------------------
 ggml_backend_reg_t ggml_backend_dx12_reg(void) {
-    static struct ggml_backend_reg reg;
-    reg.name = "DX12";
-    reg.init_fn = ggml_backend_dx12_init_impl;
-    reg.free_fn = nullptr;
-    return &reg;
+    static bool initialized = false;
+    if (!initialized) {
+        // Fill registration struct once
+        g_dx12_reg.api_version = GGML_BACKEND_API_VERSION;
+        g_dx12_reg.iface.get_name = &dx12_reg_get_name;
+        g_dx12_reg.iface.get_device_count = &dx12_reg_get_device_count;
+        g_dx12_reg.iface.get_device = &dx12_reg_get_device;
+        g_dx12_reg.iface.get_proc_address = &dx12_reg_get_proc_address;
+        g_dx12_reg.context = nullptr;
+
+        // Eagerly enumerate adapters so callers can query devices immediately.
+        ensure_dx12_devices_initialized();
+
+        initialized = true;
+    }
+
+    return &g_dx12_reg;
 }

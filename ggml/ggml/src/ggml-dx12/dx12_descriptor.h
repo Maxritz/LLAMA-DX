@@ -14,6 +14,7 @@
 #define DX12_DESCRIPTOR_H
 
 #include "dx12_device.h"
+#include <array>
 #include <vector>
 #include <mutex>
 #include <unordered_map>
@@ -106,7 +107,7 @@ struct dx12_pso {
     ComPtr<ID3D12RootSignature>     root_signature;
     dx12_root_signature_type        sig_type;
     std::string                     shader_name;
-    uint3                           thread_group_size;
+    std::array<uint32_t, 3>         thread_group_size;
 };
 
 struct dx12_pso_cache {
@@ -119,7 +120,7 @@ struct dx12_pso_cache {
     dx12_pso* get_or_create(const char* shader_name,
                             const void* cso_data, size_t cso_size,
                             dx12_root_signature_type sig_type,
-                            uint3 thread_group_size = {256, 1, 1});
+                             std::array<uint32_t, 3> thread_group_size = {256, 1, 1});
 
     void clear();
 };

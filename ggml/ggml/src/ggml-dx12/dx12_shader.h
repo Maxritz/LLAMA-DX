@@ -76,7 +76,7 @@ struct dx12_shader_dispatch {
  */
 bool dx12_shader_dispatch(dx12_device* dev,
                           dx12_command_list* cmd,
-                          const dx12_shader_dispatch& dispatch,
+                          const struct dx12_shader_dispatch& dispatch,
                           const void* constants, size_t constants_size,
                           dx12_buffer** srvs, uint32_t num_srvs,
                           dx12_buffer* uav);

@@ -32,7 +32,7 @@ dx12_gemm_path dx12_select_gemm_path(dx12_device* dev,
 
     // Small matrices -> wave-scope (lower latency)
     // Large matrices -> threadgroup-scope (better throughput)
-    uint32_t max_dim = std::max(M, std::max(N, K));
+    uint32_t max_dim = (std::max)(M, (std::max)(N, K));
 
     if (dev->caps.dxla_threadgroup && max_dim >= 256) {
         return DX12_GEMM_DXLA_TG;

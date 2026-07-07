@@ -241,6 +241,7 @@ typedef enum {
 
 typedef void (*dx12_log_callback_t)(dx12_log_level level, const char* msg);
 
+void dx12_log(dx12_log_level level, const char* fmt, ...);
 void ggml_backend_dx12_set_log_callback(dx12_log_callback_t callback);
 void ggml_backend_dx12_set_log_level(dx12_log_level level);
 
