@@ -153,3 +153,10 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# DX12 backend build artifacts
+
+ggml/ggml/src/ggml-dx12/build/
+ggml/ggml/src/ggml-dx12/generated/
+ggml/ggml/src/ggml-dx12/graphify-out/
+ggml/ggml/src/ggml-dx12/*.bak
