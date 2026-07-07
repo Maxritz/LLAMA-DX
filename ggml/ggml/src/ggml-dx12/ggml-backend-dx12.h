@@ -258,6 +258,16 @@ void        ggml_backend_dx12_print_info(void);
 
 #ifdef __cplusplus
 } // extern "C"
-#endif
+
+/**
+ * dx12_backend_buffer_from_tensor — Get the DX12 GPU buffer backing a GGML tensor
+ *
+ * Returns the dx12_buffer* that holds this tensor's data on the GPU.
+ * Returns nullptr if the tensor is not allocated in a DX12 buffer.
+ */
+struct dx12_buffer;
+dx12_buffer* dx12_backend_buffer_from_tensor(const struct ggml_tensor* tensor);
+
+#endif // __cplusplus
 
 #endif // GGML_BACKEND_DX12_H

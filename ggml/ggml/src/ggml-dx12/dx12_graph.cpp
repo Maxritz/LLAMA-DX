@@ -8,6 +8,7 @@
 #include "dx12_shader.h"
 #include "dx12_gemm.h"
 #include "dx12_quantize.h"
+#include "ggml-backend-dx12.h"
 #include <ggml-impl.h>
 #include <cstring>
 
@@ -187,10 +188,11 @@ bool dx12_dispatch_add(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* ds
 
     struct { uint32_t n; float alpha; float beta; uint32_t pad; } params = { n, 1.0f, 1.0f, 0 };
 
-    // TODO: Bind actual tensor buffers (need buffer management)
-    (void)a; (void)b;
     return dx12_shader_dispatch_simple(dev, cmd, "add",
-        &params, sizeof(params), nullptr, nullptr, nullptr, n);
+        &params, sizeof(params),
+        dx12_backend_buffer_from_tensor(a),
+        dx12_backend_buffer_from_tensor(b),
+        dx12_backend_buffer_from_tensor(dst), n);
 }
 
 // MUL: elementwise multiplication
@@ -201,39 +203,39 @@ bool dx12_dispatch_mul(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* ds
 
     struct { uint32_t n; uint32_t pad[3]; } params = { n, 0, 0, 0 };
 
-    (void)a; (void)b;
     return dx12_shader_dispatch_simple(dev, cmd, "mul",
-        &params, sizeof(params), nullptr, nullptr, nullptr, n);
+        &params, sizeof(params),
+        dx12_backend_buffer_from_tensor(a),
+        dx12_backend_buffer_from_tensor(b),
+        dx12_backend_buffer_from_tensor(dst), n);
 }
 
 // MUL_MAT: matrix multiplication (the critical path)
 bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
-    ggml_tensor* a = dst->src[0]; // weights [K, N] or quantized
-    ggml_tensor* b = dst->src[1]; // activations [M, K]
+    ggml_tensor* a = dst->src[0];
+    ggml_tensor* b = dst->src[1];
 
     uint32_t M = (uint32_t)dst->ne[1];
     uint32_t N = (uint32_t)dst->ne[0];
     uint32_t K = (uint32_t)a->ne[0];
 
+    dx12_buffer* buf_a = dx12_backend_buffer_from_tensor(a);
+    dx12_buffer* buf_b = dx12_backend_buffer_from_tensor(b);
+    dx12_buffer* buf_c = dx12_backend_buffer_from_tensor(dst);
+
+    if (!buf_a || !buf_b || !buf_c) {
+        dx12_log(DX12_LOG_VERBOSE, "MUL_MAT: buffers not bound, skipping (shape %ux%ux%u)", M, N, K);
+        return true;
+    }
+
     dx12_gemm_params params{};
     params.M = M;
     params.N = N;
     params.K = K;
-    params.transposed_b = true; // GGML weights are column-major
+    params.transposed_b = true;
     params.quant_a = dx12_quant_type_from_ggml(a->type);
     params.quant_b = dx12_quant_type_from_ggml(b->type);
     params.alpha = 1.0f;
-
-    // TODO: Get actual buffer pointers from tensor extra data
-    dx12_buffer* buf_a = nullptr; // (dx12_buffer*)a->extra;
-    dx12_buffer* buf_b = nullptr; // (dx12_buffer*)b->extra;
-    dx12_buffer* buf_c = nullptr; // (dx12_buffer*)dst->extra;
-
-    if (!buf_a || !buf_b || !buf_c) {
-        // Buffers not yet allocated — would need tensor->buffer mapping
-        dx12_log(DX12_LOG_VERBOSE, "MUL_MAT: buffers not bound, skipping (shape %ux%ux%u)", M, N, K);
-        return true; // Skip gracefully during development
-    }
 
     return dx12_gemm_dispatch(dev, cmd, buf_a, buf_b, buf_c, &params);
 }
@@ -241,14 +243,16 @@ bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor
 // SCALE: multiply by scalar
 bool dx12_dispatch_scale(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
     ggml_tensor* a = dst->src[0];
-    float scale = 1.0f; // From dst->op_params
+    float scale = 1.0f;
     uint32_t n = tensor_nelements(dst);
 
     struct { uint32_t n; float scale; uint32_t pad[2]; } params = { n, scale, 0, 0 };
 
-    (void)a;
     return dx12_shader_dispatch_simple(dev, cmd, "scale",
-        &params, sizeof(params), nullptr, nullptr, nullptr, n);
+        &params, sizeof(params),
+        dx12_backend_buffer_from_tensor(a),
+        nullptr,
+        dx12_backend_buffer_from_tensor(dst), n);
 }
 
 // SILU activation
@@ -257,7 +261,10 @@ bool dx12_dispatch_silu(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* d
     struct { uint32_t n; uint32_t pad[3]; } params = { n, 0, 0, 0 };
 
     return dx12_shader_dispatch_simple(dev, cmd, "silu",
-        &params, sizeof(params), nullptr, nullptr, nullptr, n);
+        &params, sizeof(params),
+        dx12_backend_buffer_from_tensor(dst->src[0]),
+        nullptr,
+        dx12_backend_buffer_from_tensor(dst), n);
 }
 
 // GELU activation
@@ -266,7 +273,10 @@ bool dx12_dispatch_gelu(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* d
     struct { uint32_t n; uint32_t pad[3]; } params = { n, 0, 0, 0 };
 
     return dx12_shader_dispatch_simple(dev, cmd, "gelu",
-        &params, sizeof(params), nullptr, nullptr, nullptr, n);
+        &params, sizeof(params),
+        dx12_backend_buffer_from_tensor(dst->src[0]),
+        nullptr,
+        dx12_backend_buffer_from_tensor(dst), n);
 }
 
 // SOFT_MAX
@@ -277,19 +287,25 @@ bool dx12_dispatch_soft_max(dx12_device* dev, dx12_command_list* cmd, ggml_tenso
         { n, row_size, 1.0f, 0 };
 
     return dx12_shader_dispatch_simple(dev, cmd, "soft_max",
-        &params, sizeof(params), nullptr, nullptr, nullptr, n);
+        &params, sizeof(params),
+        dx12_backend_buffer_from_tensor(dst->src[0]),
+        nullptr,
+        dx12_backend_buffer_from_tensor(dst), n);
 }
 
 // RMS_NORM
 bool dx12_dispatch_rms_norm(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
     uint32_t n = tensor_nelements(dst);
     uint32_t row_size = (uint32_t)dst->ne[0];
-    float eps = 1e-6f; // From dst->op_params
+    float eps = 1e-6f;
     struct { uint32_t n; uint32_t row_size; float eps; uint32_t pad; } params =
         { n, row_size, eps, 0 };
 
     return dx12_shader_dispatch_simple(dev, cmd, "rms_norm",
-        &params, sizeof(params), nullptr, nullptr, nullptr, n);
+        &params, sizeof(params),
+        dx12_backend_buffer_from_tensor(dst->src[0]),
+        nullptr,
+        dx12_backend_buffer_from_tensor(dst), n);
 }
 
 // LAYER_NORM
@@ -301,7 +317,10 @@ bool dx12_dispatch_layer_norm(dx12_device* dev, dx12_command_list* cmd, ggml_ten
         { n, row_size, eps, 0 };
 
     return dx12_shader_dispatch_simple(dev, cmd, "layer_norm",
-        &params, sizeof(params), nullptr, nullptr, nullptr, n);
+        &params, sizeof(params),
+        dx12_backend_buffer_from_tensor(dst->src[0]),
+        nullptr,
+        dx12_backend_buffer_from_tensor(dst), n);
 }
 
 // ROPE (Rotary Position Embedding)
@@ -310,7 +329,7 @@ bool dx12_dispatch_rope(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* d
     uint32_t head_dim = (uint32_t)dst->ne[0];
     uint32_t seq_len = (uint32_t)dst->ne[1];
     uint32_t num_heads = (uint32_t)dst->ne[2];
-    float theta = 10000.0f; // From dst->op_params
+    float theta = 10000.0f;
 
     struct rope_params {
         uint32_t n;
@@ -323,7 +342,10 @@ bool dx12_dispatch_rope(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* d
     } params = { n, head_dim, seq_len, num_heads, theta, 1.0f, 0, 0 };
 
     return dx12_shader_dispatch_simple(dev, cmd, "rope",
-        &params, sizeof(params), nullptr, nullptr, nullptr, n);
+        &params, sizeof(params),
+        dx12_backend_buffer_from_tensor(dst->src[0]),
+        nullptr,
+        dx12_backend_buffer_from_tensor(dst), n);
 }
 
 // DIAG_MASK_INF: causal mask
@@ -333,7 +355,10 @@ bool dx12_dispatch_diag_mask_inf(dx12_device* dev, dx12_command_list* cmd, ggml_
     struct { uint32_t n; uint32_t seq_len; uint32_t pad[2]; } params = { n, seq_len, 0, 0 };
 
     return dx12_shader_dispatch_simple(dev, cmd, "diag_mask_inf",
-        &params, sizeof(params), nullptr, nullptr, nullptr, n);
+        &params, sizeof(params),
+        dx12_backend_buffer_from_tensor(dst->src[0]),
+        nullptr,
+        dx12_backend_buffer_from_tensor(dst), n);
 }
 
 // GET_ROWS: embedding lookup
@@ -345,7 +370,10 @@ bool dx12_dispatch_get_rows(dx12_device* dev, dx12_command_list* cmd, ggml_tenso
         { n, emb_dim, num_rows, 0 };
 
     return dx12_shader_dispatch_simple(dev, cmd, "get_rows",
-        &params, sizeof(params), nullptr, nullptr, nullptr, n);
+        &params, sizeof(params),
+        dx12_backend_buffer_from_tensor(dst->src[0]),
+        dx12_backend_buffer_from_tensor(dst->src[1]),
+        dx12_backend_buffer_from_tensor(dst), n);
 }
 
 // PERMUTE: tensor dimension reordering
@@ -359,7 +387,10 @@ bool dx12_dispatch_permute(dx12_device* dev, dx12_command_list* cmd, ggml_tensor
     params.pad = 0;
 
     return dx12_shader_dispatch_simple(dev, cmd, "permute",
-        &params, sizeof(params), nullptr, nullptr, nullptr, n);
+        &params, sizeof(params),
+        dx12_backend_buffer_from_tensor(dst->src[0]),
+        nullptr,
+        dx12_backend_buffer_from_tensor(dst), n);
 }
 
 // CPY: tensor copy / cast
@@ -369,7 +400,10 @@ bool dx12_dispatch_cpy(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* ds
         { n, (uint32_t)(dst->src[0] ? dst->src[0]->type : 0), (uint32_t)dst->type, 0 };
 
     return dx12_shader_dispatch_simple(dev, cmd, "copy",
-        &params, sizeof(params), nullptr, nullptr, nullptr, n);
+        &params, sizeof(params),
+        dx12_backend_buffer_from_tensor(dst->src[0]),
+        nullptr,
+        dx12_backend_buffer_from_tensor(dst), n);
 }
 
 // NONE: no-op

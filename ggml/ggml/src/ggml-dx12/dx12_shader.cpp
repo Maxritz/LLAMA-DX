@@ -102,32 +102,14 @@ bool dx12_shader_dispatch(dx12_device* dev,
     // Bind SRVs (root params 1+)
     for (uint32_t i = 0; i < num_srvs && i < 4; i++) {
         if (srvs[i]) {
-            switch (dispatch.sig_type) {
-                case dx12_root_signature_type::simple_2in_1out:
-                case dx12_root_signature_type::gemm:
-                case dx12_root_signature_type::reduction:
-                    dx12_cmd_list_set_compute_root_shader_resource_view(
-                        cmd, 1 + i, srvs[i]->gpu_address);
-                    break;
-                case dx12_root_signature_type::dequant_gemm:
-                    dx12_cmd_list_set_compute_root_shader_resource_view(
-                        cmd, 1 + i, srvs[i]->gpu_address);
-                    break;
-                case dx12_root_signature_type::attention:
-                    dx12_cmd_list_set_compute_root_shader_resource_view(
-                        cmd, 1 + i, srvs[i]->gpu_address);
-                    break;
-                default:
-                    dx12_cmd_list_set_compute_root_shader_resource_view(
-                        cmd, 1 + i, srvs[i]->gpu_address);
-                    break;
-            }
+            dx12_cmd_list_set_compute_root_shader_resource_view(
+                cmd, 1 + i, srvs[i]->gpu_address);
         }
     }
 
     // Bind UAV (last root param)
     if (uav) {
-        uint32_t uav_slot = 3; // Default for simple_2in_1out
+        uint32_t uav_slot = 3;
         switch (dispatch.sig_type) {
             case dx12_root_signature_type::dequant_gemm: uav_slot = 4; break;
             case dx12_root_signature_type::attention: uav_slot = 4; break;
@@ -156,7 +138,6 @@ bool dx12_shader_dispatch_simple(dx12_device* dev,
                                  uint32_t elements) {
     if (!dev || !cmd || !shader_name || !uav) return false;
 
-    // Calculate dispatch size
     const dx12_shader_entry* entry = dx12_get_shader_entry(shader_name);
     uint32_t tg_size = entry ? entry->thread_group_x : 256;
     uint32_t dispatch_x = (elements + tg_size - 1) / tg_size;
