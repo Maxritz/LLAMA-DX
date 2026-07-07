@@ -25,8 +25,11 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // These are consumed by the Windows loader before D3D12CreateDevice is called
+// Only effective when built as DLL; for EXE builds, define DX12_SYSTEM_D3D12
+#if !defined(DX12_SYSTEM_D3D12)
 extern "C" { __declspec(dllexport) extern const UINT D3D12SDKVersion = 721; }
 extern "C" { __declspec(dllexport) extern const char* D3D12SDKPath = ".\\D3D12\\"; }
+#endif
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Logging

@@ -59,7 +59,9 @@ dx12_buffer* dx12_buffer_create(dx12_device* dev, size_t size, dx12_heap_type ty
     desc.Format = DXGI_FORMAT_UNKNOWN;
     desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    desc.Flags = (type == dx12_heap_type::default_)
+        ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+        : D3D12_RESOURCE_FLAG_NONE;
 
     auto* buf = new dx12_buffer();
     buf->heap = type;
@@ -295,7 +297,7 @@ dx12_buffer* dx12_memory_pool::allocate(size_t size) {
     }
 
     // Allocate new block
-    size_t block_alloc = std::max(block_size, size);
+    size_t block_alloc = (std::max)(block_size, size);
     block_alloc = (block_alloc + 1024 * 1024 - 1) & ~(1024 * 1024 - 1); // 1MB align
 
     dx12_buffer* block = dx12_buffer_create(dev, block_alloc, heap_type);

@@ -265,6 +265,13 @@ static void dx12_buf_free(ggml_backend_buffer_t buf) {
 static void* dx12_buf_get_base(ggml_backend_buffer_t buf) {
     auto* ctx = (dx12_backend_buffer_context*)buf->context;
     if (!ctx || !ctx->gpu_buffer) return nullptr;
+    // For default-heap GPU buffers, there is no CPU-accessible base.
+    // ggml_backend_buffer_alloc_tensor uses get_base as a sentinel for
+    // sub-allocation offset tracking; returning nullptr makes tensor->data
+    // hold the raw byte offset, which we use in dispatch.
+    if (ctx->gpu_buffer->heap == dx12_heap_type::default_) {
+        return nullptr;
+    }
     return dx12_buffer_map(ctx->gpu_buffer);
 }
 
@@ -322,6 +329,13 @@ static struct ggml_backend_buffer_i dx12_buffer_iface = {
 
 dx12_buffer* dx12_backend_buffer_from_tensor(const ggml_tensor* tensor) {
     return dx12_backend_get_gpu_buffer(tensor);
+}
+
+D3D12_GPU_VIRTUAL_ADDRESS dx12_backend_tensor_gpu_addr(const ggml_tensor* tensor) {
+    dx12_buffer* buf = dx12_backend_get_gpu_buffer(tensor);
+    if (!buf) return 0;
+    size_t offset = tensor->data ? (size_t)(uintptr_t)tensor->data : 0;
+    return buf->gpu_address + offset;
 }
 
 static dx12_buffer* dx12_backend_get_gpu_buffer(const ggml_tensor* t) {

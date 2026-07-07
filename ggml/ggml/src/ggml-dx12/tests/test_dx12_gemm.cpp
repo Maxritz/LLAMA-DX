@@ -11,6 +11,9 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <cstdint>
+
+typedef uint16_t half;
 
 static int g_passed = 0, g_failed = 0;
 #define TEST(n) void test_##n()
@@ -29,7 +32,7 @@ TEST(gemm_f16_small) {
     auto* c=dx12_buffer_create(g_dev,sz_c,dx12_heap_type::default_);
     ASSERT(a&&b&&c);
     half ha[256],hb[256];
-    for(int i=0;i<256;i++){ha[i]=(half)1.0f;hb[i]=(half)1.0f;}
+    for(int i=0;i<256;i++){ha[i]=(half)0x3C00u;hb[i]=(half)0x3C00u;} // F16 1.0
     dx12_buffer_upload(a,ha,sz_a);dx12_buffer_upload(b,hb,sz_b);
 
     dx12_command_list* cmd=dx12_cmd_list_create(g_dev);

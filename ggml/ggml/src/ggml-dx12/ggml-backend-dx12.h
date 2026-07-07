@@ -267,6 +267,7 @@ void        ggml_backend_dx12_print_info(void);
  */
 struct dx12_buffer;
 dx12_buffer* dx12_backend_buffer_from_tensor(const struct ggml_tensor* tensor);
+uint64_t     dx12_backend_tensor_gpu_addr(const struct ggml_tensor* tensor);
 
 #endif // __cplusplus
 
