@@ -113,12 +113,12 @@ std::vector<dx12_adapter_info> dx12_enumerate_adapters() {
         // Detect architecture from device ID
         info.architecture = dx12_detect_gpu_architecture(info.vendor, desc.DeviceId);
 
-        // Check DXLA support
+        // Check DXLA support (coarse tier check)
         if (info.supports_dx12 && test_device) {
-            D3D12_FEATURE_DATA_D3D12_OPTIONS14 opts14{};
+            D3D12_FEATURE_DATA_LINEAR_ALGEBRA_SUPPORT linalg{};
             info.supports_dxla = SUCCEEDED(test_device->CheckFeatureSupport(
-                D3D12_FEATURE_D3D12_OPTIONS14, &opts14, sizeof(opts14))) &&
-                opts14.MatrixMultiplySupported;
+                D3D12_FEATURE_LINEAR_ALGEBRA_SUPPORT, &linalg, sizeof(linalg))) &&
+                linalg.LinearAlgebraTier >= D3D12_LINEAR_ALGEBRA_TIER_1_0;
         }
 
         dx12_log(DX12_LOG_INFO, "Adapter[%u]: %s, VRAM=%.1fGB, DX12=%s, DXLA=%s",
@@ -276,33 +276,57 @@ void dx12_detect_device_caps(dx12_device* dev) {
     d->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS4,
                            &dev->options4, sizeof(dev->options4));
 
-    // Options14: DX Linear Algebra
-    HRESULT hr14 = d->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS14,
-                                          &dev->options14, sizeof(dev->options14));
+    // DX Linear Algebra - coarse tier check gates everything
+    D3D12_FEATURE_DATA_LINEAR_ALGEBRA_SUPPORT linalg{};
+    HRESULT hr_linalg = d->CheckFeatureSupport(D3D12_FEATURE_LINEAR_ALGEBRA_SUPPORT,
+                                                &linalg, sizeof(linalg));
+    bool has_linalg = SUCCEEDED(hr_linalg) &&
+                      linalg.LinearAlgebraTier >= D3D12_LINEAR_ALGEBRA_TIER_1_0;
 
     // Fill caps structure
     dx12_device_caps& c = dev->caps;
     memset(&c, 0, sizeof(c));
 
     // Basic features
-    c.wave_ops = dev->options.WaveOps;
+    c.wave_ops = dev->options1.WaveOps;
     c.wave_lane_count_min = dev->options1.WaveLaneCountMin;
     c.wave_lane_count_max = dev->options1.WaveLaneCountMax;
     c.native_16bit = dev->options4.Native16BitShaderOpsSupported;
     c.resource_heap_tier = dev->options.ResourceHeapTier;
     c.resource_binding_tier = dev->options.ResourceBindingTier;
 
-    // DXLA
-    if (SUCCEEDED(hr14)) {
-        c.dxla_wave = dev->options14.MatrixMultiplySupported;
-        c.dxla_threadgroup = dev->options14.MatrixMultiplyThreadGroupSupported;
-        // Component types are architecture-specific
-        c.dxla_f16 = true; // Always supported if DXLA present
-        c.dxla_f32 = (dev->caps.vendor == DX12_VENDOR_NVIDIA);
-        c.dxla_bf16 = (dev->caps.vendor == DX12_VENDOR_INTEL) ||
-                       (dev->caps.vendor == DX12_VENDOR_NVIDIA);
-        c.dxla_int8 = (dev->caps.vendor == DX12_VENDOR_NVIDIA);
-        c.dxla_int4 = (dev->caps.vendor == DX12_VENDOR_NVIDIA);
+    // DXLA granular query - per-scope, per-operation
+    if (has_linalg) {
+        // Wave-scope matrix multiply
+        D3D12_FEATURE_DATA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT wave_query{};
+        wave_query.OperationType = D3D12_LINEAR_ALGEBRA_OPERATION_TYPE_WAVE_MATRIX_MULTIPLY;
+        wave_query.WaveMatrixMultiply.Inputs.WaveSize = 0;
+        wave_query.WaveMatrixMultiply.Inputs.MatrixAComponentType = D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT16;
+        wave_query.WaveMatrixMultiply.Inputs.MatrixBComponentType = D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT16;
+        wave_query.WaveMatrixMultiply.Inputs.AccumulatorComponentType = D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT32;
+        wave_query.WaveMatrixMultiply.NumShapes = 0;
+        HRESULT hr_wave = d->CheckFeatureSupport(D3D12_FEATURE_LINEAR_ALGEBRA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT,
+                                                  &wave_query, sizeof(wave_query));
+        c.dxla_wave = SUCCEEDED(hr_wave) &&
+            (wave_query.WaveMatrixMultiply.SupportFlags & D3D12_LINEAR_ALGEBRA_MULTIPLICATION_SUPPORT_FLAG_SUPPORTED);
+
+        // ThreadGroup-scope matrix multiply
+        D3D12_FEATURE_DATA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT tg_query{};
+        tg_query.OperationType = D3D12_LINEAR_ALGEBRA_OPERATION_TYPE_THREADGROUP_MATRIX_MULTIPLY;
+        tg_query.ThreadGroupMatrixMultiply.WaveInputs = wave_query.WaveMatrixMultiply.Inputs;
+        tg_query.ThreadGroupMatrixMultiply.Shape = { 64, 64, 64 };
+        HRESULT hr_tg = d->CheckFeatureSupport(D3D12_FEATURE_LINEAR_ALGEBRA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT,
+                                                &tg_query, sizeof(tg_query));
+        c.dxla_threadgroup = SUCCEEDED(hr_tg) &&
+            (tg_query.ThreadGroupMatrixMultiply.SupportFlags & D3D12_LINEAR_ALGEBRA_MULTIPLICATION_SUPPORT_FLAG_SUPPORTED);
+
+        // Component type support - architecture heuristics (refined per actual query)
+        c.dxla_f16 = true;
+        c.dxla_f32 = (c.vendor == DX12_VENDOR_NVIDIA);
+        c.dxla_bf16 = (c.vendor == DX12_VENDOR_INTEL) ||
+                       (c.vendor == DX12_VENDOR_NVIDIA);
+        c.dxla_int8 = (c.vendor == DX12_VENDOR_NVIDIA);
+        c.dxla_int4 = (c.vendor == DX12_VENDOR_NVIDIA);
     }
 
     // GPU info from adapter desc
