@@ -40,7 +40,8 @@ void main(uint3 tid : SV_DispatchThreadID) {
 
         [unroll(4)]
         for (uint j = 0; j < 4; j++) {
-            int8_t q = (int8_t)((packed >> (j * 8)) & 0xFF);
+            int q = (int)((packed >> (j * 8)) & 0xFF);
+            if (q >= 128) q -= 256;
             float val = d * (float)q;
             uint elem_idx = out_base + i * 4 + j;
             if (elem_idx < params.num_elements) {

@@ -15,7 +15,7 @@ ByteAddressBuffer v_buf : register(t1);
 RWByteAddressBuffer out_buf : register(u0);
 
 half load(ByteAddressBuffer b,uint i){uint a=i*2;uint p=b.Load(a&~2);uint16_t v=(a&2)?(uint16_t)(p>>16):(uint16_t)(p&0xFFFF);return(half)f16_to_f32(v);}
-void store(uint i,half v){uint a=i*2;uint16_t h=f32_to_f16((float)v);uint e=out_buf.Load(a&~2);out_buf.Store(a&~2,(a&2)?((e&0xFFFF)|((uint)h<<16)):((e&0xFFFF0000)|h));}
+void store(uint i,half v){ store_packed_f16(out_buf,i,v); }
 
 using MatA=Matrix<ComponentType::F16,16,16,MatrixUse::A,MatrixScope::Wave>;
 using MatB=Matrix<ComponentType::F16,16,16,MatrixUse::B,MatrixScope::Wave>;
@@ -36,5 +36,5 @@ void main(uint3 tid:SV_DispatchThreadID,uint3 gid:SV_GroupID){
         acc.MultiplyAccumulate(ma,mb);
     }
     uint out_idx=((b*params.heads+h)*params.seq_q+tq)*params.head_dim+td;
-    store(out_idx,(half)acc[tid.x/16][tid.x%16]);
+    store(out_idx,(half)acc.Get((tid.x/16)*16+(tid.x%16)));
 }

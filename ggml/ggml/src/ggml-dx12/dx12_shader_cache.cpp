@@ -25,7 +25,12 @@ ID3D12PipelineState* dx12_shader_cache::load_pso(const char* name, const void* c
     ComPtr<ID3D12PipelineState> pso;
     HRESULT hr = dev->device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pso));
     if (FAILED(hr)) {
-        dx12_log(DX12_LOG_ERROR, "Failed to create PSO for %s: 0x%08X", name, hr);
+        if (hr == DXGI_ERROR_DEVICE_REMOVED) {
+            HRESULT reason = dev->device->GetDeviceRemovedReason();
+            dx12_log(DX12_LOG_ERROR, "Failed to create PSO for %s: DEVICE_REMOVED, reason: 0x%08X", name, reason);
+        } else {
+            dx12_log(DX12_LOG_ERROR, "Failed to create PSO for %s: 0x%08X", name, hr);
+        }
         return nullptr;
     }
 

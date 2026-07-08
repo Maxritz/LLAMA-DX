@@ -190,13 +190,19 @@ bool dx12_gemm_dispatch_dxla_wave(dx12_device* dev,
 
     struct dxla_constants {
         uint32_t M, N, K;
+        uint32_t stride_a, stride_b, stride_c;
+        uint32_t transposed_b;
         uint32_t wave_size;
-        uint32_t reserved[12];
+        uint32_t reserved[9];
     } dc{};
 
     dc.M = params->M;
     dc.N = params->N;
     dc.K = params->K;
+    dc.stride_a = params->K;
+    dc.stride_b = params->transposed_b ? params->N : params->K;
+    dc.stride_c = params->N;
+    dc.transposed_b = params->transposed_b ? 1 : 0;
     dc.wave_size = wave_size;
 
     struct dx12_shader_dispatch dispatch{};
@@ -303,7 +309,7 @@ bool dx12_gemm_dispatch_quantized(dx12_device* dev,
 
     struct dx12_shader_dispatch dispatch{};
     dispatch.shader_name = shader_name;
-    dispatch.sig_type = dx12_root_signature_type::dequant_gemm;
+    dispatch.sig_type = dx12_root_signature_type::gemm;
     dispatch.thread_group_x = dispatch_x;
     dispatch.thread_group_y = dispatch_y;
     dispatch.thread_group_z = params->batch_count;

@@ -318,10 +318,21 @@ dx12_pso* dx12_pso_cache::get_or_create(const char* shader_name,
         return it->second.get();
     }
 
+    dx12_log(DX12_LOG_INFO, "PSO: %s cso=%zuB sig_type=%d creating root signature...",
+             shader_name, cso_size, (int)sig_type);
+    fflush(stderr);
+
     // Get root signature
     dx12_root_signature_cache sig_cache(dev);
     ID3D12RootSignature* root_sig = sig_cache.get_or_create(sig_type);
     if (!root_sig) return nullptr;
+
+    dx12_log(DX12_LOG_INFO, "PSO: %s root signature created, creating pipeline...",
+             shader_name);
+    fflush(stderr);
+
+    dx12_log(DX12_LOG_INFO, "PSO: %s cso=%zuB sig_type=%d root_sig=%p",
+             shader_name, cso_size, (int)sig_type, (void*)root_sig);
 
     // Create PSO
     D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc{};
@@ -332,8 +343,11 @@ dx12_pso* dx12_pso_cache::get_or_create(const char* shader_name,
     ComPtr<ID3D12PipelineState> pipeline;
     HRESULT hr = dev->device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&pipeline));
     if (FAILED(hr)) {
-        dx12_log(DX12_LOG_ERROR, "CreateComputePipelineState for %s failed: 0x%08X",
-            shader_name, hr);
+        HRESULT reason = dev->device->GetDeviceRemovedReason();
+        dx12_log(DX12_LOG_ERROR,
+                 "CreateComputePipelineState for %s failed: hr=0x%08X reason=0x%08X (%s)",
+                 shader_name, hr, reason,
+                 hr == DXGI_ERROR_DEVICE_REMOVED ? "DEVICE_REMOVED" : "");
         return nullptr;
     }
 

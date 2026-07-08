@@ -14,10 +14,7 @@ float load_f32(uint i){return asfloat(src.Load(i*4));}
 float load_f16(uint i){uint a=i*2;uint p=src.Load(a&~2);uint16_t v=(a&2)?(uint16_t)(p>>16):(uint16_t)(p&0xFFFF);return f16_to_f32(v);}
 
 void store_f32(uint i,float v){dst.Store(i*4,asuint(v));}
-void store_f16(uint i,float v){
-    uint a=i*2;uint16_t h=f32_to_f16(v);uint e=dst.Load(a&~2);
-    dst.Store(a&~2,(a&2)?((e&0xFFFF)|((uint)h<<16)):((e&0xFFFF0000)|h));
-}
+void store_f16(uint i,float v){ store_packed_f16(dst,i,(half)v); }
 
 [numthreads(256,1,1)]
 void main(uint3 tid:SV_DispatchThreadID){

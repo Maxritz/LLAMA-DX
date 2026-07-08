@@ -78,6 +78,8 @@ dx12_buffer* dx12_buffer_create(dx12_device* dev, size_t size, dx12_heap_type ty
         IID_PPV_ARGS(&buf->resource));
 
     if (FAILED(hr)) {
+        dx12_log(DX12_LOG_ERROR, "CreateCommittedResource failed: hr=0x%08X size=%zu heap=%d",
+                 hr, aligned_size, (int)type);
         delete buf;
         return nullptr;
     }
@@ -143,10 +145,17 @@ void dx12_buffer_unmap(dx12_buffer* buf) {
 
 bool dx12_buffer_upload(dx12_buffer* buf, const void* data, size_t size, size_t offset) {
     if (!buf || !data || size == 0) return false;
-    if (offset + size > buf->size) return false;
+    if (offset + size > buf->size) {
+        dx12_log(DX12_LOG_ERROR, "buffer_upload overflow: offset=%zu size=%zu buf_size=%zu",
+                 offset, size, buf->size);
+        return false;
+    }
 
     void* mapped = dx12_buffer_map(buf);
-    if (!mapped) return false;
+    if (!mapped) {
+        dx12_log(DX12_LOG_ERROR, "buffer_upload: map failed heap=%d size=%zu", (int)buf->heap, buf->size);
+        return false;
+    }
 
     memcpy(static_cast<char*>(mapped) + offset, data, size);
     return true;
@@ -214,6 +223,11 @@ void dx12_buffer_transition(dx12_command_list* cmd,
                             dx12_buffer* buf,
                             D3D12_RESOURCE_STATES new_state) {
     if (!cmd || !buf || buf->state == new_state) return;
+
+    // UPLOAD/READBACK heaps have fixed states and cannot be transitioned
+    if (buf->heap == dx12_heap_type::upload || buf->heap == dx12_heap_type::readback) {
+        return;
+    }
 
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;

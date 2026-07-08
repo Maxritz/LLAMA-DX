@@ -1,7 +1,7 @@
 # ggml-backend-dx12/CMakeLists.txt
 # DirectX 12 backend for llama.cpp
 # Targets: AMD RDNA4/RDNA3/RDNA2, NVIDIA Ada/Ampere, Intel Arc
-# Requires: Windows 11, DirectX Agility SDK 1.721+, Shader Model 6.10
+# Requires: Windows 11, DirectX Agility SDK 1.620+, Shader Model 6.10
 
 cmake_minimum_required(VERSION 3.25)
 
@@ -10,36 +10,17 @@ cmake_minimum_required(VERSION 3.25)
 # ═══════════════════════════════════════════════════════════════════════════════
 include(FetchContent)
 
-set(DX12_AGILITY_SDK_VERSION "1.721.0" CACHE STRING "DirectX Agility SDK version")
-set(DX12_AGILITY_SDK_URL 
-    "https://www.nuget.org/api/v2/package/Microsoft.Direct3D.D3D12/${DX12_AGILITY_SDK_VERSION}")
+set(DX12_AGILITY_SDK_VERSION "1.721.1" CACHE STRING "DirectX Agility SDK version")
+set(DX12_AGILITY_SDK_PATH "E:/DXllama/agility1.721.1" CACHE PATH "Path to local Agility SDK root")
 
-FetchContent_Declare(
-    agilitysdk
-    URL ${DX12_AGILITY_SDK_URL}
-    URL_MD5 ""
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-)
-
-message(STATUS "Fetching DirectX Agility SDK ${DX12_AGILITY_SDK_VERSION}...")
-FetchContent_MakeAvailable(agilitysdk)
-
-set(AGILITY_SDK_DIR ${agilitysdk_SOURCE_DIR})
-message(STATUS "Agility SDK extracted to: ${AGILITY_SDK_DIR}")
+set(AGILITY_SDK_DIR ${DX12_AGILITY_SDK_PATH})
+message(STATUS "Using Agility SDK from: ${AGILITY_SDK_DIR}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # DXC Compiler Detection
 # ═══════════════════════════════════════════════════════════════════════════════
 # DXC can come from: (1) Windows SDK, (2) Agility SDK, (3) Standalone
-find_program(DXC_EXECUTABLE dxc.exe
-    PATHS
-        "${CMAKE_VS_WINDOWS_SDK_DIR}/bin/${CMAKE_VS_WINDOWS_SDK_VERSION}/x64"
-        "${CMAKE_VS_WINDOWS_SDK_DIR}/bin/x64"
-        "${AGILITY_SDK_DIR}/build/native/bin/x64"
-        "$ENV{WindowsSdkDir}/bin/$ENV{WindowsSDKVersion}/x64"
-        "$ENV{WindowsSdkDir}/bin/x64"
-    DOC "DirectX Shader Compiler"
-)
+set(DXC_EXECUTABLE "E:/DXllama/dxc/bin/x64/dxc.exe" CACHE FILEPATH "DXC compiler")
 
 if(NOT DXC_EXECUTABLE)
     message(FATAL_ERROR "dxc.exe not found. Install Windows SDK 22621+ or DXC standalone.")
@@ -99,6 +80,7 @@ target_include_directories(ggml-backend-dx12
     PRIVATE
         ${AGILITY_SDK_DIR}/build/native/include
         ${CMAKE_CURRENT_SOURCE_DIR}/shaders
+        ${CMAKE_CURRENT_SOURCE_DIR}/../  # ggml/src/ for ggml-impl.h, ggml-backend-impl.h
 )
 
 # Link DirectX libraries
@@ -113,12 +95,16 @@ target_link_libraries(ggml-backend-dx12
 target_compile_definitions(ggml-backend-dx12
     PRIVATE
         DX12_AGILITY_SDK_VERSION=${DX12_AGILITY_SDK_VERSION}
+        DX12_SYSTEM_D3D12
         $<$<CONFIG:Debug>:DX12_DEBUG_LAYER>
         $<$<CONFIG:Debug>:DX12_GPU_VALIDATION>
 )
 
 # C++20 required for designated initializers and concepts
-target_compile_features(ggml-backend-dx12 PUBLIC cxx_std_20)
+target_compile_features(ggml-backend-dx12 PRIVATE cxx_std_20)
+
+target_link_libraries(ggml-backend-dx12 PRIVATE ggml-base)
+target_link_libraries(ggml PUBLIC ggml-backend-dx12)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Shader Compilation
@@ -159,6 +145,7 @@ set(DX12_SHADERS
     diag_mask_inf
     flash_attn
     ffn_fused
+    set_rows
 )
 
 # Compile each .hlsl -> .cso
@@ -180,6 +167,8 @@ foreach(SHADER_NAME ${DX12_SHADERS})
             -Zi
             -Qembed_debug
             -HV 2021
+            -I "${DX12_SHADER_DIR}"
+            -I "E:/DXllama/dxc/inc/hlsl"
             -Fo ${CSO_FILE}
             ${HLSL_FILE}
         DEPENDS ${HLSL_FILE} ${DX12_SHADER_DIR}/common.hlsli
@@ -223,20 +212,27 @@ set(D3D12_CORE_DLL ${AGILITY_SDK_DIR}/build/native/bin/x64/D3D12Core.dll)
 set(D3D12_SDK_LAYERS_DLL ${AGILITY_SDK_DIR}/build/native/bin/x64/d3d12SDKLayers.dll)
 
 if(EXISTS ${D3D12_CORE_DLL})
-    add_custom_command(TARGET ggml-backend-dx12 POST_BUILD
+    set(DX12_COPY_DLLS_COMMANDS
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:ggml>/D3D12"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${D3D12_CORE_DLL}
-            $<TARGET_FILE_DIR:ggml-backend-dx12>/D3D12/D3D12Core.dll
-        COMMENT "Copying D3D12Core.dll"
+            "$<TARGET_FILE_DIR:ggml>/D3D12/D3D12Core.dll"
     )
 endif()
 
 if(EXISTS ${D3D12_SDK_LAYERS_DLL})
-    add_custom_command(TARGET ggml-backend-dx12 POST_BUILD
+    list(APPEND DX12_COPY_DLLS_COMMANDS
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${D3D12_SDK_LAYERS_DLL}
-            $<TARGET_FILE_DIR:ggml-backend-dx12>/D3D12/d3d12SDKLayers.dll
-        COMMENT "Copying d3d12SDKLayers.dll"
+            "$<TARGET_FILE_DIR:ggml>/D3D12/d3d12SDKLayers.dll"
+    )
+endif()
+
+if(DX12_COPY_DLLS_COMMANDS)
+    add_custom_target(dx12_copy_agility_dlls ALL
+        ${DX12_COPY_DLLS_COMMANDS}
+        DEPENDS ggml
+        COMMENT "Copying Agility SDK DLLs to runtime output"
     )
 endif()
 

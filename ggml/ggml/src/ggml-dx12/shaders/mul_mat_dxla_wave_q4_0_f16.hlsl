@@ -8,8 +8,8 @@
 #include <dx/linalg.h>
 using namespace dx::linalg;
 
-struct GEMMParams { uint M,N,K; uint stride_a,stride_b,stride_c; uint transposed_b; uint wave_size; uint reserved[9]; };
-ConstantBuffer<GEMMParams> params : register(b0);
+struct DXLAWaveQ4GEMMParams { uint M,N,K; uint stride_a,stride_b,stride_c; uint transposed_b; uint wave_size; uint reserved[9]; };
+ConstantBuffer<DXLAWaveQ4GEMMParams> params : register(b0);
 ByteAddressBuffer weights_a : register(t0);  // Q4_0 quantized
 ByteAddressBuffer matrix_b : register(t1);    // F16
 RWByteAddressBuffer result : register(u0);
@@ -31,7 +31,7 @@ float dequant(uint flat_idx){
 }
 
 half load_b(uint idx){uint a=idx*2;uint p=matrix_b.Load(a&~2);uint16_t v=(a&2)?(uint16_t)(p>>16):(uint16_t)(p&0xFFFF);return(half)f16_to_f32(v);}
-void store_c(uint idx,half v){uint a=idx*2;uint16_t h=f32_to_f16((float)v);uint e=result.Load(a&~2);result.Store(a&~2,(a&2)?((e&0xFFFF)|((uint)h<<16)):((e&0xFFFF0000)|h));}
+void store_c(uint idx,half v){ store_packed_f16(result,idx,v); }
 
 using MatA=Matrix<ComponentType::F16,16,16,MatrixUse::A,MatrixScope::Wave>;
 using MatB=Matrix<ComponentType::F16,16,16,MatrixUse::B,MatrixScope::Wave>;
@@ -53,5 +53,5 @@ void main(uint3 tid:SV_DispatchThreadID,uint3 gid:SV_GroupID){
         }
         acc.MultiplyAccumulate(ma,mb);
     }
-    store_c(gr*params.stride_c+gc,(half)acc[lr][lc]);
+    store_c(gr*params.stride_c+gc,(half)acc.Get(lr*16+lc));
 }

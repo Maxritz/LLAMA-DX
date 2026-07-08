@@ -24,9 +24,7 @@ RWByteAddressBuffer out_buf : register(u0);
 half load_qkv(ByteAddressBuffer buf, uint idx) {
     uint a=idx*2; uint p=buf.Load(a&~2); uint16_t v=(a&2)?(uint16_t)(p>>16):(uint16_t)(p&0xFFFF); return (half)f16_to_f32(v);
 }
-void store_out(uint idx, half v) {
-    uint a=idx*2; uint16_t h=f32_to_f16((float)v); uint e=out_buf.Load(a&~2); out_buf.Store(a&~2,(a&2)?((e&0xFFFF)|((uint)h<<16)):((e&0xFFFF0000)|h));
-}
+void store_out(uint idx, half v) { store_packed_f16(out_buf, idx, v); }
 
 groupshared half q_tile[BLOCK_SIZE];
 groupshared half k_tile[BLOCK_SIZE];

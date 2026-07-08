@@ -5,7 +5,7 @@
 
 #include "common.hlsli"
 
-struct GEMMParams {
+struct Q8GEMMParams {
     uint M, N, K;
     uint stride_a, stride_b, stride_c;
     uint transposed_b;
@@ -13,7 +13,7 @@ struct GEMMParams {
     uint reserved[8];
 };
 
-ConstantBuffer<GEMMParams> params : register(b0);
+ConstantBuffer<Q8GEMMParams> params : register(b0);
 ByteAddressBuffer weights_a : register(t0);  // Q8_0 quantized
 ByteAddressBuffer matrix_b : register(t1);    // F16
 RWByteAddressBuffer result : register(u0);
@@ -28,14 +28,7 @@ half load_f16_b(uint idx) {
     return (half)f16_to_f32(bits);
 }
 
-void store_f16_c(uint idx, half val) {
-    uint addr = idx * 2;
-    uint16_t h = f32_to_f16((float)val);
-    uint existing = result.Load(addr & ~2);
-    uint new_val = (addr & 2) ? ((existing & 0xFFFF) | ((uint)h << 16))
-                              : ((existing & 0xFFFF0000) | h);
-    result.Store(addr & ~2, new_val);
-}
+void store_f16_c(uint idx, half val) { store_packed_f16(result, idx, val); }
 
 float dequant_q8_0_element(uint flat_idx) {
     uint block_idx = flat_idx / Q8_0_BLOCK_SIZE;
@@ -49,7 +42,8 @@ float dequant_q8_0_element(uint flat_idx) {
     uint q_byte_offset = byte_offset + 2 + j;
     uint q_word = weights_a.Load(q_byte_offset & ~3);
     uint q_shift = (q_byte_offset & 3) * 8;
-    int8_t q = (int8_t)((q_word >> q_shift) & 0xFF);
+    int q = (int)((q_word >> q_shift) & 0xFF);
+    if (q >= 128) q -= 256;
 
     return d * (float)q;
 }

@@ -39,18 +39,18 @@ half load_f16(ByteAddressBuffer buf, uint idx) {
     return (half)f16_to_f32(bits);
 }
 
-// Store F16 to byte address
+// Store F16 to byte address.
+// Two adjacent f16 values share one 32-bit word, so each thread would
+// otherwise do a non-atomic read-modify-write and clobber its neighbour's
+// half. Use InterlockedOr (buffer is zero-initialised) so both halves land.
 void store_f16(RWByteAddressBuffer buf, uint idx, half val) {
     uint addr = idx * 2;
-    uint16_t h = f32_to_f16((float)val);
-    uint existing = buf.Load(addr & ~2);
-    uint new_val;
+    uint h = (uint)f32_to_f16((float)val);
     if (addr & 2) {
-        new_val = (existing & 0xFFFF) | ((uint)h << 16);
+        buf.InterlockedOr(addr & ~2, h << 16);
     } else {
-        new_val = (existing & 0xFFFF0000) | h;
+        buf.InterlockedOr(addr & ~2, h);
     }
-    buf.Store(addr & ~2, new_val);
 }
 
 [numthreads(TILE_N, TILE_M, 1)]

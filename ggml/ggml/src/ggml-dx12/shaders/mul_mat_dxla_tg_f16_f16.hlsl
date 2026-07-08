@@ -8,15 +8,15 @@
 #include <dx/linalg.h>
 using namespace dx::linalg;
 
-struct GEMMParams { uint M,N,K; uint stride_a,stride_b,stride_c; uint transposed_b; uint reserved[11]; };
-ConstantBuffer<GEMMParams> params : register(b0);
+struct DXLATGGEMMParams { uint M,N,K; uint stride_a,stride_b,stride_c; uint transposed_b; uint reserved[11]; };
+ConstantBuffer<DXLATGGEMMParams> params : register(b0);
 ByteAddressBuffer matrix_a : register(t0);
 ByteAddressBuffer matrix_b : register(t1);
 RWByteAddressBuffer result : register(u0);
 
 half load_a(uint idx){uint a=idx*2;uint p=matrix_a.Load(a&~2);uint16_t v=(a&2)?(uint16_t)(p>>16):(uint16_t)(p&0xFFFF);return(half)f16_to_f32(v);}
 half load_b(uint idx){uint a=idx*2;uint p=matrix_b.Load(a&~2);uint16_t v=(a&2)?(uint16_t)(p>>16):(uint16_t)(p&0xFFFF);return(half)f16_to_f32(v);}
-void store_c(uint idx,half v){uint a=idx*2;uint16_t h=f32_to_f16((float)v);uint e=result.Load(a&~2);result.Store(a&~2,(a&2)?((e&0xFFFF)|((uint)h<<16)):((e&0xFFFF0000)|h));}
+void store_c(uint idx,half v){ store_packed_f16(result,idx,v); }
 
 using MatA=Matrix<ComponentType::F16,32,32,MatrixUse::A,MatrixScope::ThreadGroup>;
 using MatB=Matrix<ComponentType::F16,32,32,MatrixUse::B,MatrixScope::ThreadGroup>;
@@ -50,6 +50,6 @@ void main(uint3 tid:SV_DispatchThreadID,uint3 gid:SV_GroupID,uint3 lid:SV_GroupT
     // Store result tile
     for(uint i=0;i<4;i++){
         uint r=tr+lr,c=tc+lc*4+i;
-        if(r<params.M&&c<params.N)store_c(r*params.stride_c+c,(half)acc[lr][lc*4+i]);
+        if(r<params.M&&c<params.N)store_c(r*params.stride_c+c,(half)acc.Get(lr*32+lc*4+i));
     }
 }

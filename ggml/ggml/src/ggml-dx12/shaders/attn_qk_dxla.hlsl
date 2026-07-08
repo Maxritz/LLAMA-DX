@@ -1,9 +1,9 @@
 /*
  * attn_qk_dxla.hlsl
- * PURPOSE: Attention Q x K^T using DXLA
+ * PURPOSE: Attention Q x K^T using DXLA wave matrix multiply
  * Scores[b,h,q,k] = sum_d(Q[b,h,q,d] * K[b,h,k,d])
+ * Each wave (32 threads) computes a 16x16 tile of the attention matrix
  */
-
 #include "common.hlsli"
 #include <dx/linalg.h>
 using namespace dx::linalg;
@@ -14,8 +14,8 @@ ByteAddressBuffer q_buf : register(t0);
 ByteAddressBuffer k_buf : register(t1);
 RWByteAddressBuffer out_buf : register(u0);
 
-half load(ByteAddressBuffer b,uint i){uint a=i*2;uint p=b.Load(a&~2);uint16_t v=(a&2)?(uint16_t)(p>>16):(uint16_t)(p&0xFFFF);return(half)f16_to_f32(v);}
-void store(uint i,half v){uint a=i*2;uint16_t h=f32_to_f16((float)v);uint e=out_buf.Load(a&~2);out_buf.Store(a&~2,(a&2)?((e&0xFFFF)|((uint)h<<16)):((e&0xFFFF0000)|h));}
+half load_elem(ByteAddressBuffer b,uint i){uint a=i*2;uint p=b.Load(a&~2);uint16_t v=(a&2)?(uint16_t)(p>>16):(uint16_t)(p&0xFFFF);return(half)f16_to_f32(v);}
+void store(uint i,half v){ store_packed_f16(out_buf,i,v); }
 
 using MatA=Matrix<ComponentType::F16,16,16,MatrixUse::A,MatrixScope::Wave>;
 using MatB=Matrix<ComponentType::F16,16,16,MatrixUse::B,MatrixScope::Wave>;
@@ -24,20 +24,25 @@ using MatC=Matrix<ComponentType::F32,16,16,MatrixUse::Accumulator,MatrixScope::W
 [numthreads(32,1,1)]
 void main(uint3 tid:SV_DispatchThreadID,uint3 gid:SV_GroupID){
     uint h=gid.z,b=h/params.heads;h%=params.heads;
-    uint tq=gid.y*16+tid.x/16,tk=gid.x*16+tid.x%16;
-    if(tq>=params.seq_q||tk>=params.seq_k||b>=params.batch)return;
+    if(b>=params.batch)return;
 
-    uint q_off=((b*params.heads+h)*params.seq_q+tq)*params.head_dim;
-    uint k_off=((b*params.heads+h)*params.seq_k+tk)*params.head_dim;
+    uint q_first=gid.y*16,k_first=gid.x*16;
 
     MatC acc=MatC::Splat(0.0f);
     for(uint d=0;d<params.head_dim;d+=16){
-        MatA ma; MatB mb;
-        for(uint i=0;i<16;i++){
-            // Load Q and K tiles
-        }
-        acc.MultiplyAccumulate(ma,mb);
+        uint q_off=(((b*params.heads+h)*params.seq_q+q_first)*params.head_dim+d)*2;
+        uint k_off=(((b*params.heads+h)*params.seq_k+k_first)*params.head_dim+d)*2;
+        MatA a_tile=MatA::Load(q_buf,q_off,params.head_dim*2,MatrixLayout::RowMajor);
+        MatB b_tile=MatB::Load(k_buf,k_off,params.head_dim*2,MatrixLayout::ColMajor);
+        acc.MultiplyAccumulate(a_tile,b_tile);
     }
-    uint out_idx=((b*params.heads+h)*params.seq_q+tq)*params.seq_k+tk;
-    store(out_idx,(half)(acc[tid.x/16][tid.x%16]*params.scale));
+
+    for(uint i=tid.x;i<256;i+=32){
+        uint lr=i/16,lc=i%16;
+        uint q_idx=q_first+lr,k_idx=k_first+lc;
+        if(q_idx>=params.seq_q||k_idx>=params.seq_k)continue;
+        float score=acc.Get(i)*params.scale;
+        uint out_idx=((b*params.heads+h)*params.seq_q+q_idx)*params.seq_k+k_idx;
+        store(out_idx,(half)score);
+    }
 }

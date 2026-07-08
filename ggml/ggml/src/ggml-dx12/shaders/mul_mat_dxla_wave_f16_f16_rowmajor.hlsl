@@ -31,12 +31,10 @@ void main(uint3 gid : SV_GroupID) {
 
     for (uint k = 0; k < params.K; k += TILE) {
         uint a_offset = (tile_row * params.stride_a + k) * 2;
-        uint b_offset = params.transposed_b
-            ? (tile_col * params.stride_b + k) * 2
-            : (k * params.stride_b + tile_col) * 2;
+        uint b_offset = (k * params.stride_b + tile_col) * 2;
 
         MatA a_tile = MatA::Load(matrix_a, a_offset, params.stride_a * 2, MatrixLayout::RowMajor);
-        MatB b_tile = MatB::Load(matrix_b, b_offset, params.stride_b * 2, params.transposed_b ? MatrixLayout::ColMajor : MatrixLayout::RowMajor);
+        MatB b_tile = MatB::Load(matrix_b, b_offset, params.stride_b * 2, MatrixLayout::RowMajor);
         acc.MultiplyAccumulate(a_tile, b_tile);
     }
 

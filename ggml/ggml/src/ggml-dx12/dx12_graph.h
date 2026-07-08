@@ -68,6 +68,7 @@ bool dx12_dispatch_diag_mask_inf(dx12_device* dev, dx12_command_list* cmd, ggml_
 bool dx12_dispatch_get_rows  (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
 bool dx12_dispatch_permute   (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
 bool dx12_dispatch_cpy       (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
+bool dx12_dispatch_set_rows  (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
 bool dx12_dispatch_none      (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
 bool dx12_dispatch_count     (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
 

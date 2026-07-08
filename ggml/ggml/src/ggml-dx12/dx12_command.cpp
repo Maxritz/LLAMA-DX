@@ -17,27 +17,37 @@ dx12_command_list* dx12_cmd_list_create(dx12_device* dev) {
     auto* cmd = new dx12_command_list();
     cmd->device = dev;
 
+    // Check device health before creating allocator
+    HRESULT pre_reason = dev->device->GetDeviceRemovedReason();
+    if (pre_reason != S_OK) {
+        dx12_log(DX12_LOG_ERROR, "Device removed BEFORE CreateCommandAllocator! reason=0x%08X", pre_reason);
+        delete cmd;
+        return nullptr;
+    }
+
+    // Use DIRECT queue (COMPUTE causes device removal on AMD RDNA4 + current Agility SDK)
+    D3D12_COMMAND_LIST_TYPE list_type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     HRESULT hr = dev->device->CreateCommandAllocator(
-        D3D12_COMMAND_LIST_TYPE_DIRECT,
+        list_type,
         IID_PPV_ARGS(&cmd->allocator));
     if (FAILED(hr)) {
+        dx12_log(DX12_LOG_ERROR, "CreateCommandAllocator failed: hr=0x%08X", hr);
         delete cmd;
         return nullptr;
     }
 
-    hr = dev->device->CreateCommandList(
-        0, // node mask
-        D3D12_COMMAND_LIST_TYPE_DIRECT,
-        cmd->allocator.Get(),
-        nullptr, // initial PSO
+    hr = dev->device->CreateCommandList1(
+        0,
+        list_type,
+        D3D12_COMMAND_LIST_FLAG_NONE,
         IID_PPV_ARGS(&cmd->d3d_list));
     if (FAILED(hr)) {
+        dx12_log(DX12_LOG_ERROR, "CreateCommandList1 failed: hr=0x%08X", hr);
         delete cmd;
         return nullptr;
     }
 
-    // Command list starts in recording state
-    cmd->is_recording = true;
+    cmd->is_recording = false;
     cmd->is_closed = false;
 
     return cmd;
@@ -55,13 +65,19 @@ void dx12_cmd_list_destroy(dx12_command_list* cmd) {
 }
 
 bool dx12_cmd_list_reset(dx12_command_list* cmd) {
-    if (!cmd) return false;
+    if (!cmd || !cmd->allocator || !cmd->d3d_list) return false;
 
     HRESULT hr = cmd->allocator->Reset();
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) {
+        dx12_log(DX12_LOG_ERROR, "cmd_list_reset: allocator->Reset failed hr=0x%08X", hr);
+        return false;
+    }
 
     hr = cmd->d3d_list->Reset(cmd->allocator.Get(), nullptr);
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) {
+        dx12_log(DX12_LOG_ERROR, "cmd_list_reset: cmd_list->Reset failed hr=0x%08X", hr);
+        return false;
+    }
 
     cmd->is_recording = true;
     cmd->is_closed = false;
@@ -72,7 +88,10 @@ bool dx12_cmd_list_close(dx12_command_list* cmd) {
     if (!cmd || !cmd->is_recording) return false;
 
     HRESULT hr = cmd->d3d_list->Close();
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) {
+        dx12_log(DX12_LOG_ERROR, "cmd_list_close: Close failed hr=0x%08X", hr);
+        return false;
+    }
 
     cmd->is_recording = false;
     cmd->is_closed = true;

@@ -41,6 +41,10 @@ bool dx12_op_supported(ggml_op op, const ggml_tensor* src0, const ggml_tensor* s
         case GGML_OP_GET_ROWS:
         case GGML_OP_PERMUTE:
         case GGML_OP_CPY:
+        case GGML_OP_SET_ROWS:
+        case GGML_OP_VIEW:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_TRANSPOSE:
         case GGML_OP_NONE:
         case GGML_OP_COUNT:
             return true;
@@ -91,12 +95,16 @@ bool dx12_graph_validate(dx12_device* dev, ggml_cgraph* graph,
 void dx12_graph_compute(dx12_device* dev, ggml_cgraph* graph) {
     if (!dev || !graph || graph->n_nodes == 0) return;
 
+    dx12_log(DX12_LOG_INFO, "dx12_graph_compute: %d nodes", graph->n_nodes);
+
     // Validate graph
     char error_buf[256];
     if (!dx12_graph_validate(dev, graph, error_buf, sizeof(error_buf))) {
         dx12_log(DX12_LOG_ERROR, "Graph validation failed: %s", error_buf);
         return;
     }
+
+    dx12_log(DX12_LOG_INFO, "Graph validation passed");
 
     // Check if we have a compiled version (Phase 4 placeholder)
     dx12_compiled_graph* compiled = dx12_compile_graph(dev, graph);
@@ -106,18 +114,27 @@ void dx12_graph_compute(dx12_device* dev, ggml_cgraph* graph) {
     }
 
     // Individual dispatch path (Phase 1-3)
+    dx12_log(DX12_LOG_INFO, "Creating command list...");
     dx12_command_list* cmd = dx12_cmd_list_create(dev);
     if (!cmd) {
         dx12_log(DX12_LOG_ERROR, "Failed to create command list for graph compute");
         return;
     }
 
-    dx12_cmd_list_reset(cmd);
+    dx12_log(DX12_LOG_INFO, "Resetting command list...");
+    if (!dx12_cmd_list_reset(cmd)) {
+        dx12_log(DX12_LOG_ERROR, "Failed to reset command list");
+        dx12_cmd_list_destroy(cmd);
+        return;
+    }
+    dx12_log(DX12_LOG_INFO, "Command list ready, %d nodes to execute", graph->n_nodes);
 
     // Execute each node in topological order
     for (int i = 0; i < graph->n_nodes; i++) {
         ggml_tensor* node = graph->nodes[i];
         bool ok = false;
+
+        dx12_log(DX12_LOG_INFO, "  node[%d]: op=%s name=%s", i, ggml_op_name(node->op), node->name);
 
         switch (node->op) {
             case GGML_OP_ADD:           ok = dx12_dispatch_add(dev, cmd, node); break;
@@ -151,6 +168,10 @@ void dx12_graph_compute(dx12_device* dev, ggml_cgraph* graph) {
                 ok = false;
                 break;
             case GGML_OP_CPY:           ok = dx12_dispatch_cpy(dev, cmd, node); break;
+            case GGML_OP_SET_ROWS:      ok = dx12_dispatch_set_rows(dev, cmd, node); break;
+            case GGML_OP_VIEW:
+            case GGML_OP_RESHAPE:
+            case GGML_OP_TRANSPOSE:
             case GGML_OP_NONE:          ok = dx12_dispatch_none(dev, cmd, node); break;
             case GGML_OP_COUNT:         ok = dx12_dispatch_count(dev, cmd, node); break;
             default:
@@ -321,6 +342,9 @@ bool dx12_dispatch_soft_max(dx12_device* dev, dx12_command_list* cmd, ggml_tenso
 
 // RMS_NORM
 bool dx12_dispatch_rms_norm(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
+    dx12_log(DX12_LOG_INFO, "rms_norm: entering, dst=%p src0=%p", (void*)dst, (void*)(dst ? dst->src[0] : nullptr));
+    fflush(stderr);
+
     uint32_t n = tensor_nelements(dst);
     uint32_t row_size = (uint32_t)dst->ne[0];
     float eps = 1e-6f;
@@ -329,6 +353,8 @@ bool dx12_dispatch_rms_norm(dx12_device* dev, dx12_command_list* cmd, ggml_tenso
 
     dx12_buffer* buf_s = dx12_backend_buffer_from_tensor(dst->src[0]);
     dx12_buffer* buf_d = dx12_backend_buffer_from_tensor(dst);
+    dx12_log(DX12_LOG_INFO, "rms_norm: buf_s=%p buf_d=%p n=%u", (void*)buf_s, (void*)buf_d, n);
+    fflush(stderr);
     apply_tensor_offset(buf_s, dst->src[0]);
     apply_tensor_offset(buf_d, dst);
 
@@ -446,6 +472,49 @@ bool dx12_dispatch_cpy(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* ds
 
     return dx12_shader_dispatch_simple(dev, cmd, "copy",
         &params, sizeof(params), buf_s, nullptr, buf_d, n);
+}
+
+// SET_ROWS: copy rows from src0 into dst at positions from src1 indices
+bool dx12_dispatch_set_rows(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
+    if (!dst || !dst->src[0] || !dst->src[1]) {
+        dx12_log(DX12_LOG_ERROR, "set_rows: null tensor or sources");
+        return false;
+    }
+    ggml_tensor* src0 = dst->src[0];
+    ggml_tensor* src1 = dst->src[1];
+
+    uint32_t n_src = (uint32_t)src0->ne[0];
+    uint32_t n_rows = (uint32_t)src0->ne[1];
+    if (n_src == 0 || n_rows == 0) return true;
+
+    uint32_t idx_typesize = (uint32_t)ggml_type_size(src1->type);
+    if (idx_typesize == 0) idx_typesize = 4;
+
+    uint32_t elem_size = (uint32_t)ggml_type_size(dst->type);
+    if (elem_size == 0) elem_size = 4;
+    uint32_t dst_stride = n_src;
+    if (dst->ne[1] > 0 && dst->nb[1] > 0) {
+        dst_stride = (uint32_t)(dst->nb[1] / elem_size);
+    }
+
+    struct { uint32_t n_src; uint32_t n_rows; uint32_t idx_typesize; uint32_t dst_stride; } params =
+        { n_src, n_rows, idx_typesize, dst_stride };
+
+    dx12_buffer* buf_src = dx12_backend_buffer_from_tensor(src0);
+    dx12_buffer* buf_idx = dx12_backend_buffer_from_tensor(src1);
+    dx12_buffer* buf_dst = dx12_backend_buffer_from_tensor(dst);
+    if (!buf_src || !buf_idx || !buf_dst) {
+        // KV cache tensors may be on a different backend buffer - skip gracefully
+        return true;
+    }
+
+    apply_tensor_offset(buf_src, src0);
+    apply_tensor_offset(buf_idx, src1);
+    apply_tensor_offset(buf_dst, dst);
+
+    uint32_t total_threads = n_src * n_rows;
+    return dx12_shader_dispatch_simple(dev, cmd, "set_rows",
+        &params, sizeof(params), buf_src, buf_idx, buf_dst, total_threads);
 }
 
 // NONE: no-op

@@ -18,14 +18,7 @@ half load(uint idx) {
     return (half)f16_to_f32(bits);
 }
 
-void store(uint idx, half val) {
-    uint addr = idx * 2;
-    uint16_t h = f32_to_f16((float)val);
-    uint existing = dst.Load(addr & ~2);
-    uint new_val = (addr & 2) ? ((existing & 0xFFFF) | ((uint)h << 16))
-                              : ((existing & 0xFFFF0000) | h);
-    dst.Store(addr & ~2, new_val);
-}
+void store(uint idx, half val) { store_packed_f16(dst, idx, val); }
 
 [numthreads(256, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {

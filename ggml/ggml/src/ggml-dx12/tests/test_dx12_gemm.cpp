@@ -16,6 +16,16 @@
 
 typedef uint16_t half;
 
+// Proper f16 bit pattern -> float (test's `half` is just uint16_t bits)
+static float f16_to_f32(uint16_t h) {
+    uint32_t sign = (h >> 15) & 0x1;
+    uint32_t exp  = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x3FF;
+    if (exp == 0)  return (sign ? -1.0f : 1.0f) * (mant / 1024.0f) * powf(2.0f, -14.0f);
+    if (exp == 31) return (mant == 0) ? (sign ? -INFINITY : INFINITY) : NAN;
+    return (sign ? -1.0f : 1.0f) * (1.0f + mant / 1024.0f) * powf(2.0f, (float)(exp - 15));
+}
+
 static int g_passed = 0, g_failed = 0;
 #define TEST(n) void test_##n()
 #define RUN(n) do{printf("  %-40s ",#n);test_##n();}while(0)
@@ -27,7 +37,7 @@ static dx12_device* g_dev = nullptr;
 
 TEST(gemm_f16_small) {
     uint32_t M=16,N=16,K=16;
-    size_t sz_a=M*K*2,sz_b=N*K*2,sz_c=M*N*2;
+    size_t sz_a=M*K*2,sz_b=N*K*2,sz_c=M*N*4;
     auto* a=dx12_buffer_create(g_dev,sz_a,dx12_heap_type::upload);
     auto* b=dx12_buffer_create(g_dev,sz_b,dx12_heap_type::upload);
     auto* c=dx12_buffer_create(g_dev,sz_c,dx12_heap_type::default_);
@@ -43,26 +53,25 @@ TEST(gemm_f16_small) {
     ASSERT(ok);
     dx12_cmd_list_submit_and_wait(cmd);
 
-    // Download result for verification
     auto* c_rb=dx12_buffer_create(g_dev,sz_c,dx12_heap_type::readback);
     if(c_rb){
         dx12_cmd_list_reset(cmd);
         dx12_buffer_transition(cmd,c,D3D12_RESOURCE_STATE_COPY_SOURCE);
         dx12_buffer_copy(cmd,c_rb,0,c,0,sz_c);
         dx12_cmd_list_submit_and_wait(cmd);
-        half* result=(half*)dx12_buffer_map(c_rb);
+        float* result=(float*)dx12_buffer_map(c_rb);
         if(result){
             float mx=0; uint32_t nz=0;
-            for(uint32_t i=0;i<M*N;i++){ float v=(float)result[i]; if(fabs(v)>mx)mx=fabs(v); if(v!=0)nz++; }
-            printf("(max=%.3f nonzero=%u) ", mx, nz);
+            for(uint32_t i=0;i<M*N;i++){ float v=result[i]; if(fabs(v)>mx)mx=fabs(v); if(v!=0)nz++; }
+            printf("(max=%.3f nonzero=%u)\n", mx, nz);
             for(uint32_t r=0;r<M;r++){
                 for(uint32_t c=0;c<N;c++){
-                    float v=(float)result[r*N+c];
-                    printf("%c", (v!=0)?(v<8?'L':'H'):'.');
+                    printf("%5.1f", result[r*N+c]);
                 }
                 printf("\n");
             }
-            for(uint32_t i=0;i<M*N;i++) ASSERT_NEAR((float)result[i],(float)K,0.5f);
+            fflush(stdout);
+            for(uint32_t i=0;i<M*N;i++) ASSERT_NEAR(result[i],(float)K,0.5f);
             dx12_buffer_unmap(c_rb);
         }
         dx12_buffer_destroy(c_rb);
@@ -87,10 +96,29 @@ TEST(gemm_rectangular) {
     PASS();
 }
 
+TEST(pso_simple) {
+    // PSO creation sanity: if add/copy PSOs fail, the SDK is broken.
+    // If they pass, the issue is specific to mul_mat_f16_f16's CSO.
+    uint32_t N = 256;
+    auto* buf = dx12_buffer_create(g_dev, N * 2, dx12_heap_type::default_);
+    ASSERT(buf);
+
+    dx12_command_list* cmd = dx12_cmd_list_create(g_dev);
+    bool ok1 = dx12_shader_dispatch_simple(g_dev, cmd, "add", nullptr, 0, nullptr, nullptr, buf, N);
+    dx12_cmd_list_reset(cmd);
+    bool ok2 = dx12_shader_dispatch_simple(g_dev, cmd, "copy", nullptr, 0, nullptr, nullptr, buf, N);
+    dx12_cmd_list_destroy(cmd);
+    dx12_buffer_destroy(buf);
+    printf("(add=%s copy=%s)", ok1 ? "OK" : "FAIL", ok2 ? "OK" : "FAIL");
+    ASSERT(ok1 && ok2);
+    PASS();
+}
+
 int main(){
     printf("\n=== DX12 GEMM Tests ===\n\n");
     dx12_result r=dx12_device_create(-1,&g_dev);
     if(r!=DX12_OK){printf("Device creation failed: %d\n",r);return 1;}
+    RUN(pso_simple);
     RUN(gemm_f16_small);
     RUN(gemm_path_selection);
     RUN(gemm_rectangular);

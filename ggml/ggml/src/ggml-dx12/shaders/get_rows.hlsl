@@ -16,7 +16,7 @@ half load_emb(uint row,uint col){
     uint16_t v=(a&2)?(uint16_t)(p>>16):(uint16_t)(p&0xFFFF);
     return(half)f16_to_f32(v);
 }
-void store(uint idx,half v){uint a=idx*2;uint16_t h=f32_to_f16((float)v);uint e=dst.Load(a&~2);dst.Store(a&~2,(a&2)?((e&0xFFFF)|((uint)h<<16)):((e&0xFFFF0000)|h));}
+void store(uint idx,half v){ store_packed_f16(dst,idx,v); }
 
 [numthreads(256,1,1)]
 void main(uint3 tid:SV_DispatchThreadID){

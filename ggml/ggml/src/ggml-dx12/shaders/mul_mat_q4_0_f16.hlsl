@@ -9,7 +9,7 @@
 
 #include "common.hlsli"
 
-struct GEMMParams {
+struct Q4GEMMParams {
     uint M, N, K;
     uint stride_a, stride_b, stride_c;
     uint transposed_b;
@@ -17,7 +17,7 @@ struct GEMMParams {
     uint reserved[8];
 };
 
-ConstantBuffer<GEMMParams> params : register(b0);
+ConstantBuffer<Q4GEMMParams> params : register(b0);
 ByteAddressBuffer weights_a : register(t0);  // Q4_0 quantized weights
 ByteAddressBuffer matrix_b : register(t1);    // F16 activations
 RWByteAddressBuffer result : register(u0);
@@ -32,18 +32,7 @@ half load_f16_b(uint idx) {
     return (half)f16_to_f32(bits);
 }
 
-void store_f16_c(uint idx, half val) {
-    uint addr = idx * 2;
-    uint16_t h = f32_to_f16((float)val);
-    uint existing = result.Load(addr & ~2);
-    uint new_val;
-    if (addr & 2) {
-        new_val = (existing & 0xFFFF) | ((uint)h << 16);
-    } else {
-        new_val = (existing & 0xFFFF0000) | h;
-    }
-    result.Store(addr & ~2, new_val);
-}
+void store_f16_c(uint idx, half val) { store_packed_f16(result, idx, val); }
 
 // Dequantize one Q4_0 block, return the j-th element
 float dequant_q4_0_element(uint block_idx, uint j) {

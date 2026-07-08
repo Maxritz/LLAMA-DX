@@ -24,6 +24,7 @@
 #include <ggml.h>
 #include <ggml-backend.h>
 #include <ggml-backend-impl.h>
+#include <ggml-impl.h>
 
 #include <cstring>
 #include <cstdlib>
@@ -31,6 +32,7 @@
 #include <cstdarg>
 #include <mutex>
 #include <vector>
+#include <unordered_map>
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // C++ helpers for macro expansion (must be before version string)
@@ -38,6 +40,11 @@
 
 #define STRINGIFY_(x) #x
 #define STRINGIFY(x) STRINGIFY_(x)
+
+static ggml_guid_t ggml_backend_dx12_guid(void) {
+    static ggml_guid guid = { 0xd3, 0x12, 0x76, 0x00, 0xa0, 0x67, 0x4b, 0x2c, 0x8d, 0x15, 0x9e, 0x3f, 0x51, 0x8b, 0x14, 0xc2 };
+    return &guid;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Version Info
@@ -161,13 +168,45 @@ struct ggml_backend_dx12_context {
 
 struct dx12_backend_buffer_context {
     dx12_buffer* gpu_buffer;
+    dx12_device* device;
 };
 
 struct dx12_backend_buffer_type_context {
     ggml_backend_dev_t device;
 };
 
+static const struct ggml_backend_buffer_i* dx12_buffer_iface(void);
+
 static dx12_buffer* dx12_backend_get_gpu_buffer(const ggml_tensor* t);
+
+// Module-level device cache: one DX12 device per adapter index, reused across buffer allocs
+static std::mutex g_dx12_device_cache_mutex;
+static std::unordered_map<uint32_t, dx12_device*> g_dx12_device_cache;
+
+static dx12_device* dx12_get_or_create_device(uint32_t adapter_idx) {
+    std::lock_guard<std::mutex> lk(g_dx12_device_cache_mutex);
+    auto it = g_dx12_device_cache.find(adapter_idx);
+    if (it != g_dx12_device_cache.end()) {
+        dx12_device* dev = it->second;
+        // Check if cached device is still healthy
+        if (dev && dev->device) {
+            HRESULT reason = dev->device->GetDeviceRemovedReason();
+            if (reason == S_OK) {
+                dx12_log(DX12_LOG_INFO, "device_cache HIT for idx=%u", adapter_idx);
+                return dev;
+            }
+            dx12_log(DX12_LOG_WARN, "device_cache STALE for idx=%u (reason=0x%08X), recreating", adapter_idx, reason);
+        }
+        dx12_device_destroy(dev);
+        g_dx12_device_cache.erase(it);
+    }
+    dx12_log(DX12_LOG_INFO, "device_cache MISS for idx=%u, creating new", adapter_idx);
+    dx12_device* dev = nullptr;
+    dx12_result result = dx12_device_create((int32_t)adapter_idx, &dev);
+    if (result != DX12_OK) return nullptr;
+    g_dx12_device_cache[adapter_idx] = dev;
+    return dev;
+}
 
 static const char* dx12_buft_get_name(ggml_backend_buffer_type_t buft) {
     (void)buft;
@@ -178,27 +217,40 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
     auto* btctx = (dx12_backend_buffer_type_context*)buft->context;
     uint32_t adapter_idx = (uint32_t)(uintptr_t)btctx->device->context;
 
-    dx12_device* d3d_dev = nullptr;
-    dx12_result result = dx12_device_create((int32_t)adapter_idx, &d3d_dev);
-    if (result != DX12_OK) return nullptr;
-
-    dx12_buffer* gpu_buf = dx12_buffer_create_uav(d3d_dev, size, dx12_heap_type::default_);
-    if (!gpu_buf) {
-        dx12_device_destroy(d3d_dev);
+    dx12_device* d3d_dev = dx12_get_or_create_device(adapter_idx);
+    if (!d3d_dev) {
+        dx12_log(DX12_LOG_ERROR, "buft_alloc: failed to get device");
         return nullptr;
     }
 
+    dx12_heap_type heap = dx12_heap_type::default_;
+    dx12_buffer* gpu_buf = dx12_buffer_create_uav(d3d_dev, size, heap);
+
+    if (!gpu_buf) {
+        dx12_log(DX12_LOG_WARN, "buft_alloc: default heap failed idx=%u size=%zu, trying upload", adapter_idx, size);
+        heap = dx12_heap_type::upload;
+        gpu_buf = dx12_buffer_create_uav(d3d_dev, size, heap);
+    }
+
+    if (!gpu_buf) {
+        dx12_log(DX12_LOG_ERROR, "buft_alloc: both heap types failed idx=%u size=%zu", adapter_idx, size);
+        return nullptr;
+    }
+
+    dx12_log(DX12_LOG_INFO, "buft_alloc: idx=%u size=%zu heap=%s DONE", adapter_idx, size,
+             heap == dx12_heap_type::upload ? "upload" : "default");
+
     auto* ctx = new dx12_backend_buffer_context();
     ctx->gpu_buffer = gpu_buf;
+    ctx->device = d3d_dev;
 
     ggml_backend_buffer_t buf = new ggml_backend_buffer();
-    buf->iface = {}; // filled below
+    buf->iface = *dx12_buffer_iface();
     buf->buft = buft;
     buf->context = ctx;
     buf->size = size;
     buf->usage = GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
 
-    // We store the d3d_dev in gpu_buffer for later cleanup
     return buf;
 }
 
@@ -264,20 +316,23 @@ static void dx12_buf_free(ggml_backend_buffer_t buf) {
 
 static void* dx12_buf_get_base(ggml_backend_buffer_t buf) {
     auto* ctx = (dx12_backend_buffer_context*)buf->context;
-    if (!ctx || !ctx->gpu_buffer) return nullptr;
-    // For default-heap GPU buffers, there is no CPU-accessible base.
-    // ggml_backend_buffer_alloc_tensor uses get_base as a sentinel for
-    // sub-allocation offset tracking; returning nullptr makes tensor->data
-    // hold the raw byte offset, which we use in dispatch.
-    if (ctx->gpu_buffer->heap == dx12_heap_type::default_) {
+    if (!ctx || !ctx->gpu_buffer) {
+        dx12_log(DX12_LOG_WARN, "get_base: null context or buffer");
         return nullptr;
     }
-    return dx12_buffer_map(ctx->gpu_buffer);
+    if (ctx->gpu_buffer->heap == dx12_heap_type::default_) {
+        return (void*)0x1000;
+    }
+    void* base = dx12_buffer_map(ctx->gpu_buffer);
+    if (!base) {
+        dx12_log(DX12_LOG_ERROR, "get_base: map failed for upload heap size=%zu", ctx->gpu_buffer->size);
+    }
+    return base;
 }
 
 static enum ggml_status dx12_buf_init_tensor(ggml_backend_buffer_t buf, ggml_tensor* tensor) {
     (void)buf;
-    (void)tensor;
+    dx12_log(DX12_LOG_INFO, "init_tensor: %s type=%d", tensor->name, (int)tensor->type);
     return GGML_STATUS_SUCCESS;
 }
 
@@ -285,35 +340,90 @@ static void dx12_buf_memset_tensor(ggml_backend_buffer_t buf, ggml_tensor* tenso
                                     uint8_t value, size_t offset, size_t size) {
     auto* ctx = (dx12_backend_buffer_context*)buf->context;
     if (!ctx || !ctx->gpu_buffer) return;
-    (void)tensor;
+
+    void* mapped = dx12_buffer_map(ctx->gpu_buffer);
+    size_t tensor_off = mapped
+        ? (size_t)((const char*)tensor->data - (const char*)mapped)
+        : (size_t)((uintptr_t)tensor->data - 0x1000);
+
     std::vector<uint8_t> zero_data(size, value);
-    dx12_buffer_upload(ctx->gpu_buffer, zero_data.data(), size, offset);
+    if (mapped) {
+        dx12_buffer_upload(ctx->gpu_buffer, zero_data.data(), size, tensor_off + offset);
+    } else {
+        dx12_command_list* cmd = dx12_cmd_list_create(ctx->device);
+        if (cmd) {
+            dx12_cmd_list_reset(cmd);
+            dx12_buffer_copy_upload_to_default(ctx->device, cmd, ctx->gpu_buffer,
+                                               tensor_off + offset, zero_data.data(), size);
+            dx12_cmd_list_destroy(cmd);
+        }
+    }
 }
 
 static void dx12_buf_set_tensor(ggml_backend_buffer_t buf, ggml_tensor* tensor,
                                  const void* data, size_t offset, size_t size) {
     auto* ctx = (dx12_backend_buffer_context*)buf->context;
-    if (!ctx || !ctx->gpu_buffer) return;
-    (void)tensor;
-    dx12_buffer_upload(ctx->gpu_buffer, data, size, offset);
+    if (!ctx || !ctx->gpu_buffer) {
+        dx12_log(DX12_LOG_ERROR, "set_tensor: null ctx");
+        return;
+    }
+
+    void* mapped = dx12_buffer_map(ctx->gpu_buffer);
+    size_t tensor_off = mapped
+        ? (size_t)((const char*)tensor->data - (const char*)mapped)
+        : (size_t)((uintptr_t)tensor->data - 0x1000);
+
+    dx12_log(DX12_LOG_INFO, "upload %s off=%zu(sz=%zu) tensor_off=%zu heap=%d buf=%zu",
+             tensor->name, offset, size, tensor_off, (int)ctx->gpu_buffer->heap, ctx->gpu_buffer->size);
+
+    if (mapped) {
+        bool ok = dx12_buffer_upload(ctx->gpu_buffer, data, size, tensor_off + offset);
+        if (!ok) dx12_log(DX12_LOG_ERROR, "upload FAILED: %s", tensor->name);
+    } else {
+        dx12_command_list* cmd = dx12_cmd_list_create(ctx->device);
+        if (!cmd) {
+            dx12_log(DX12_LOG_ERROR, "upload FAILED: no cmd list for %s", tensor->name);
+            return;
+        }
+        dx12_cmd_list_reset(cmd);
+        dx12_buffer_copy_upload_to_default(ctx->device, cmd, ctx->gpu_buffer,
+                                           tensor_off + offset, data, size);
+        dx12_cmd_list_destroy(cmd);
+    }
 }
 
 static void dx12_buf_get_tensor(ggml_backend_buffer_t buf, const ggml_tensor* tensor,
                                  void* data, size_t offset, size_t size) {
     auto* ctx = (dx12_backend_buffer_context*)buf->context;
     if (!ctx || !ctx->gpu_buffer) return;
-    (void)tensor;
-    dx12_buffer_download(ctx->gpu_buffer, data, size, offset);
+
+    void* mapped = dx12_buffer_map(ctx->gpu_buffer);
+    if (!mapped) return;
+
+    size_t tensor_off = (const char*)tensor->data - (const char*)mapped;
+    dx12_buffer_download(ctx->gpu_buffer, data, size, tensor_off + offset);
 }
 
 static void dx12_buf_clear(ggml_backend_buffer_t buf, uint8_t value) {
     auto* ctx = (dx12_backend_buffer_context*)buf->context;
     if (!ctx || !ctx->gpu_buffer) return;
+
     std::vector<uint8_t> zero_data(ctx->gpu_buffer->size, value);
-    dx12_buffer_upload(ctx->gpu_buffer, zero_data.data(), ctx->gpu_buffer->size, 0);
+    void* mapped = dx12_buffer_map(ctx->gpu_buffer);
+    if (mapped) {
+        dx12_buffer_upload(ctx->gpu_buffer, zero_data.data(), ctx->gpu_buffer->size, 0);
+    } else {
+        dx12_command_list* cmd = dx12_cmd_list_create(ctx->device);
+        if (!cmd) return;
+        dx12_cmd_list_reset(cmd);
+        dx12_buffer_copy_upload_to_default(ctx->device, cmd, ctx->gpu_buffer,
+                                           0, zero_data.data(), ctx->gpu_buffer->size);
+        dx12_cmd_list_destroy(cmd);
+    }
 }
 
-static struct ggml_backend_buffer_i dx12_buffer_iface = {
+static const struct ggml_backend_buffer_i* dx12_buffer_iface(void) {
+    static const struct ggml_backend_buffer_i iface = {
     /* free_buffer  */ dx12_buf_free,
     /* get_base     */ dx12_buf_get_base,
     /* init_tensor  */ dx12_buf_init_tensor,
@@ -325,7 +435,9 @@ static struct ggml_backend_buffer_i dx12_buffer_iface = {
     /* cpy_tensor   */ nullptr,
     /* clear        */ dx12_buf_clear,
     /* reset        */ nullptr,
-};
+    };
+    return &iface;
+}
 
 dx12_buffer* dx12_backend_buffer_from_tensor(const ggml_tensor* tensor) {
     return dx12_backend_get_gpu_buffer(tensor);
@@ -333,13 +445,27 @@ dx12_buffer* dx12_backend_buffer_from_tensor(const ggml_tensor* tensor) {
 
 D3D12_GPU_VIRTUAL_ADDRESS dx12_backend_tensor_gpu_addr(const ggml_tensor* tensor) {
     dx12_buffer* buf = dx12_backend_get_gpu_buffer(tensor);
-    if (!buf) return 0;
-    size_t offset = tensor->data ? (size_t)(uintptr_t)tensor->data : 0;
-    return buf->gpu_address + offset;
+    if (!buf || !buf->resource) return 0;
+
+    D3D12_GPU_VIRTUAL_ADDRESS base = buf->resource->GetGPUVirtualAddress();
+    void* mapped = dx12_buffer_map(buf);
+    if (mapped) {
+        size_t offset = (const char*)tensor->data - (const char*)mapped;
+        return base + offset;
+    }
+    if (buf->heap == dx12_heap_type::default_) {
+        size_t offset = (uintptr_t)tensor->data - 0x1000;
+        return base + offset;
+    }
+    return base;
 }
 
 static dx12_buffer* dx12_backend_get_gpu_buffer(const ggml_tensor* t) {
     if (!t || !t->buffer) return nullptr;
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t->buffer);
+    if (!buft || !buft->iface.get_name) return nullptr;
+    const char* name = buft->iface.get_name(buft);
+    if (!name || strcmp(name, "DX12") != 0) return nullptr;
     auto* ctx = (dx12_backend_buffer_context*)t->buffer->context;
     return ctx ? ctx->gpu_buffer : nullptr;
 }
@@ -416,11 +542,13 @@ static ggml_status ggml_backend_dx12_graph_compute(ggml_backend_t backend,
                                                     ggml_cgraph* cgraph) {
     auto* ctx = (ggml_backend_dx12_context*)backend->context;
     if (!ctx || !ctx->device || !ctx->cmd_pool) {
+        dx12_log(DX12_LOG_ERROR, "graph_compute: no device/context");
         return GGML_STATUS_FAILED;
     }
 
-    // Use Component 5 (Graph Execution) to dispatch the compute graph
-    // This walks the GGML graph and dispatches DX12 compute shaders
+    dx12_log(DX12_LOG_INFO, "graph_compute: %d nodes", cgraph ? cgraph->n_nodes : 0);
+    if (!cgraph || cgraph->n_nodes == 0) return GGML_STATUS_SUCCESS;
+
     dx12_graph_compute(ctx->device, cgraph);
 
     return GGML_STATUS_SUCCESS;
@@ -500,28 +628,36 @@ static ggml_backend_t ggml_backend_dx12_init_impl(const char* params) {
     }
 
     // Create command pool
+    dx12_log(DX12_LOG_INFO, "Creating command pool...");
     ctx->cmd_pool = new dx12_command_pool(ctx->device);
 
     // Create descriptor heap (8192 descriptors)
+    dx12_log(DX12_LOG_INFO, "Creating descriptor heap...");
     ctx->descriptor_heap = new dx12_descriptor_heap(
         ctx->device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8192);
     ctx->descriptor_heap->init();
 
     // Create PSO cache
+    dx12_log(DX12_LOG_INFO, "Creating PSO cache...");
     ctx->pso_cache = new dx12_pso_cache(ctx->device);
 
     // Create memory pools
+    dx12_log(DX12_LOG_INFO, "Creating memory pools...");
     ctx->activation_pool = new dx12_memory_pool(
         ctx->device, 256 * 1024 * 1024, dx12_heap_type::default_); // 256MB blocks
     ctx->weight_pool = new dx12_memory_pool(
         ctx->device, 512 * 1024 * 1024, dx12_heap_type::default_); // 512MB blocks
 
     // Initialize shader database (loads embedded CSO registry)
+    dx12_log(DX12_LOG_INFO, "Init shader db...");
     dx12_shader_db_init();
+
+    dx12_log(DX12_LOG_INFO, "Init complete, creating ggml backend...");
 
     // Create GGML backend
     ggml_backend_t backend = new ggml_backend();
-    backend->iface = ggml_backend_dx12_interface;
+    backend->guid   = ggml_backend_dx12_guid();
+    backend->iface  = ggml_backend_dx12_interface;
     backend->context = ctx;
 
     // Look up the device from registry to link backend to device layer
@@ -668,9 +804,10 @@ static ggml_backend_t dx12_dev_init_backend(ggml_backend_dev_t dev, const char *
     dx12_shader_db_init();
 
     ggml_backend_t backend = new ggml_backend();
-    backend->iface = ggml_backend_dx12_interface;
+    backend->guid   = ggml_backend_dx12_guid();
+    backend->iface  = ggml_backend_dx12_interface;
     backend->context = ctx;
-    backend->device = dev;
+    backend->device  = dev;
 
     ctx->initialized = true;
     dx12_log(DX12_LOG_INFO, "DX12 backend initialized on %s", d3d_dev->caps.adapter_name);

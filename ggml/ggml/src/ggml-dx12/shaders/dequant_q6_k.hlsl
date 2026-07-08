@@ -68,13 +68,15 @@ void main(uint3 tid : SV_DispatchThreadID) {
 
         // Scale (per 16-element group)
         uint scale_idx = elem / 16;
-        int8_t scale_byte;
+        int scale_byte;
         if (scale_idx < 8) {
             uint s_word = src[base + 48 + scale_idx / 2];
-            scale_byte = (int8_t)((s_word >> ((scale_idx & 1) * 8)) & 0xFF);
+            scale_byte = (int)((s_word >> ((scale_idx & 1) * 8)) & 0xFF);
+            if (scale_byte >= 128) scale_byte -= 256;
         } else {
             uint s_word = src[base + 48 + (scale_idx - 8) / 2 + 4];
-            scale_byte = (int8_t)((s_word >> (((scale_idx - 8) & 1) * 8)) & 0xFF);
+            scale_byte = (int)((s_word >> (((scale_idx - 8) & 1) * 8)) & 0xFF);
+            if (scale_byte >= 128) scale_byte -= 256;
         }
 
         float val = d * (float)scale_byte * (float)q;

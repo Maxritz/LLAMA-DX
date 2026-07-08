@@ -8,6 +8,7 @@
 #define DX12_PROFILER_H
 
 #include "dx12_device.h"
+#include "dx12_command.h"
 #include <vector>
 #include <string>
 #include <cstdint>

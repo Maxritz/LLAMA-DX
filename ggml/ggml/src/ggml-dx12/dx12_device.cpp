@@ -143,19 +143,13 @@ std::vector<dx12_adapter_info> dx12_enumerate_adapters() {
         // Detect architecture from device ID
         info.architecture = dx12_detect_gpu_architecture(info.vendor, desc.DeviceId);
 
-        // Check DXLA support (coarse tier check)
-        if (info.supports_dx12 && test_device) {
-            D3D12_FEATURE_DATA_LINEAR_ALGEBRA_SUPPORT linalg{};
-            info.supports_dxla = SUCCEEDED(test_device->CheckFeatureSupport(
-                D3D12_FEATURE_LINEAR_ALGEBRA_SUPPORT, &linalg, sizeof(linalg))) &&
-                linalg.LinearAlgebraTier >= D3D12_LINEAR_ALGEBRA_TIER_1_0;
-        }
+        // DXLA check skipped (disabled)
+        info.supports_dxla = false;
 
-        dx12_log(DX12_LOG_INFO, "Adapter[%u]: %s, VRAM=%.1fGB, DX12=%s, DXLA=%s",
+        dx12_log(DX12_LOG_INFO, "Adapter[%u]: %s, VRAM=%.1fGB, DX12=%s",
             index, info.name,
             info.dedicated_vram / (1024.0 * 1024.0 * 1024.0),
-            info.supports_dx12 ? "YES" : "NO",
-            info.supports_dxla ? "YES" : "NO");
+            info.supports_dx12 ? "YES" : "NO");
 
         adapters.push_back(info);
         adapter.Reset();
@@ -334,12 +328,15 @@ void dx12_detect_device_caps(dx12_device* dev) {
     d->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS4,
                            &dev->options4, sizeof(dev->options4));
 
+    // --- DXLA disabled ---
+#if 0
     // DX Linear Algebra - coarse tier check gates everything
     D3D12_FEATURE_DATA_LINEAR_ALGEBRA_SUPPORT linalg{};
     HRESULT hr_linalg = d->CheckFeatureSupport(D3D12_FEATURE_LINEAR_ALGEBRA_SUPPORT,
                                                 &linalg, sizeof(linalg));
     bool has_linalg = SUCCEEDED(hr_linalg) &&
                       linalg.LinearAlgebraTier >= D3D12_LINEAR_ALGEBRA_TIER_1_0;
+#endif
 
     // Fill caps structure
     dx12_device_caps& c = dev->caps;
@@ -353,39 +350,100 @@ void dx12_detect_device_caps(dx12_device* dev) {
     c.resource_heap_tier = dev->options.ResourceHeapTier;
     c.resource_binding_tier = dev->options.ResourceBindingTier;
 
+    // --- DXLA granular query disabled ---
+#if 0
     // DXLA granular query - per-scope, per-operation
     if (has_linalg) {
-        // Wave-scope matrix multiply
-        D3D12_FEATURE_DATA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT wave_query{};
-        wave_query.OperationType = D3D12_LINEAR_ALGEBRA_OPERATION_TYPE_WAVE_MATRIX_MULTIPLY;
-        wave_query.WaveMatrixMultiply.Inputs.WaveSize = 0;
-        wave_query.WaveMatrixMultiply.Inputs.MatrixAComponentType = D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT16;
-        wave_query.WaveMatrixMultiply.Inputs.MatrixBComponentType = D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT16;
-        wave_query.WaveMatrixMultiply.Inputs.AccumulatorComponentType = D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT32;
-        wave_query.WaveMatrixMultiply.NumShapes = 0;
-        HRESULT hr_wave = d->CheckFeatureSupport(D3D12_FEATURE_LINEAR_ALGEBRA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT,
-                                                  &wave_query, sizeof(wave_query));
-        c.dxla_wave = SUCCEEDED(hr_wave) &&
-            (wave_query.WaveMatrixMultiply.SupportFlags & D3D12_LINEAR_ALGEBRA_MULTIPLICATION_SUPPORT_FLAG_SUPPORTED);
+        // Wave-scope matrix multiply — two-step query (step1: count, step2: shapes)
+        {
+            D3D12_FEATURE_DATA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT wave_query{};
+            wave_query.OperationType = D3D12_LINEAR_ALGEBRA_OPERATION_TYPE_WAVE_MATRIX_MULTIPLY;
+            wave_query.WaveMatrixMultiply.Inputs.WaveSize = 32;
+            wave_query.WaveMatrixMultiply.Inputs.MatrixAComponentType = D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT16;
+            wave_query.WaveMatrixMultiply.Inputs.MatrixBComponentType = D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT16;
+            wave_query.WaveMatrixMultiply.Inputs.AccumulatorComponentType = D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT32;
+            wave_query.WaveMatrixMultiply.NumShapes = 0;
+            wave_query.WaveMatrixMultiply.Shapes = nullptr;
+
+            HRESULT hr_step1 = d->CheckFeatureSupport(
+                D3D12_FEATURE_LINEAR_ALGEBRA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT,
+                &wave_query, sizeof(wave_query));
+
+            dx12_log(DX12_LOG_INFO, "DXLA wave step1: hr=0x%08X flags=0x%X NumShapes=%u",
+                     hr_step1, wave_query.WaveMatrixMultiply.SupportFlags,
+                     wave_query.WaveMatrixMultiply.NumShapes);
+
+            c.dxla_wave = false;
+            if (SUCCEEDED(hr_step1) && wave_query.WaveMatrixMultiply.NumShapes > 0) {
+                uint32_t n = wave_query.WaveMatrixMultiply.NumShapes;
+                std::vector<D3D12_LINEAR_ALGEBRA_MATRIX_MULTIPLY_SHAPE> shapes(n);
+                wave_query.WaveMatrixMultiply.Shapes = shapes.data();
+                wave_query.WaveMatrixMultiply.NumShapes = n;
+
+                HRESULT hr_step2 = d->CheckFeatureSupport(
+                    D3D12_FEATURE_LINEAR_ALGEBRA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT,
+                    &wave_query, sizeof(wave_query));
+
+                dx12_log(DX12_LOG_INFO, "DXLA wave step2: hr=0x%08X flags=0x%X shapes=%u",
+                         hr_step2, wave_query.WaveMatrixMultiply.SupportFlags,
+                         wave_query.WaveMatrixMultiply.NumShapes);
+
+                c.dxla_wave = (wave_query.WaveMatrixMultiply.SupportFlags & D3D12_LINEAR_ALGEBRA_MULTIPLICATION_SUPPORT_FLAG_SUPPORTED) != 0;
+
+                uint32_t show_count = n < 8 ? n : 8u;
+                for (uint32_t i = 0; i < show_count; i++) {
+                    dx12_log(DX12_LOG_INFO, "  wave shape[%u]: M=%u N=%u K=%u",
+                             i, shapes[i].M, shapes[i].N, shapes[i].K);
+                }
+            }
+        }
 
         // ThreadGroup-scope matrix multiply
-        D3D12_FEATURE_DATA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT tg_query{};
-        tg_query.OperationType = D3D12_LINEAR_ALGEBRA_OPERATION_TYPE_THREADGROUP_MATRIX_MULTIPLY;
-        tg_query.ThreadGroupMatrixMultiply.WaveInputs = wave_query.WaveMatrixMultiply.Inputs;
-        tg_query.ThreadGroupMatrixMultiply.Shape = { 64, 64, 64 };
-        HRESULT hr_tg = d->CheckFeatureSupport(D3D12_FEATURE_LINEAR_ALGEBRA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT,
-                                                &tg_query, sizeof(tg_query));
-        c.dxla_threadgroup = SUCCEEDED(hr_tg) &&
-            (tg_query.ThreadGroupMatrixMultiply.SupportFlags & D3D12_LINEAR_ALGEBRA_MULTIPLICATION_SUPPORT_FLAG_SUPPORTED);
+        {
+            D3D12_FEATURE_DATA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT tg_query{};
+            tg_query.OperationType = D3D12_LINEAR_ALGEBRA_OPERATION_TYPE_THREADGROUP_MATRIX_MULTIPLY;
+            tg_query.ThreadGroupMatrixMultiply.WaveInputs.WaveSize = 32;
+            tg_query.ThreadGroupMatrixMultiply.WaveInputs.MatrixAComponentType = D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT16;
+            tg_query.ThreadGroupMatrixMultiply.WaveInputs.MatrixBComponentType = D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT16;
+            tg_query.ThreadGroupMatrixMultiply.WaveInputs.AccumulatorComponentType = D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT32;
+            tg_query.ThreadGroupMatrixMultiply.Shape = { 64, 64, 64 };
+            HRESULT hr_tg = d->CheckFeatureSupport(D3D12_FEATURE_LINEAR_ALGEBRA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT,
+                                                    &tg_query, sizeof(tg_query));
+            c.dxla_threadgroup = SUCCEEDED(hr_tg) &&
+                (tg_query.ThreadGroupMatrixMultiply.SupportFlags & D3D12_LINEAR_ALGEBRA_MULTIPLICATION_SUPPORT_FLAG_SUPPORTED);
+        }
 
-        // Component type support - architecture heuristics (refined per actual query)
+        // Wave-scope INT8 matrix multiply — check if hardware supports it independently
+        {
+            D3D12_FEATURE_DATA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT i8_query{};
+            i8_query.OperationType = D3D12_LINEAR_ALGEBRA_OPERATION_TYPE_WAVE_MATRIX_MULTIPLY;
+            i8_query.WaveMatrixMultiply.Inputs.WaveSize = 32;
+            i8_query.WaveMatrixMultiply.Inputs.MatrixAComponentType = D3D12_LINEAR_ALGEBRA_DATATYPE_SINT8;
+            i8_query.WaveMatrixMultiply.Inputs.MatrixBComponentType = D3D12_LINEAR_ALGEBRA_DATATYPE_SINT8;
+            i8_query.WaveMatrixMultiply.Inputs.AccumulatorComponentType = D3D12_LINEAR_ALGEBRA_DATATYPE_SINT32;
+            i8_query.WaveMatrixMultiply.NumShapes = 0;
+            i8_query.WaveMatrixMultiply.Shapes = nullptr;
+
+            HRESULT hr_i8 = d->CheckFeatureSupport(
+                D3D12_FEATURE_LINEAR_ALGEBRA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT,
+                &i8_query, sizeof(i8_query));
+
+            dx12_log(DX12_LOG_INFO, "DXLA wave INT8: hr=0x%08X flags=0x%X NumShapes=%u",
+                     hr_i8, i8_query.WaveMatrixMultiply.SupportFlags,
+                     i8_query.WaveMatrixMultiply.NumShapes);
+
+            c.dxla_int8 = SUCCEEDED(hr_i8) &&
+                (i8_query.WaveMatrixMultiply.SupportFlags & D3D12_LINEAR_ALGEBRA_MULTIPLICATION_SUPPORT_FLAG_SUPPORTED);
+        }
+
+        // Component type support - derived from queries above (overridden for INT8)
         c.dxla_f16 = true;
         c.dxla_f32 = (c.vendor == DX12_VENDOR_NVIDIA);
         c.dxla_bf16 = (c.vendor == DX12_VENDOR_INTEL) ||
                        (c.vendor == DX12_VENDOR_NVIDIA);
-        c.dxla_int8 = (c.vendor == DX12_VENDOR_NVIDIA);
         c.dxla_int4 = (c.vendor == DX12_VENDOR_NVIDIA);
     }
+#endif // DXLA disabled
 
     // GPU info from adapter desc
     wcstombs(c.adapter_name, dev->adapter_desc.Description, sizeof(c.adapter_name) - 1);
@@ -430,11 +488,10 @@ void dx12_detect_device_caps(dx12_device* dev) {
             c.prefers_wave64 = true;
     }
 
-    dx12_log(DX12_LOG_INFO, "Device caps: WaveOps=%s WaveSize=%u-%u Native16bit=%s DXLA=%s",
+    dx12_log(DX12_LOG_INFO, "Device caps: WaveOps=%s WaveSize=%u-%u Native16bit=%s",
         c.wave_ops ? "YES" : "NO",
         c.wave_lane_count_min, c.wave_lane_count_max,
-        c.native_16bit ? "YES" : "NO",
-        c.dxla_wave ? "YES" : "NO");
+        c.native_16bit ? "YES" : "NO");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -445,7 +502,7 @@ dx12_result dx12_device_create(int32_t adapter_index, dx12_device** out_device) 
     if (!out_device) return DX12_ERROR_INVALID_ARGUMENT;
     *out_device = nullptr;
 
-    // Enable SM 6.10 experimental features (DXLA, wave matrix, etc.)
+    // Enable SM 6.10 experimental features (required for Agility SDK runtime)
     static bool s_features_enabled = false;
     if (!s_features_enabled) {
         UUID experimental[] = { D3D12ExperimentalShaderModels };
@@ -637,6 +694,15 @@ dx12_result dx12_device_create(int32_t adapter_index, dx12_device** out_device) 
     }
 
     dx12_log(DX12_LOG_INFO, "DX12 device ready: %s", dev->caps.adapter_name);
+
+    // Check if device was created in a removed state
+    HRESULT reason = dev->device->GetDeviceRemovedReason();
+    if (reason != S_OK) {
+        dx12_log(DX12_LOG_ERROR, "Device already removed on creation! reason=0x%08X", reason);
+    } else {
+        dx12_log(DX12_LOG_INFO, "Device removal reason check: S_OK");
+    }
+
     *out_device = dev;
     return DX12_OK;
 }
@@ -646,8 +712,14 @@ void dx12_device_destroy(dx12_device* dev) {
 
     dx12_log(DX12_LOG_INFO, "Destroying DX12 device");
 
-    // Wait for GPU to finish
-    dx12_device_wait_idle(dev);
+    // Don't wait if device was removed
+    bool removed = false;
+    if (dev->device) {
+        removed = (dev->device->GetDeviceRemovedReason() != S_OK);
+    }
+    if (!removed) {
+        dx12_device_wait_idle(dev);
+    }
 
     // Cleanup CBV ring buffer
     if (dev->cbv_ring_cpu_address) {
