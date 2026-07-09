@@ -23,26 +23,37 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * dx12_graph_compute — Execute a GGML compute graph on DX12
+ * dx12_graph_compute_begin — Create and start recording a batched command list
+ */
+dx12_command_list* dx12_graph_compute_begin(dx12_device* dev);
+
+/**
+ * dx12_graph_compute — Record dispatches for one sub-graph into an open cmd list
  *
- * This is the main entry point. It:
- * 1. Walks the GGML graph in topological order
- * 2. For each op, selects the appropriate DX12 shader
- * 3. Records dispatches to a command list
- * 4. Submits to GPU
+ * Returns false if any node fails to dispatch; caller must NOT submit the
+ * partially recorded command list in that case.
  *
  * Called from: ggml_backend_dx12_graph_compute in ggml-backend-dx12.cpp
  */
-void dx12_graph_compute(dx12_device* dev, ggml_cgraph* graph);
+bool dx12_graph_compute(dx12_device* dev, dx12_command_list* cmd, ggml_cgraph* graph);
+
+/**
+ * dx12_graph_compute_end — Submit and wait for the batched command list
+ */
+void dx12_graph_compute_end(dx12_device* dev, dx12_command_list* cmd);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Op Support
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * dx12_op_supported — Check if a GGML op is implemented on DX12
+ * dx12_op_supported — Check if a GGML node is computable on DX12
+ *
+ * Deliberately conservative: only returns true for op/shape/type combinations
+ * that have a verified-correct shader path. Everything else falls back to the
+ * CPU backend via ggml_backend_sched.
  */
-bool dx12_op_supported(ggml_op op, const ggml_tensor* src0, const ggml_tensor* src1);
+bool dx12_op_supported(const ggml_tensor* node);
 
 /**
  * dx12_graph_validate — Check if all ops in a graph are supported

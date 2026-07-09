@@ -162,20 +162,24 @@ std::vector<dx12_adapter_info> dx12_enumerate_adapters() {
 uint32_t dx12_select_best_adapter(const std::vector<dx12_adapter_info>& adapters) {
     if (adapters.empty()) return 0;
 
-    uint32_t best_idx = 0;
+    uint32_t best_idx = adapters[0].index;
+    const char* best_name = adapters[0].name;
     uint64_t best_vram = 0;
 
     for (const auto& a : adapters) {
         if (!a.supports_dx12) continue;
-        // Prefer discrete GPUs with most VRAM
+        // Prefer discrete GPUs with most VRAM. Note: a.index is the DXGI
+        // enumeration index, which can be non-contiguous (skipped software
+        // adapters) — never use it to subscript the adapters vector.
         if (a.dedicated_vram > best_vram) {
             best_vram = a.dedicated_vram;
             best_idx = a.index;
+            best_name = a.name;
         }
     }
 
     dx12_log(DX12_LOG_INFO, "Selected adapter[%u]: %s (VRAM=%.1fGB)",
-        best_idx, adapters[best_idx].name,
+        best_idx, best_name,
         best_vram / (1024.0 * 1024.0 * 1024.0));
 
     return best_idx;
@@ -266,19 +270,16 @@ static void __stdcall dx12_info_queue_callback(
     D3D12_MESSAGE_CATEGORY category,
     D3D12_MESSAGE_SEVERITY severity,
     D3D12_MESSAGE_ID id,
-    LPCWSTR pDescription,
+    LPCSTR pDescription,   // D3D12MessageFunc delivers a narrow string
     void* pContext) {
-    if (severity >= D3D12_MESSAGE_SEVERITY_WARNING) {
+    (void)category; (void)pContext;
+    if (severity <= D3D12_MESSAGE_SEVERITY_WARNING) {
         const char* sev = severity == D3D12_MESSAGE_SEVERITY_CORRUPTION ? "CORRUPTION"
                         : severity == D3D12_MESSAGE_SEVERITY_ERROR ? "ERROR"
                         : "WARNING";
-        FILE* f = fopen("C:\\dx12_err.log", "a");
-        if (f) {
-            fprintf(f, "[D3D12 %s] %S\n", sev, pDescription ? pDescription : L"(no description)");
-            fclose(f);
-        }
-        printf("[D3D12 %s] %S\n", sev, pDescription ? pDescription : L"(no description)");
-        fflush(stdout);
+        fprintf(stderr, "[D3D12 %s id=%d] %s\n", sev, (int)id,
+                pDescription ? pDescription : "(no description)");
+        fflush(stderr);
     }
 }
 
@@ -502,7 +503,15 @@ dx12_result dx12_device_create(int32_t adapter_index, dx12_device** out_device) 
     if (!out_device) return DX12_ERROR_INVALID_ARGUMENT;
     *out_device = nullptr;
 
-    // Enable SM 6.10 experimental features (required for Agility SDK runtime)
+    // --- SM 6.10 experimental features disabled ---
+    // Shaders now compile against the stable cs_6_6 profile (see
+    // shaders/compile_shaders.ps1); the DXLA shaders that actually needed SM
+    // 6.10 were dropped from the build since the DXLA dispatch path is dead
+    // code. Nothing left requires D3D12ExperimentalShaderModels, and it was
+    // confirmed (via matched before/after tests at an identical buft_alloc
+    // call) to correlate with GPU hangs during plain resource allocation on
+    // this preview RDNA4 driver. Re-add if DXLA shaders come back.
+#if 0
     static bool s_features_enabled = false;
     if (!s_features_enabled) {
         UUID experimental[] = { D3D12ExperimentalShaderModels };
@@ -514,6 +523,7 @@ dx12_result dx12_device_create(int32_t adapter_index, dx12_device** out_device) 
             dx12_log(DX12_LOG_WARN, "D3D12EnableExperimentalFeatures failed: 0x%08X", hr_exp);
         }
     }
+#endif
 
     // Enable debug layer in debug builds
 #ifdef DX12_DEBUG_LAYER
@@ -554,9 +564,13 @@ dx12_result dx12_device_create(int32_t adapter_index, dx12_device** out_device) 
         selected_index = dx12_select_best_adapter(adapters);
     } else {
         selected_index = (uint32_t)adapter_index;
-        if (selected_index >= adapters.size()) {
-            dx12_log(DX12_LOG_ERROR, "Adapter index %u out of range (max %zu)",
-                selected_index, adapters.size() - 1);
+        bool found = false;
+        for (const auto& a : adapters) {
+            if (a.index == selected_index) { found = true; break; }
+        }
+        if (!found) {
+            dx12_log(DX12_LOG_ERROR, "Adapter index %u not among enumerated adapters",
+                selected_index);
             delete dev;
             return DX12_ERROR_ADAPTER_NOT_FOUND;
         }
@@ -606,7 +620,7 @@ dx12_result dx12_device_create(int32_t adapter_index, dx12_device** out_device) 
     // Create command queue
     D3D12_COMMAND_QUEUE_DESC queue_desc{};
     queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    queue_desc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
+    queue_desc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
     queue_desc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
     queue_desc.NodeMask = 0;
 
@@ -636,7 +650,23 @@ dx12_result dx12_device_create(int32_t adapter_index, dx12_device** out_device) 
     // Detect capabilities
     dx12_detect_device_caps(dev);
 
-    // Create CBV ring buffer (64KB upload heap, 256-byte aligned)
+    // Create CBV ring buffer (upload heap, 256-byte aligned).
+    //
+    // Sized generously (4MB = 16384 dispatch-constant slots) because
+    // dx12_device_allocate_cbv wraps this ring with NO synchronization: a
+    // whole graph_compute call records every node's dispatch into a single
+    // command list and only submits+waits once at the end, so every
+    // dispatch's constants get memcpy'd into this ring before the GPU
+    // executes any of them. A too-small ring (previously 64KB = 256 slots)
+    // wraps mid-graph for any real model (Llama-3.2-1B alone needs ~300+
+    // dispatches per token), silently overwriting earlier dispatches'
+    // constants with later ones' before the GPU ever reads them — the GPU
+    // then executes with garbage M/N/K/stride values, which can turn a
+    // shader's `for (k = 0; k < params.K; k++)` into a near-infinite loop
+    // and hang the device (DXGI_ERROR_DEVICE_HUNG). This is a real fix only
+    // insofar as it makes wraparound unlikely for current graph sizes; the
+    // ring is still unsynchronized, so a model/context large enough to
+    // exceed this many dispatches per compute call would reproduce the bug.
     {
         D3D12_HEAP_PROPERTIES heap_props = {};
         heap_props.Type = D3D12_HEAP_TYPE_UPLOAD;
@@ -645,9 +675,10 @@ dx12_result dx12_device_create(int32_t adapter_index, dx12_device** out_device) 
         heap_props.CreationNodeMask = 1;
         heap_props.VisibleNodeMask = 1;
 
+        static constexpr UINT64 CBV_RING_BUFFER_SIZE = 4 * 1024 * 1024; // 4MB
         D3D12_RESOURCE_DESC desc = {};
         desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        desc.Width = 65536;  // 64KB
+        desc.Width = CBV_RING_BUFFER_SIZE;
         desc.Height = 1;
         desc.DepthOrArraySize = 1;
         desc.MipLevels = 1;
@@ -680,10 +711,11 @@ dx12_result dx12_device_create(int32_t adapter_index, dx12_device** out_device) 
         }
         dev->cbv_ring_gpu_address =
             dev->cbv_ring_buffer->GetGPUVirtualAddress();
-        dev->cbv_ring_size = 65536;
+        dev->cbv_ring_size = (uint32_t)CBV_RING_BUFFER_SIZE;
         dev->cbv_ring_offset = 0;
 
-        dx12_log(DX12_LOG_INFO, "CBV ring buffer created: 64KB");
+        dx12_log(DX12_LOG_INFO, "CBV ring buffer created: %uMB",
+                 (unsigned)(CBV_RING_BUFFER_SIZE / (1024 * 1024)));
     }
 
     // Verify minimum requirements
@@ -759,12 +791,24 @@ bool dx12_device_check_lost(dx12_device* dev) {
 void dx12_device_wait_idle(dx12_device* dev) {
     if (!dev || !dev->fence) return;
 
-    uint64_t current_value = dev->fence_value.load();
+    // Reserve a fresh fence value (fetch_add, like submit does). Signaling
+    // fence_value.load() without reserving it lets the next submit signal the
+    // same value again; its wait then returns before the GPU finishes and the
+    // command list is destroyed in flight -> device hang.
+    uint64_t current_value = dev->fence_value.fetch_add(1);
     dev->command_queue->Signal(dev->fence.Get(), current_value);
 
     if (dev->fence->GetCompletedValue() < current_value) {
         dev->fence->SetEventOnCompletion(current_value, dev->fence_event);
-        WaitForSingleObject(dev->fence_event, INFINITE);
+        // Bounded wait: an INFINITE wait on a hung device never returns (the
+        // fence is never signaled after removal), leaving a zombie process
+        // holding the adapter.
+        DWORD wr = WaitForSingleObject(dev->fence_event, 10000);
+        if (wr == WAIT_TIMEOUT) {
+            dx12_log(DX12_LOG_ERROR, "wait_idle: fence timeout (device removed: 0x%08X)",
+                     (unsigned)dev->device->GetDeviceRemovedReason());
+            dev->device_lost.store(true);
+        }
     }
 }
 
@@ -772,7 +816,12 @@ void dx12_device_wait_for_fence(dx12_device* dev, uint64_t fence_value) {
     if (!dev || !dev->fence) return;
     if (dev->fence->GetCompletedValue() < fence_value) {
         dev->fence->SetEventOnCompletion(fence_value, dev->fence_event);
-        WaitForSingleObject(dev->fence_event, INFINITE);
+        DWORD wr = WaitForSingleObject(dev->fence_event, 10000);
+        if (wr == WAIT_TIMEOUT) {
+            dx12_log(DX12_LOG_ERROR, "wait_for_fence: fence timeout (device removed: 0x%08X)",
+                     (unsigned)dev->device->GetDeviceRemovedReason());
+            dev->device_lost.store(true);
+        }
     }
 }
 
@@ -814,12 +863,10 @@ D3D12_GPU_VIRTUAL_ADDRESS dx12_device_allocate_cbv(dx12_device* dev,
 
     {
         const uint32_t* src = (const uint32_t*)data;
-        const uint32_t* dst = (const uint32_t*)(dev->cbv_ring_cpu_address + offset);
-        dx12_log(DX12_LOG_INFO,
-                 "CBV write: cpu=%p gpu=%llx M=%u N=%u K=%u sa=%u sb=%u sc=%u tb=%u (dst0=%u)",
-                 (void*)(dev->cbv_ring_cpu_address + offset),
+        dx12_log(DX12_LOG_VERBOSE,
+                 "CBV write: gpu=%llx M=%u N=%u K=%u",
                  (unsigned long long)gpu_address,
-                 src[0], src[1], src[2], src[3], src[4], src[5], src[6], dst[0]);
+                 src[0], src[1], src[2]);
     }
 
     // Update offset (256-byte aligned)

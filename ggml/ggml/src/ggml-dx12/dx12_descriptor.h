@@ -44,6 +44,12 @@ enum class dx12_root_signature_type {
     // Used for: flash attention
     attention,
 
+    // MM: CBV + 3 root UAVs (u0=A, u1=B, u2=C). All buffers bound as UAVs so
+    // sources aliasing the destination's resource share one legal state
+    // (UNORDERED_ACCESS); an SRV binding on a UAV-state resource is invalid
+    // and hangs this driver. Used for: mm_* mul_mat shaders.
+    mm,
+
     // Custom: built from description at runtime
     custom,
 };

@@ -222,10 +222,24 @@ void dx12_buffer_copy_upload_to_default(dx12_device* dev,
 void dx12_buffer_transition(dx12_command_list* cmd,
                             dx12_buffer* buf,
                             D3D12_RESOURCE_STATES new_state) {
-    if (!cmd || !buf || buf->state == new_state) return;
+    if (!cmd || !buf) return;
 
     // UPLOAD/READBACK heaps have fixed states and cannot be transitioned
     if (buf->heap == dx12_heap_type::upload || buf->heap == dx12_heap_type::readback) {
+        return;
+    }
+
+    if (buf->state == new_state) {
+        // A state-transition barrier only exists when the state actually changes.
+        // Consecutive dispatches that both leave a buffer in UNORDERED_ACCESS
+        // (e.g. one op's UAV output read/written by the next op as UAV) need an
+        // explicit UAV barrier instead, or the GPU has no guarantee the prior
+        // dispatch's writes are visible before the next one starts — this was
+        // silently a no-op here, which let dependent dispatches race and could
+        // hang the GPU (DXGI_ERROR_DEVICE_HUNG) instead of just returning wrong data.
+        if (new_state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+            dx12_cmd_list_uav_barrier(cmd, buf->resource.Get());
+        }
         return;
     }
 

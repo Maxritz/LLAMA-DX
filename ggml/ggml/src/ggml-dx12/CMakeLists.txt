@@ -91,6 +91,9 @@ target_link_libraries(ggml-backend-dx12
         dxcompiler.lib
 )
 
+# Diagnostic toggles (set via cmake -D)
+option(DX12_FORCE_COMPUTE_LIST "Use D3D12_COMMAND_LIST_TYPE_COMPUTE instead of DIRECT (diagnostic)" OFF)
+
 # Shader Model 6.10 compile flags
 target_compile_definitions(ggml-backend-dx12
     PRIVATE
@@ -98,6 +101,9 @@ target_compile_definitions(ggml-backend-dx12
         DX12_SYSTEM_D3D12
         $<$<CONFIG:Debug>:DX12_DEBUG_LAYER>
         $<$<CONFIG:Debug>:DX12_GPU_VALIDATION>
+        $<IF:$<BOOL:${DX12_FORCE_COMPUTE_LIST}>,DX12_FORCE_COMPUTE_LIST,>
+        $<IF:$<BOOL:${DX12_FORCE_DEBUG_LAYER}>,DX12_DEBUG_LAYER,>
+        $<IF:$<BOOL:${DX12_FORCE_DEBUG_LAYER}>,DX12_GPU_VALIDATION,>
 )
 
 # C++20 required for designated initializers and concepts
@@ -128,11 +134,34 @@ set(DX12_SHADERS
     mul_mat_q8_0_f16
     mul_mat_batched
     mul_mat_strided
-    mul_mat_dxla_wave_f16_f16
-    mul_mat_dxla_wave_q4_0_f16
-    mul_mat_dxla_tg_f16_f16
-    attn_qk_dxla
-    attn_ov_dxla
+    mm_f32
+    mm_f16
+    mm_q8_0
+    mm_q4_0
+    mms_f32
+    mms_f16
+    mv_f32
+    mv_f16
+    mv_q8_0
+    mv_q4_0
+    ew_bin
+    ew_scale
+    ew_unary
+    ew_glu
+    rms_norm_row
+    soft_max_row
+    get_rows_x
+    cpy_gen
+    rope_f32
+    set_rows_gen
+    # DXLA GEMM/attention shaders excluded — need SM 6.10 (dx::linalg
+    # cooperative matrix), but the DXLA dispatch path is disabled
+    # (dx12_gemm.cpp / dx12_device.cpp), so these were unreachable dead
+    # weight forcing every shader to require D3D12EnableExperimentalFeatures.
+    # Re-add (and switch cs_6_6 below back to cs_6_10 + re-enable experimental
+    # features in dx12_device.cpp) if DXLA is ever revisited:
+    #   mul_mat_dxla_wave_f16_f16, mul_mat_dxla_wave_q4_0_f16,
+    #   mul_mat_dxla_tg_f16_f16, attn_qk_dxla, attn_ov_dxla
     soft_max
     silu
     gelu
@@ -160,7 +189,7 @@ foreach(SHADER_NAME ${DX12_SHADERS})
     add_custom_command(
         OUTPUT ${CSO_FILE}
         COMMAND ${DXC_EXECUTABLE}
-            -T cs_6_10
+            -T cs_6_6
             -E main
             -enable-16bit-types
             -O3

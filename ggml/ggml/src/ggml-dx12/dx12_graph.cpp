@@ -22,48 +22,201 @@ static void apply_tensor_offset(dx12_buffer* buf, const ggml_tensor* t) {
 // Op Support Table
 // ═══════════════════════════════════════════════════════════════════════════════
 
-bool dx12_op_supported(ggml_op op, const ggml_tensor* src0, const ggml_tensor* src1) {
-    (void)src0;
-    (void)src1;
+// D3D12 dispatch limit per dimension
+static const int64_t DX12_MAX_GROUPS = 65535;
 
-    switch (op) {
-        // Fully supported ops
+// Debug: comma list in DX12_DISABLE_OPS disables op families at runtime
+// (add,mul,scale,unary,rms,softmax,rope,getrows,cpy,setrows,mms)
+static bool dx12_op_disabled(const char* name) {
+    static const char* env = getenv("DX12_DISABLE_OPS");
+    if (!env) return false;
+    return strstr(env, name) != nullptr;
+}
+
+static bool dx12_dims_fit_u32(const ggml_tensor* t) {
+    return ggml_nbytes(t) < (size_t)UINT32_MAX;
+}
+
+static bool dx12_mul_mat_is_fast2d(const ggml_tensor* dst);
+static bool dx12_dispatch_glu(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
+
+bool dx12_op_supported(const ggml_tensor* node) {
+    if (!node) return false;
+
+    switch (node->op) {
+        case GGML_OP_MUL_MAT: {
+            const ggml_tensor* a = node->src[0];
+            const ggml_tensor* b = node->src[1];
+            if (!a || !b) return false;
+            if (dx12_op_disabled("mulmat")) return false;
+            if (b->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32) return false;
+            if (!dx12_dims_fit_u32(a) || !dx12_dims_fit_u32(b) || !dx12_dims_fit_u32(node)) return false;
+            if ((a->ne[1] + 15) / 16 > DX12_MAX_GROUPS) return false;
+            if ((b->ne[1] + 15) / 16 > DX12_MAX_GROUPS) return false;
+            if (node->ne[2] * node->ne[3] > DX12_MAX_GROUPS) return false;
+            // Fast path: contiguous 2D {F32, F16, Q8_0, Q4_0} weights
+            if (dx12_mul_mat_is_fast2d(node)) return true;
+            // Strided/batched path: F32/F16 sources with arbitrary strides
+            if (dx12_op_disabled("mms")) return false;
+            return a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16;
+        }
+
         case GGML_OP_ADD:
-        case GGML_OP_MUL:
-        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL: {
+            if (dx12_op_disabled("ewbin")) return false;
+            const ggml_tensor* a = node->src[0];
+            const ggml_tensor* b = node->src[1];
+            if (!a || !b) return false;
+            if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 ||
+                node->type != GGML_TYPE_F32) return false;
+            if (!ggml_are_same_shape(a, node)) return false;
+            if ((node->ne[0] + 255) / 256 > DX12_MAX_GROUPS) return false;
+            if (node->ne[1] > DX12_MAX_GROUPS) return false;
+            if (node->ne[2] * node->ne[3] > DX12_MAX_GROUPS) return false;
+            return dx12_dims_fit_u32(a) && dx12_dims_fit_u32(b) && dx12_dims_fit_u32(node);
+        }
+
         case GGML_OP_SCALE:
-        case GGML_OP_UNARY:
-        case GGML_OP_SOFT_MAX:
-        case GGML_OP_RMS_NORM:
-        case GGML_OP_NORM:
-        case GGML_OP_ROPE:
-        case GGML_OP_DIAG_MASK_INF:
-        case GGML_OP_GET_ROWS:
-        case GGML_OP_PERMUTE:
+            if (dx12_op_disabled("scale")) return false;
+            return node->src[0] && node->src[0]->type == GGML_TYPE_F32 &&
+                   node->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(node) &&
+                   (ggml_nelements(node) + 255) / 256 <= DX12_MAX_GROUPS;
+
+        case GGML_OP_UNARY: {
+            if (dx12_op_disabled("unary")) return false;
+            const enum ggml_unary_op uop = ggml_get_unary_op(node);
+            if (uop != GGML_UNARY_OP_SILU && uop != GGML_UNARY_OP_GELU) return false;
+            return node->src[0] && node->src[0]->type == GGML_TYPE_F32 &&
+                   node->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(node) &&
+                   (ggml_nelements(node) + 255) / 256 <= DX12_MAX_GROUPS;
+        }
+
+        case GGML_OP_GLU: {
+            if (dx12_op_disabled("glu")) return false;
+            const enum ggml_glu_op gop = ggml_get_glu_op(node);
+            if (gop != GGML_GLU_OP_SWIGLU && gop != GGML_GLU_OP_GEGLU) return false;
+            const ggml_tensor* a = node->src[0];
+            const ggml_tensor* b = node->src[1];
+            if (!a || a->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32) return false;
+            if (b && b->type != GGML_TYPE_F32) return false;
+            if (!ggml_is_contiguous(a) || !ggml_is_contiguous(node)) return false;
+            if (b && !ggml_is_contiguous(b)) return false;
+            if ((node->ne[0] + 255) / 256 > DX12_MAX_GROUPS) return false;
+            if (node->ne[1] * node->ne[2] * node->ne[3] > DX12_MAX_GROUPS) return false;
+            return dx12_dims_fit_u32(a) && dx12_dims_fit_u32(node);
+        }
+
+        case GGML_OP_RMS_NORM: {
+            if (dx12_op_disabled("rms")) return false;
+            const ggml_tensor* a = node->src[0];
+            if (!a || a->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32) return false;
+            if (a->nb[0] != 4 || node->nb[0] != 4) return false;
+            if (a->ne[1] > DX12_MAX_GROUPS || a->ne[2] > DX12_MAX_GROUPS ||
+                a->ne[3] > DX12_MAX_GROUPS) return false;
+            return dx12_dims_fit_u32(a) && dx12_dims_fit_u32(node);
+        }
+
+        case GGML_OP_SOFT_MAX: {
+            if (dx12_op_disabled("softmax")) return false;
+            const ggml_tensor* a = node->src[0];
+            const ggml_tensor* mask = node->src[1];
+            if (!a || a->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32) return false;
+            if (node->src[2]) return false; // sinks not implemented
+            if (a->nb[0] != 4 || node->nb[0] != 4) return false;
+            if (mask && mask->type != GGML_TYPE_F32 && mask->type != GGML_TYPE_F16) return false;
+            float max_bias;
+            memcpy(&max_bias, (const char*)node->op_params + 4, sizeof(float));
+            if (max_bias != 0.0f) return false; // ALiBi slopes not implemented
+            if (a->ne[1] > DX12_MAX_GROUPS || a->ne[2] > DX12_MAX_GROUPS ||
+                a->ne[3] > DX12_MAX_GROUPS) return false;
+            return dx12_dims_fit_u32(a) && dx12_dims_fit_u32(node);
+        }
+
+        case GGML_OP_ROPE: {
+            if (dx12_op_disabled("rope")) return false;
+            const ggml_tensor* a = node->src[0];
+            const ggml_tensor* pos = node->src[1];
+            const ggml_tensor* ff = node->src[2];
+            if (!a || a->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32) return false;
+            if (!pos || pos->type != GGML_TYPE_I32) return false;
+            if (ff && ff->type != GGML_TYPE_F32) return false;
+            const int32_t mode = ((const int32_t*)node->op_params)[2];
+            if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) return false;
+            const int32_t n_dims = ((const int32_t*)node->op_params)[1];
+            if (n_dims <= 0 || (n_dims % 2) != 0) return false;
+            if (a->ne[0] % 2 != 0) return false;
+            if (a->ne[1] > DX12_MAX_GROUPS || a->ne[2] * a->ne[3] > DX12_MAX_GROUPS) return false;
+            return dx12_dims_fit_u32(a) && dx12_dims_fit_u32(node);
+        }
+
+        case GGML_OP_GET_ROWS: {
+            if (dx12_op_disabled("getrows")) return false;
+            const ggml_tensor* a = node->src[0];
+            const ggml_tensor* ids = node->src[1];
+            if (!a || !ids || node->type != GGML_TYPE_F32) return false;
+            if (a->type != GGML_TYPE_F32 && a->type != GGML_TYPE_F16 &&
+                a->type != GGML_TYPE_Q8_0 && a->type != GGML_TYPE_Q4_0) return false;
+            if (ids->type != GGML_TYPE_I32) return false;
+            if (a->ne[2] != 1 || a->ne[3] != 1) return false;
+            if (ids->ne[1] != 1 || ids->ne[2] != 1) return false;
+            if (!ggml_is_contiguous(a)) return false;
+            if ((a->ne[0] + 255) / 256 > DX12_MAX_GROUPS || ids->ne[0] > DX12_MAX_GROUPS) return false;
+            return dx12_dims_fit_u32(a) && dx12_dims_fit_u32(node);
+        }
+
         case GGML_OP_CPY:
-        case GGML_OP_SET_ROWS:
+        case GGML_OP_DUP:
+        case GGML_OP_CONT: {
+            if (dx12_op_disabled("cpy")) return false;
+            const ggml_tensor* a = node->src[0];
+            const ggml_tensor* d = node;
+            if (!a) return false;
+            if (a->type != GGML_TYPE_F32 && a->type != GGML_TYPE_F16) return false;
+            if (d->type != GGML_TYPE_F32 && d->type != GGML_TYPE_F16) return false;
+            const int64_t total = ggml_nelements(d);
+            if ((total + 255) / 256 > DX12_MAX_GROUPS) return false;
+            if (d->type == GGML_TYPE_F16) {
+                // F16 stores are whole-word pair writes: each 32-bit word must
+                // be owned by one thread (see cpy_gen.hlsl)
+                if (d->nb[0] != 2 || (d->ne[0] % 2) != 0) return false;
+                if ((d->nb[1] % 4) != 0 || (d->nb[2] % 4) != 0 || (d->nb[3] % 4) != 0) return false;
+            }
+            return dx12_dims_fit_u32(a) && dx12_dims_fit_u32(d);
+        }
+
+        case GGML_OP_SET_ROWS: {
+            if (dx12_op_disabled("setrows")) return false;
+            const ggml_tensor* a = node->src[0];
+            const ggml_tensor* ids = node->src[1];
+            if (!a || !ids || a->type != GGML_TYPE_F32) return false;
+            if (ids->type != GGML_TYPE_I64 && ids->type != GGML_TYPE_I32) return false;
+            if (node->type != GGML_TYPE_F32 && node->type != GGML_TYPE_F16) return false;
+            if (a->nb[0] != 4) return false;
+            if (a->ne[2] * a->ne[3] > DX12_MAX_GROUPS) return false;
+            // F16 dst handled either by pair stores (contiguous rows) or
+            // per-lane atomic stores (strided, e.g. transposed V cache);
+            // F16 strides are always 2-byte element aligned.
+            if (node->type == GGML_TYPE_F32 && (node->nb[0] % 4) != 0) return false;
+            if (a->ne[0] == 1 && a->ne[2] == 1 && a->ne[3] == 1) {
+                // flat per-element scatter (transposed V cache): rows over x
+                if ((a->ne[1] + 255) / 256 > DX12_MAX_GROUPS) return false;
+            } else if (a->ne[1] > DX12_MAX_GROUPS) {
+                return false;
+            }
+            return dx12_dims_fit_u32(a) && dx12_dims_fit_u32(node);
+        }
+
+        // View ops: no data movement, dispatched as no-ops
         case GGML_OP_VIEW:
         case GGML_OP_RESHAPE:
+        case GGML_OP_PERMUTE:
         case GGML_OP_TRANSPOSE:
         case GGML_OP_NONE:
-        case GGML_OP_COUNT:
             return true;
 
-        // Partially supported / needs attention fusion
-        // FLASH_ATTN and FLASH_FF merged into FLASH_ATTN_EXT in this ggml version
-        case GGML_OP_FLASH_ATTN_EXT:
-            return true; // Decomposed into individual ops
-
-        // SSM ops — used by Mamba-family models (not yet implemented)
-        case GGML_OP_SSM_CONV:
-        case GGML_OP_SSM_SCAN:
-
-        // Not yet supported
-        case GGML_OP_CONV_2D:
-        case GGML_OP_POOL_1D:
-        case GGML_OP_POOL_2D:
-        case GGML_OP_MAP_CUSTOM1:
-        case GGML_OP_MAP_CUSTOM2:
+        // Everything else is unverified on DX12 — CPU fallback.
         default:
             return false;
     }
@@ -76,7 +229,7 @@ bool dx12_graph_validate(dx12_device* dev, ggml_cgraph* graph,
     bool valid = true;
     for (int i = 0; i < graph->n_nodes; i++) {
         ggml_tensor* node = graph->nodes[i];
-        if (!dx12_op_supported(node->op, node->src[0], node->src[1])) {
+        if (!dx12_op_supported(node)) {
             valid = false;
             if (error_buf && error_buf_size > 0) {
                 snprintf(error_buf, error_buf_size,
@@ -92,110 +245,93 @@ bool dx12_graph_validate(dx12_device* dev, ggml_cgraph* graph,
 // Graph Compute
 // ═══════════════════════════════════════════════════════════════════════════════
 
-void dx12_graph_compute(dx12_device* dev, ggml_cgraph* graph) {
-    if (!dev || !graph || graph->n_nodes == 0) return;
+dx12_command_list* dx12_graph_compute_begin(dx12_device* dev) {
+    dx12_command_list* cmd = dx12_cmd_list_create(dev);
+    if (!cmd) return nullptr;
+    if (!dx12_cmd_list_reset(cmd)) {
+        dx12_cmd_list_destroy(cmd);
+        return nullptr;
+    }
+    return cmd;
+}
 
-    dx12_log(DX12_LOG_INFO, "dx12_graph_compute: %d nodes", graph->n_nodes);
+void dx12_graph_compute_end(dx12_device* dev, dx12_command_list* cmd) {
+    (void)dev;
+    if (!cmd) return;
+    dx12_cmd_list_submit_and_wait(cmd);
+    dx12_cmd_list_destroy(cmd);
+}
+
+bool dx12_graph_compute(dx12_device* dev, dx12_command_list* cmd, ggml_cgraph* graph) {
+    if (!dev || !cmd || !graph) return false;
+    if (graph->n_nodes == 0) return true;
 
     // Validate graph
     char error_buf[256];
     if (!dx12_graph_validate(dev, graph, error_buf, sizeof(error_buf))) {
         dx12_log(DX12_LOG_ERROR, "Graph validation failed: %s", error_buf);
-        return;
+        return false;
     }
-
-    dx12_log(DX12_LOG_INFO, "Graph validation passed");
-
-    // Check if we have a compiled version (Phase 4 placeholder)
-    dx12_compiled_graph* compiled = dx12_compile_graph(dev, graph);
-    if (compiled) {
-        dx12_execute_compiled_graph(dev, compiled);
-        return;
-    }
-
-    // Individual dispatch path (Phase 1-3)
-    dx12_log(DX12_LOG_INFO, "Creating command list...");
-    dx12_command_list* cmd = dx12_cmd_list_create(dev);
-    if (!cmd) {
-        dx12_log(DX12_LOG_ERROR, "Failed to create command list for graph compute");
-        return;
-    }
-
-    dx12_log(DX12_LOG_INFO, "Resetting command list...");
-    if (!dx12_cmd_list_reset(cmd)) {
-        dx12_log(DX12_LOG_ERROR, "Failed to reset command list");
-        dx12_cmd_list_destroy(cmd);
-        return;
-    }
-    dx12_log(DX12_LOG_INFO, "Command list ready, %d nodes to execute", graph->n_nodes);
 
     // Execute each node in topological order
     for (int i = 0; i < graph->n_nodes; i++) {
         ggml_tensor* node = graph->nodes[i];
         bool ok = false;
-
-        dx12_log(DX12_LOG_INFO, "  node[%d]: op=%s name=%s", i, ggml_op_name(node->op), node->name);
+        bool dispatched = true;
 
         switch (node->op) {
+            case GGML_OP_MUL_MAT:       ok = dx12_dispatch_mul_mat(dev, cmd, node); break;
             case GGML_OP_ADD:           ok = dx12_dispatch_add(dev, cmd, node); break;
             case GGML_OP_MUL:           ok = dx12_dispatch_mul(dev, cmd, node); break;
-            case GGML_OP_MUL_MAT:       ok = dx12_dispatch_mul_mat(dev, cmd, node); break;
             case GGML_OP_SCALE:         ok = dx12_dispatch_scale(dev, cmd, node); break;
             case GGML_OP_UNARY:
                 switch (ggml_get_unary_op(node)) {
                     case GGML_UNARY_OP_SILU: ok = dx12_dispatch_silu(dev, cmd, node); break;
                     case GGML_UNARY_OP_GELU: ok = dx12_dispatch_gelu(dev, cmd, node); break;
                     default:
-                        dx12_log(DX12_LOG_WARN, "Unary op %s not dispatched", ggml_unary_op_name(ggml_get_unary_op(node)));
-                        ok = true;
+                        dx12_log(DX12_LOG_ERROR, "Unary op %s not implemented on DX12",
+                                 ggml_unary_op_name(ggml_get_unary_op(node)));
+                        ok = false;
                         break;
                 }
                 break;
-            case GGML_OP_SOFT_MAX:      ok = dx12_dispatch_soft_max(dev, cmd, node); break;
+            case GGML_OP_GLU:           ok = dx12_dispatch_glu(dev, cmd, node); break;
             case GGML_OP_RMS_NORM:      ok = dx12_dispatch_rms_norm(dev, cmd, node); break;
-            case GGML_OP_NORM:    ok = dx12_dispatch_layer_norm(dev, cmd, node); break;
+            case GGML_OP_SOFT_MAX:      ok = dx12_dispatch_soft_max(dev, cmd, node); break;
             case GGML_OP_ROPE:          ok = dx12_dispatch_rope(dev, cmd, node); break;
-            case GGML_OP_DIAG_MASK_INF: ok = dx12_dispatch_diag_mask_inf(dev, cmd, node); break;
             case GGML_OP_GET_ROWS:      ok = dx12_dispatch_get_rows(dev, cmd, node); break;
-            case GGML_OP_PERMUTE:       ok = dx12_dispatch_permute(dev, cmd, node); break;
-            // SSM ops — used by Mamba-family models (not yet implemented on DX12)
-            // Unreachable in the normal ggml_backend_sched path — the scheduler
-            // filters these via dx12_op_supported() before this switch ever sees them.
-            // Kept as a hard-fail guard for standalone/direct graph_compute calls.
-            case GGML_OP_SSM_CONV:
-            case GGML_OP_SSM_SCAN:
-                dx12_log(DX12_LOG_ERROR, "SSM op %s not implemented on DX12", ggml_op_name(node->op));
-                ok = false;
-                break;
-            case GGML_OP_CPY:           ok = dx12_dispatch_cpy(dev, cmd, node); break;
+            case GGML_OP_CPY:
+            case GGML_OP_DUP:
+            case GGML_OP_CONT:          ok = dx12_dispatch_cpy(dev, cmd, node); break;
             case GGML_OP_SET_ROWS:      ok = dx12_dispatch_set_rows(dev, cmd, node); break;
             case GGML_OP_VIEW:
             case GGML_OP_RESHAPE:
+            case GGML_OP_PERMUTE:
             case GGML_OP_TRANSPOSE:
-            case GGML_OP_NONE:          ok = dx12_dispatch_none(dev, cmd, node); break;
-            case GGML_OP_COUNT:         ok = dx12_dispatch_count(dev, cmd, node); break;
+            case GGML_OP_NONE:
+                ok = dx12_dispatch_none(dev, cmd, node);
+                dispatched = false;
+                break;
             default:
-                dx12_log(DX12_LOG_WARN, "Op %s not dispatched", ggml_op_name(node->op));
-                ok = true; // Skip unsupported ops gracefully
+                // Unreachable via ggml_backend_sched (filtered by dx12_op_supported);
+                // hard-fail guard for direct graph_compute calls.
+                dx12_log(DX12_LOG_ERROR, "Op %s not implemented on DX12", ggml_op_name(node->op));
+                ok = false;
                 break;
         }
 
         if (!ok) {
             dx12_log(DX12_LOG_ERROR, "Dispatch failed for op %s at node %d",
                 ggml_op_name(node->op), i);
-            dx12_cmd_list_destroy(cmd);
-            return;
+            return false;
         }
 
-        // Global UAV barrier between dependent ops
-        // This ensures ordering but may be overly conservative
-        // TODO: Fine-grained barriers based on tensor dependency analysis
-        dx12_cmd_list_global_uav_barrier(cmd);
+        // Order dependent dispatches: flush UAV writes before the next node reads them
+        if (dispatched) {
+            dx12_cmd_list_global_uav_barrier(cmd);
+        }
     }
-
-    // Submit all work
-    dx12_cmd_list_submit_and_wait(cmd);
-    dx12_cmd_list_destroy(cmd);
+    return true;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -207,159 +343,322 @@ static uint32_t tensor_nelements(const ggml_tensor* t) {
     return (uint32_t)(t->ne[0] * t->ne[1] * t->ne[2] * t->ne[3]);
 }
 
-// ADD: elementwise addition
-bool dx12_dispatch_add(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
-    ggml_tensor* a = dst->src[0];
-    ggml_tensor* b = dst->src[1];
-    uint32_t n = tensor_nelements(dst);
+// Run one mm-signature dispatch: up to 3 source tensors + dst, all bound as
+// root UAVs with explicit per-tensor GPU VAs (tensors may share one buffer).
+static bool dx12_run_mm(dx12_device* dev, dx12_command_list* cmd,
+                        const char* shader, const void* cbv, size_t cbv_size,
+                        const ggml_tensor* s0, const ggml_tensor* s1, const ggml_tensor* s2,
+                        ggml_tensor* dst, uint32_t dx, uint32_t dy, uint32_t dz) {
+    // Empty tensors (e.g. zero-row views) produce zero-group dispatches,
+    // which this driver does not tolerate — legal no-op instead.
+    if (dx == 0 || dy == 0 || dz == 0) return true;
 
-    struct { uint32_t n; float alpha; float beta; uint32_t pad; } params = { n, 1.0f, 1.0f, 0 };
+    const ggml_tensor* srcs[3] = { s0, s1, s2 };
+    dx12_buffer* bufs[4] = {};
+    dx12_buffer* srv_bufs[3] = {};
+    uint32_t nsrc = 0;
 
-    dx12_buffer* buf_a = dx12_backend_buffer_from_tensor(a);
-    dx12_buffer* buf_b = dx12_backend_buffer_from_tensor(b);
+    struct dx12_shader_dispatch dispatch{};
+    for (uint32_t i = 0; i < 3 && srcs[i]; i++) {
+        srv_bufs[i] = dx12_backend_buffer_from_tensor(srcs[i]);
+        dispatch.srv_addr[i] = dx12_backend_tensor_gpu_addr(srcs[i]);
+        if (!srv_bufs[i] || !dispatch.srv_addr[i]) {
+            dx12_log(DX12_LOG_ERROR, "%s: source %u not bound", shader, i);
+            return false;
+        }
+        bufs[nsrc++] = srv_bufs[i];
+    }
     dx12_buffer* buf_d = dx12_backend_buffer_from_tensor(dst);
-    apply_tensor_offset(buf_a, a);
-    apply_tensor_offset(buf_b, b);
-    apply_tensor_offset(buf_d, dst);
+    dispatch.uav_addr = dx12_backend_tensor_gpu_addr(dst);
+    if (!buf_d || !dispatch.uav_addr) {
+        dx12_log(DX12_LOG_ERROR, "%s: dst not bound", shader);
+        return false;
+    }
+    bufs[nsrc] = buf_d;
 
-    return dx12_shader_dispatch_simple(dev, cmd, "add",
-        &params, sizeof(params), buf_a, buf_b, buf_d, n);
+    // Transition each unique buffer to UNORDERED_ACCESS
+    for (uint32_t i = 0; i <= nsrc; i++) {
+        bool seen = false;
+        for (uint32_t j = 0; j < i; j++) {
+            if (bufs[j] == bufs[i]) { seen = true; break; }
+        }
+        if (!seen) dx12_buffer_transition(cmd, bufs[i], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+
+    dispatch.shader_name = shader;
+    dispatch.sig_type = dx12_root_signature_type::mm;
+    dispatch.dispatch_x = dx;
+    dispatch.dispatch_y = dy;
+    dispatch.dispatch_z = dz;
+
+    return dx12_shader_dispatch(dev, cmd, dispatch, cbv, cbv_size, srv_bufs, nsrc, buf_d);
 }
 
-// MUL: elementwise multiplication
+// Shared CBV layout for ew_bin (ADD/MUL)
+struct dx12_ew_bin_params {
+    uint32_t ne0, ne1, ne2, ne3;
+    uint32_t ne10, ne11, ne12, ne13;
+    uint32_t nb00, nb01, nb02, nb03;
+    uint32_t nb10, nb11, nb12, nb13;
+    uint32_t dnb0, dnb1, dnb2, dnb3;
+    uint32_t op;
+    uint32_t pad[3];
+};
+
+static bool dx12_dispatch_ew_bin(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst, uint32_t op) {
+    const ggml_tensor* a = dst->src[0];
+    const ggml_tensor* b = dst->src[1];
+
+    dx12_ew_bin_params p{};
+    p.ne0 = (uint32_t)dst->ne[0]; p.ne1 = (uint32_t)dst->ne[1];
+    p.ne2 = (uint32_t)dst->ne[2]; p.ne3 = (uint32_t)dst->ne[3];
+    p.ne10 = (uint32_t)b->ne[0]; p.ne11 = (uint32_t)b->ne[1];
+    p.ne12 = (uint32_t)b->ne[2]; p.ne13 = (uint32_t)b->ne[3];
+    p.nb00 = (uint32_t)a->nb[0]; p.nb01 = (uint32_t)a->nb[1];
+    p.nb02 = (uint32_t)a->nb[2]; p.nb03 = (uint32_t)a->nb[3];
+    p.nb10 = (uint32_t)b->nb[0]; p.nb11 = (uint32_t)b->nb[1];
+    p.nb12 = (uint32_t)b->nb[2]; p.nb13 = (uint32_t)b->nb[3];
+    p.dnb0 = (uint32_t)dst->nb[0]; p.dnb1 = (uint32_t)dst->nb[1];
+    p.dnb2 = (uint32_t)dst->nb[2]; p.dnb3 = (uint32_t)dst->nb[3];
+    p.op = op;
+
+    return dx12_run_mm(dev, cmd, "ew_bin", &p, sizeof(p),
+                       a, b, nullptr, dst,
+                       (p.ne0 + 255) / 256, p.ne1, p.ne2 * p.ne3);
+}
+
+// ADD: elementwise addition (F32, broadcast src1)
+bool dx12_dispatch_add(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
+    return dx12_dispatch_ew_bin(dev, cmd, dst, 0);
+}
+
+// MUL: elementwise multiplication (F32, broadcast src1)
 bool dx12_dispatch_mul(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
-    ggml_tensor* a = dst->src[0];
-    ggml_tensor* b = dst->src[1];
-    uint32_t n = tensor_nelements(dst);
+    return dx12_dispatch_ew_bin(dev, cmd, dst, 1);
+}
 
-    struct { uint32_t n; uint32_t pad[3]; } params = { n, 0, 0, 0 };
+// Is this mul_mat eligible for the fast contiguous 2D path?
+static bool dx12_mul_mat_is_fast2d(const ggml_tensor* dst) {
+    const ggml_tensor* a = dst->src[0];
+    const ggml_tensor* b = dst->src[1];
+    if (a->ne[2] != 1 || a->ne[3] != 1 || b->ne[2] != 1 || b->ne[3] != 1) return false;
+    if (!ggml_is_contiguous(a) || !ggml_is_contiguous(b) || !ggml_is_contiguous(dst)) return false;
+    return a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16 ||
+           a->type == GGML_TYPE_Q8_0 || a->type == GGML_TYPE_Q4_0;
+}
 
-    dx12_buffer* buf_a = dx12_backend_buffer_from_tensor(a);
-    dx12_buffer* buf_b = dx12_backend_buffer_from_tensor(b);
-    dx12_buffer* buf_d = dx12_backend_buffer_from_tensor(dst);
-    apply_tensor_offset(buf_a, a);
-    apply_tensor_offset(buf_b, b);
-    apply_tensor_offset(buf_d, dst);
+// Strided/batched mul_mat (attention QK/V over KV cache views, permuted srcs)
+static bool dx12_dispatch_mul_mat_strided(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
+    const ggml_tensor* a = dst->src[0];
+    const ggml_tensor* b = dst->src[1];
 
-    return dx12_shader_dispatch_simple(dev, cmd, "mul",
-        &params, sizeof(params), buf_a, buf_b, buf_d, n);
+    struct {
+        uint32_t M, N, K, ne2;
+        uint32_t r2, r3, pad0, pad1;
+        uint32_t anb0, anb1, anb2, anb3;
+        uint32_t bnb0, bnb1, bnb2, bnb3;
+        uint32_t dnb0, dnb1, dnb2, dnb3;
+    } p{};
+    p.M = (uint32_t)b->ne[1];
+    p.N = (uint32_t)a->ne[1];
+    p.K = (uint32_t)a->ne[0];
+    p.ne2 = (uint32_t)dst->ne[2];
+    p.r2 = (uint32_t)(b->ne[2] / a->ne[2]);
+    p.r3 = (uint32_t)(b->ne[3] / a->ne[3]);
+    p.anb0 = (uint32_t)a->nb[0]; p.anb1 = (uint32_t)a->nb[1];
+    p.anb2 = (uint32_t)a->nb[2]; p.anb3 = (uint32_t)a->nb[3];
+    p.bnb0 = (uint32_t)b->nb[0]; p.bnb1 = (uint32_t)b->nb[1];
+    p.bnb2 = (uint32_t)b->nb[2]; p.bnb3 = (uint32_t)b->nb[3];
+    p.dnb0 = (uint32_t)dst->nb[0]; p.dnb1 = (uint32_t)dst->nb[1];
+    p.dnb2 = (uint32_t)dst->nb[2]; p.dnb3 = (uint32_t)dst->nb[3];
+
+    const char* shader = (a->type == GGML_TYPE_F16) ? "mms_f16" : "mms_f32";
+    return dx12_run_mm(dev, cmd, shader, &p, sizeof(p),
+                       a, b, nullptr, dst,
+                       (p.N + 15) / 16, (p.M + 15) / 16,
+                       (uint32_t)(dst->ne[2] * dst->ne[3]));
 }
 
 // MUL_MAT: matrix multiplication (the critical path)
+// C[t*N + o] = dot(A[o,:], B[t,:]) with A = src0 weights (N x K),
+// B = src1 activations (M x K, F32), C = dst (M x N, F32).
+// Shapes/types are guaranteed by dx12_op_supported.
 bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
     ggml_tensor* a = dst->src[0];
     ggml_tensor* b = dst->src[1];
 
-    uint32_t M = (uint32_t)dst->ne[1];
-    uint32_t N = (uint32_t)dst->ne[0];
+    if (!dx12_mul_mat_is_fast2d(dst)) {
+        return dx12_dispatch_mul_mat_strided(dev, cmd, dst);
+    }
+
     uint32_t K = (uint32_t)a->ne[0];
+    uint32_t N = (uint32_t)a->ne[1];
+    uint32_t M = (uint32_t)b->ne[1];
+
+    // Decode path (single token): GEMV kernel, one 64-lane reduction per row.
+    // Much better weight-read coalescing than the tiled kernel at M == 1.
+    bool gemv = (M == 1) && ((N + 3) / 4 <= DX12_MAX_GROUPS);
+
+    const char* shader_name = nullptr;
+    switch (a->type) {
+        case GGML_TYPE_F32:  shader_name = gemv ? "mv_f32"  : "mm_f32";  break;
+        case GGML_TYPE_F16:  shader_name = gemv ? "mv_f16"  : "mm_f16";  break;
+        case GGML_TYPE_Q8_0: shader_name = gemv ? "mv_q8_0" : "mm_q8_0"; break;
+        case GGML_TYPE_Q4_0: shader_name = gemv ? "mv_q4_0" : "mm_q4_0"; break;
+        default:
+            dx12_log(DX12_LOG_ERROR, "MUL_MAT: unsupported weight type %s", ggml_type_name(a->type));
+            return false;
+    }
 
     dx12_buffer* buf_a = dx12_backend_buffer_from_tensor(a);
     dx12_buffer* buf_b = dx12_backend_buffer_from_tensor(b);
     dx12_buffer* buf_c = dx12_backend_buffer_from_tensor(dst);
 
     if (!buf_a || !buf_b || !buf_c) {
-        dx12_log(DX12_LOG_VERBOSE, "MUL_MAT: buffers not bound, skipping (shape %ux%ux%u)", M, N, K);
-        return true;
+        dx12_log(DX12_LOG_ERROR, "MUL_MAT: buffers not bound (shape M=%u N=%u K=%u)", M, N, K);
+        return false;
     }
 
-    apply_tensor_offset(buf_a, a);
-    apply_tensor_offset(buf_b, b);
-    apply_tensor_offset(buf_c, dst);
+    // All three buffers are bound as root UAVs (mm root signature), so a
+    // single UNORDERED_ACCESS state covers sources that alias the result's
+    // resource. Ordering between nodes comes from the global UAV barrier.
+    dx12_buffer_transition(cmd, buf_c, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (buf_a != buf_c) dx12_buffer_transition(cmd, buf_a, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (buf_b != buf_c && buf_b != buf_a) dx12_buffer_transition(cmd, buf_b, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
-    dx12_gemm_params params{};
-    params.M = M;
-    params.N = N;
-    params.K = K;
-    params.transposed_b = true;
-    params.quant_a = dx12_quant_type_from_ggml(a->type);
-    params.quant_b = dx12_quant_type_from_ggml(b->type);
-    params.alpha = 1.0f;
+    struct { uint32_t M, N, K, pad; } params = { M, N, K, 0 };
 
-    return dx12_gemm_dispatch(dev, cmd, buf_a, buf_b, buf_c, &params);
+    struct dx12_shader_dispatch dispatch{};
+    dispatch.shader_name = shader_name;
+    dispatch.sig_type = dx12_root_signature_type::mm;
+    if (gemv) {
+        dispatch.dispatch_x = (N + 3) / 4; // 4 rows per 256-thread group
+        dispatch.dispatch_y = 1;
+    } else {
+        dispatch.dispatch_x = (N + 15) / 16;
+        dispatch.dispatch_y = (M + 15) / 16;
+    }
+    dispatch.dispatch_z = 1;
+    // Explicit per-tensor VAs: a/b/dst may share one dx12_buffer, so the
+    // shared gpu_address field cannot represent all three at once.
+    dispatch.srv_addr[0] = dx12_backend_tensor_gpu_addr(a);
+    dispatch.srv_addr[1] = dx12_backend_tensor_gpu_addr(b);
+    dispatch.uav_addr    = dx12_backend_tensor_gpu_addr(dst);
+
+    if (!dispatch.srv_addr[0] || !dispatch.srv_addr[1] || !dispatch.uav_addr) {
+        dx12_log(DX12_LOG_ERROR, "MUL_MAT: missing tensor GPU address");
+        return false;
+    }
+
+    dx12_buffer* srvs[2] = { buf_a, buf_b };
+
+    return dx12_shader_dispatch(dev, cmd, dispatch, &params, sizeof(params), srvs, 2, buf_c);
 }
 
-// SCALE: multiply by scalar
+// SCALE: dst = src * scale + bias (contiguous F32)
 bool dx12_dispatch_scale(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
-    ggml_tensor* a = dst->src[0];
-    float scale = 1.0f;
     uint32_t n = tensor_nelements(dst);
+    float scale, bias;
+    memcpy(&scale, (const char*)dst->op_params + 0, sizeof(float));
+    memcpy(&bias,  (const char*)dst->op_params + 4, sizeof(float));
 
-    struct { uint32_t n; float scale; uint32_t pad[2]; } params = { n, scale, 0, 0 };
-
-    dx12_buffer* buf_a = dx12_backend_buffer_from_tensor(a);
-    dx12_buffer* buf_d = dx12_backend_buffer_from_tensor(dst);
-    apply_tensor_offset(buf_a, a);
-    apply_tensor_offset(buf_d, dst);
-
-    return dx12_shader_dispatch_simple(dev, cmd, "scale",
-        &params, sizeof(params), buf_a, nullptr, buf_d, n);
+    struct { uint32_t n; float scale; float bias; uint32_t pad; } p = { n, scale, bias, 0 };
+    return dx12_run_mm(dev, cmd, "ew_scale", &p, sizeof(p),
+                       dst->src[0], nullptr, nullptr, dst, (n + 255) / 256, 1, 1);
 }
 
-// SILU activation
+static bool dx12_dispatch_unary_impl(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst, uint32_t op) {
+    uint32_t n = tensor_nelements(dst);
+    struct { uint32_t n; uint32_t op; uint32_t pad[2]; } p = { n, op, {0, 0} };
+    return dx12_run_mm(dev, cmd, "ew_unary", &p, sizeof(p),
+                       dst->src[0], nullptr, nullptr, dst, (n + 255) / 256, 1, 1);
+}
+
+// SILU activation (contiguous F32)
 bool dx12_dispatch_silu(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
-    uint32_t n = tensor_nelements(dst);
-    struct { uint32_t n; uint32_t pad[3]; } params = { n, 0, 0, 0 };
-
-    dx12_buffer* buf_s = dx12_backend_buffer_from_tensor(dst->src[0]);
-    dx12_buffer* buf_d = dx12_backend_buffer_from_tensor(dst);
-    apply_tensor_offset(buf_s, dst->src[0]);
-    apply_tensor_offset(buf_d, dst);
-
-    return dx12_shader_dispatch_simple(dev, cmd, "silu",
-        &params, sizeof(params), buf_s, nullptr, buf_d, n);
+    return dx12_dispatch_unary_impl(dev, cmd, dst, 0);
 }
 
-// GELU activation
+// GLU (SWIGLU / GEGLU): dst = act(gate) * up, F32 contiguous rows
+static bool dx12_dispatch_glu(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
+    const ggml_tensor* a = dst->src[0];
+    const ggml_tensor* b = dst->src[1];
+    const enum ggml_glu_op gop = ggml_get_glu_op(dst);
+
+    struct {
+        uint32_t nc;
+        uint32_t snb1, s1nb1, dnb1;
+        uint32_t has_src1, swapped, op, pad;
+    } p{};
+    p.nc = (uint32_t)dst->ne[0];
+    p.snb1 = (uint32_t)a->nb[1];
+    p.s1nb1 = b ? (uint32_t)b->nb[1] : (uint32_t)a->nb[1];
+    p.dnb1 = (uint32_t)dst->nb[1];
+    p.has_src1 = b ? 1 : 0;
+    p.swapped = (uint32_t)((const int32_t*)dst->op_params)[1];
+    p.op = (gop == GGML_GLU_OP_SWIGLU) ? 0 : 1;
+
+    uint32_t nrows = (uint32_t)(dst->ne[1] * dst->ne[2] * dst->ne[3]);
+    return dx12_run_mm(dev, cmd, "ew_glu", &p, sizeof(p),
+                       a, b ? b : a, nullptr, dst,
+                       (p.nc + 255) / 256, nrows, 1);
+}
+
+// GELU activation (contiguous F32)
 bool dx12_dispatch_gelu(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
-    uint32_t n = tensor_nelements(dst);
-    struct { uint32_t n; uint32_t pad[3]; } params = { n, 0, 0, 0 };
-
-    dx12_buffer* buf_s = dx12_backend_buffer_from_tensor(dst->src[0]);
-    dx12_buffer* buf_d = dx12_backend_buffer_from_tensor(dst);
-    apply_tensor_offset(buf_s, dst->src[0]);
-    apply_tensor_offset(buf_d, dst);
-
-    return dx12_shader_dispatch_simple(dev, cmd, "gelu",
-        &params, sizeof(params), buf_s, nullptr, buf_d, n);
+    return dx12_dispatch_unary_impl(dev, cmd, dst, 1);
 }
 
-// SOFT_MAX
+// SOFT_MAX: F32 rows, optional F16/F32 mask, max_bias == 0
 bool dx12_dispatch_soft_max(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
-    uint32_t n = tensor_nelements(dst);
-    uint32_t row_size = (uint32_t)dst->ne[0];
-    struct { uint32_t n; uint32_t row_size; float scale; uint32_t pad; } params =
-        { n, row_size, 1.0f, 0 };
+    const ggml_tensor* a = dst->src[0];
+    const ggml_tensor* mask = dst->src[1];
 
-    dx12_buffer* buf_s = dx12_backend_buffer_from_tensor(dst->src[0]);
-    dx12_buffer* buf_d = dx12_backend_buffer_from_tensor(dst);
-    apply_tensor_offset(buf_s, dst->src[0]);
-    apply_tensor_offset(buf_d, dst);
+    float scale;
+    memcpy(&scale, (const char*)dst->op_params, sizeof(float));
 
-    return dx12_shader_dispatch_simple(dev, cmd, "soft_max",
-        &params, sizeof(params), buf_s, nullptr, buf_d, n);
+    struct {
+        uint32_t ne0; float scale;
+        uint32_t nb01, nb02, nb03, dnb1, dnb2, dnb3;
+        uint32_t has_mask, mask_f16;
+        uint32_t mnb1, mnb2, mnb3, mne2, mne3, pad;
+    } p{};
+    p.ne0 = (uint32_t)a->ne[0];
+    p.scale = scale;
+    p.nb01 = (uint32_t)a->nb[1]; p.nb02 = (uint32_t)a->nb[2]; p.nb03 = (uint32_t)a->nb[3];
+    p.dnb1 = (uint32_t)dst->nb[1]; p.dnb2 = (uint32_t)dst->nb[2]; p.dnb3 = (uint32_t)dst->nb[3];
+    p.has_mask = mask ? 1 : 0;
+    p.mask_f16 = (mask && mask->type == GGML_TYPE_F16) ? 1 : 0;
+    p.mnb1 = mask ? (uint32_t)mask->nb[1] : 0;
+    p.mnb2 = mask ? (uint32_t)mask->nb[2] : 0;
+    p.mnb3 = mask ? (uint32_t)mask->nb[3] : 0;
+    p.mne2 = mask ? (uint32_t)mask->ne[2] : 1;
+    p.mne3 = mask ? (uint32_t)mask->ne[3] : 1;
+
+    // Bind src0 in the mask slot when there is no mask (never read)
+    return dx12_run_mm(dev, cmd, "soft_max_row", &p, sizeof(p),
+                       a, mask ? mask : a, nullptr, dst,
+                       (uint32_t)a->ne[1], (uint32_t)a->ne[2], (uint32_t)a->ne[3]);
 }
 
-// RMS_NORM
+// RMS_NORM: F32, eps from op_params, one group per row
 bool dx12_dispatch_rms_norm(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
-    dx12_log(DX12_LOG_INFO, "rms_norm: entering, dst=%p src0=%p", (void*)dst, (void*)(dst ? dst->src[0] : nullptr));
-    fflush(stderr);
+    const ggml_tensor* a = dst->src[0];
+    float eps;
+    memcpy(&eps, (const char*)dst->op_params, sizeof(float));
 
-    uint32_t n = tensor_nelements(dst);
-    uint32_t row_size = (uint32_t)dst->ne[0];
-    float eps = 1e-6f;
-    struct { uint32_t n; uint32_t row_size; float eps; uint32_t pad; } params =
-        { n, row_size, eps, 0 };
+    struct {
+        uint32_t ne0; float eps;
+        uint32_t nb01, nb02, nb03, dnb1, dnb2, dnb3;
+    } p{};
+    p.ne0 = (uint32_t)a->ne[0];
+    p.eps = eps;
+    p.nb01 = (uint32_t)a->nb[1]; p.nb02 = (uint32_t)a->nb[2]; p.nb03 = (uint32_t)a->nb[3];
+    p.dnb1 = (uint32_t)dst->nb[1]; p.dnb2 = (uint32_t)dst->nb[2]; p.dnb3 = (uint32_t)dst->nb[3];
 
-    dx12_buffer* buf_s = dx12_backend_buffer_from_tensor(dst->src[0]);
-    dx12_buffer* buf_d = dx12_backend_buffer_from_tensor(dst);
-    dx12_log(DX12_LOG_INFO, "rms_norm: buf_s=%p buf_d=%p n=%u", (void*)buf_s, (void*)buf_d, n);
-    fflush(stderr);
-    apply_tensor_offset(buf_s, dst->src[0]);
-    apply_tensor_offset(buf_d, dst);
-
-    return dx12_shader_dispatch_simple(dev, cmd, "rms_norm",
-        &params, sizeof(params), buf_s, nullptr, buf_d, n);
+    return dx12_run_mm(dev, cmd, "rms_norm_row", &p, sizeof(p),
+                       a, nullptr, nullptr, dst,
+                       (uint32_t)a->ne[1], (uint32_t)a->ne[2], (uint32_t)a->ne[3]);
 }
 
 // LAYER_NORM
@@ -379,31 +678,54 @@ bool dx12_dispatch_layer_norm(dx12_device* dev, dx12_command_list* cmd, ggml_ten
         &params, sizeof(params), buf_s, nullptr, buf_d, n);
 }
 
-// ROPE (Rotary Position Embedding)
+// ROPE: F32, modes NORMAL/NEOX, YaRN + optional freq factors (src2)
 bool dx12_dispatch_rope(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
-    uint32_t n = tensor_nelements(dst);
-    uint32_t head_dim = (uint32_t)dst->ne[0];
-    uint32_t seq_len = (uint32_t)dst->ne[1];
-    uint32_t num_heads = (uint32_t)dst->ne[2];
-    float theta = 10000.0f;
+    const ggml_tensor* a   = dst->src[0];
+    const ggml_tensor* pos = dst->src[1];
+    const ggml_tensor* ff  = dst->src[2];
 
-    struct rope_params {
-        uint32_t n;
-        uint32_t head_dim;
-        uint32_t seq_len;
-        uint32_t num_heads;
-        float    theta;
-        float    scale;
-        uint32_t pad[2];
-    } params = { n, head_dim, seq_len, num_heads, theta, 1.0f, 0, 0 };
+    const int32_t n_dims     = ((const int32_t*)dst->op_params)[1];
+    const int32_t mode       = ((const int32_t*)dst->op_params)[2];
+    const int32_t n_ctx_orig = ((const int32_t*)dst->op_params)[4];
+    float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+    memcpy(&freq_base,   (const int32_t*)dst->op_params +  5, sizeof(float));
+    memcpy(&freq_scale,  (const int32_t*)dst->op_params +  6, sizeof(float));
+    memcpy(&ext_factor,  (const int32_t*)dst->op_params +  7, sizeof(float));
+    memcpy(&attn_factor, (const int32_t*)dst->op_params +  8, sizeof(float));
+    memcpy(&beta_fast,   (const int32_t*)dst->op_params +  9, sizeof(float));
+    memcpy(&beta_slow,   (const int32_t*)dst->op_params + 10, sizeof(float));
 
-    dx12_buffer* buf_s = dx12_backend_buffer_from_tensor(dst->src[0]);
-    dx12_buffer* buf_d = dx12_backend_buffer_from_tensor(dst);
-    apply_tensor_offset(buf_s, dst->src[0]);
-    apply_tensor_offset(buf_d, dst);
+    float corr_dims[2];
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims);
 
-    return dx12_shader_dispatch_simple(dev, cmd, "rope",
-        &params, sizeof(params), buf_s, nullptr, buf_d, n);
+    struct {
+        uint32_t ne0, ne1, ne2, ne3;
+        uint32_t n_dims, mode, has_ff, pad0;
+        float freq_scale, ext_factor, attn_factor, theta_scale;
+        float corr0, corr1, pad1, pad2;
+        uint32_t nb00, nb01, nb02, nb03;
+        uint32_t dnb0, dnb1, dnb2, dnb3;
+    } p{};
+    p.ne0 = (uint32_t)a->ne[0]; p.ne1 = (uint32_t)a->ne[1];
+    p.ne2 = (uint32_t)a->ne[2]; p.ne3 = (uint32_t)a->ne[3];
+    p.n_dims = (uint32_t)n_dims;
+    p.mode = (uint32_t)mode;
+    p.has_ff = ff ? 1 : 0;
+    p.freq_scale = freq_scale;
+    p.ext_factor = ext_factor;
+    p.attn_factor = attn_factor;
+    p.theta_scale = powf(freq_base, -2.0f / n_dims);
+    p.corr0 = corr_dims[0];
+    p.corr1 = corr_dims[1];
+    p.nb00 = (uint32_t)a->nb[0]; p.nb01 = (uint32_t)a->nb[1];
+    p.nb02 = (uint32_t)a->nb[2]; p.nb03 = (uint32_t)a->nb[3];
+    p.dnb0 = (uint32_t)dst->nb[0]; p.dnb1 = (uint32_t)dst->nb[1];
+    p.dnb2 = (uint32_t)dst->nb[2]; p.dnb3 = (uint32_t)dst->nb[3];
+
+    // Bind src0 in the freq-factor slot when absent (never read)
+    return dx12_run_mm(dev, cmd, "rope_f32", &p, sizeof(p),
+                       a, pos, ff ? ff : a, dst,
+                       (p.ne0 / 2 + 63) / 64, p.ne1, p.ne2 * p.ne3);
 }
 
 // DIAG_MASK_INF: causal mask
@@ -421,23 +743,35 @@ bool dx12_dispatch_diag_mask_inf(dx12_device* dev, dx12_command_list* cmd, ggml_
         &params, sizeof(params), buf_s, nullptr, buf_d, n);
 }
 
-// GET_ROWS: embedding lookup
+// GET_ROWS: 2D src0 {F32,F16,Q8_0,Q4_0}, I32 ids -> F32
 bool dx12_dispatch_get_rows(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
-    uint32_t n = tensor_nelements(dst);
-    uint32_t emb_dim = (uint32_t)dst->ne[0];
-    uint32_t num_rows = (uint32_t)dst->ne[1];
-    struct { uint32_t n; uint32_t emb_dim; uint32_t num_rows; uint32_t pad; } params =
-        { n, emb_dim, num_rows, 0 };
+    const ggml_tensor* a = dst->src[0];
+    const ggml_tensor* ids = dst->src[1];
 
-    dx12_buffer* buf_s0 = dx12_backend_buffer_from_tensor(dst->src[0]);
-    dx12_buffer* buf_s1 = dx12_backend_buffer_from_tensor(dst->src[1]);
-    dx12_buffer* buf_d = dx12_backend_buffer_from_tensor(dst);
-    apply_tensor_offset(buf_s0, dst->src[0]);
-    apply_tensor_offset(buf_s1, dst->src[1]);
-    apply_tensor_offset(buf_d, dst);
+    uint32_t src_type;
+    switch (a->type) {
+        case GGML_TYPE_F32:  src_type = 0; break;
+        case GGML_TYPE_F16:  src_type = 1; break;
+        case GGML_TYPE_Q8_0: src_type = 2; break;
+        case GGML_TYPE_Q4_0: src_type = 3; break;
+        default:
+            dx12_log(DX12_LOG_ERROR, "GET_ROWS: unsupported src type %s", ggml_type_name(a->type));
+            return false;
+    }
 
-    return dx12_shader_dispatch_simple(dev, cmd, "get_rows",
-        &params, sizeof(params), buf_s0, buf_s1, buf_d, n);
+    struct {
+        uint32_t ne00, nb01, nb10, dnb1;
+        uint32_t src_type, pad[3];
+    } p{};
+    p.ne00 = (uint32_t)a->ne[0];
+    p.nb01 = (uint32_t)a->nb[1];
+    p.nb10 = (uint32_t)ids->nb[0];
+    p.dnb1 = (uint32_t)dst->nb[1];
+    p.src_type = src_type;
+
+    return dx12_run_mm(dev, cmd, "get_rows_x", &p, sizeof(p),
+                       a, ids, nullptr, dst,
+                       (p.ne00 + 255) / 256, (uint32_t)ids->ne[0], 1);
 }
 
 // PERMUTE: tensor dimension reordering
@@ -459,62 +793,78 @@ bool dx12_dispatch_permute(dx12_device* dev, dx12_command_list* cmd, ggml_tensor
         &params, sizeof(params), buf_s, nullptr, buf_d, n);
 }
 
-// CPY: tensor copy / cast
+// CPY / DUP / CONT: F32/F16 <-> F32/F16, arbitrary strides
 bool dx12_dispatch_cpy(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
-    uint32_t n = tensor_nelements(dst);
-    struct { uint32_t n; uint32_t src_type; uint32_t dst_type; uint32_t pad; } params =
-        { n, (uint32_t)(dst->src[0] ? dst->src[0]->type : 0), (uint32_t)dst->type, 0 };
+    const ggml_tensor* a = dst->src[0];
 
-    dx12_buffer* buf_s = dx12_backend_buffer_from_tensor(dst->src[0]);
-    dx12_buffer* buf_d = dx12_backend_buffer_from_tensor(dst);
-    apply_tensor_offset(buf_s, dst->src[0]);
-    apply_tensor_offset(buf_d, dst);
+    struct {
+        uint32_t sne0, sne1, sne2, sne3;
+        uint32_t snb0, snb1, snb2, snb3;
+        uint32_t dne0, dne1, dne2, dne3;
+        uint32_t dnb0, dnb1, dnb2, dnb3;
+        uint32_t total, src_f16, dst_f16, pad;
+    } p{};
+    p.sne0 = (uint32_t)a->ne[0]; p.sne1 = (uint32_t)a->ne[1];
+    p.sne2 = (uint32_t)a->ne[2]; p.sne3 = (uint32_t)a->ne[3];
+    p.snb0 = (uint32_t)a->nb[0]; p.snb1 = (uint32_t)a->nb[1];
+    p.snb2 = (uint32_t)a->nb[2]; p.snb3 = (uint32_t)a->nb[3];
+    p.dne0 = (uint32_t)dst->ne[0]; p.dne1 = (uint32_t)dst->ne[1];
+    p.dne2 = (uint32_t)dst->ne[2]; p.dne3 = (uint32_t)dst->ne[3];
+    p.dnb0 = (uint32_t)dst->nb[0]; p.dnb1 = (uint32_t)dst->nb[1];
+    p.dnb2 = (uint32_t)dst->nb[2]; p.dnb3 = (uint32_t)dst->nb[3];
+    p.total = tensor_nelements(dst);
+    p.src_f16 = (a->type == GGML_TYPE_F16) ? 1 : 0;
+    p.dst_f16 = (dst->type == GGML_TYPE_F16) ? 1 : 0;
 
-    return dx12_shader_dispatch_simple(dev, cmd, "copy",
-        &params, sizeof(params), buf_s, nullptr, buf_d, n);
+    uint32_t threads = p.dst_f16 ? (p.total + 1) / 2 : p.total;
+    return dx12_run_mm(dev, cmd, "cpy_gen", &p, sizeof(p),
+                       a, nullptr, nullptr, dst, (threads + 255) / 256, 1, 1);
 }
 
-// SET_ROWS: copy rows from src0 into dst at positions from src1 indices
+// SET_ROWS: F32 rows scattered into F32/F16 dst by I64/I32 ids
 bool dx12_dispatch_set_rows(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
-    if (!dst || !dst->src[0] || !dst->src[1]) {
-        dx12_log(DX12_LOG_ERROR, "set_rows: null tensor or sources");
-        return false;
+    const ggml_tensor* a = dst->src[0];
+    const ggml_tensor* ids = dst->src[1];
+
+    struct {
+        uint32_t ne00, ne02, ne01, flat;
+        uint32_t nb01, nb02, nb03, pad2;
+        uint32_t ne10, ne11, ne12, idx_i64;
+        uint32_t inb0, inb1, inb2, dst_mode;
+        uint32_t dnb0, dnb1, dnb2, dnb3;
+    } p{};
+    p.ne00 = (uint32_t)a->ne[0];
+    p.ne02 = (uint32_t)a->ne[2];
+    p.ne01 = (uint32_t)a->ne[1];
+    p.flat = (a->ne[0] == 1 && a->ne[2] == 1 && a->ne[3] == 1) ? 1 : 0;
+    p.nb01 = (uint32_t)a->nb[1]; p.nb02 = (uint32_t)a->nb[2]; p.nb03 = (uint32_t)a->nb[3];
+    p.ne10 = (uint32_t)ids->ne[0]; p.ne11 = (uint32_t)ids->ne[1]; p.ne12 = (uint32_t)ids->ne[2];
+    p.idx_i64 = (ids->type == GGML_TYPE_I64) ? 1 : 0;
+    p.inb0 = (uint32_t)ids->nb[0]; p.inb1 = (uint32_t)ids->nb[1]; p.inb2 = (uint32_t)ids->nb[2];
+    p.dnb0 = (uint32_t)dst->nb[0];
+    p.dnb1 = (uint32_t)dst->nb[1]; p.dnb2 = (uint32_t)dst->nb[2]; p.dnb3 = (uint32_t)dst->nb[3];
+
+    if (dst->type == GGML_TYPE_F16) {
+        // Pair store requires an element-contiguous, word-owned layout;
+        // otherwise fall back to per-lane atomic stores.
+        bool pair_ok = dst->nb[0] == 2 && (a->ne[0] % 2) == 0 &&
+                       (dst->nb[1] % 4) == 0 && (dst->nb[2] % 4) == 0 && (dst->nb[3] % 4) == 0;
+        p.dst_mode = pair_ok ? 1 : 2;
+    } else {
+        p.dst_mode = 0;
     }
-    ggml_tensor* src0 = dst->src[0];
-    ggml_tensor* src1 = dst->src[1];
 
-    uint32_t n_src = (uint32_t)src0->ne[0];
-    uint32_t n_rows = (uint32_t)src0->ne[1];
-    if (n_src == 0 || n_rows == 0) return true;
-
-    uint32_t idx_typesize = (uint32_t)ggml_type_size(src1->type);
-    if (idx_typesize == 0) idx_typesize = 4;
-
-    uint32_t elem_size = (uint32_t)ggml_type_size(dst->type);
-    if (elem_size == 0) elem_size = 4;
-    uint32_t dst_stride = n_src;
-    if (dst->ne[1] > 0 && dst->nb[1] > 0) {
-        dst_stride = (uint32_t)(dst->nb[1] / elem_size);
+    if (p.flat) {
+        return dx12_run_mm(dev, cmd, "set_rows_gen", &p, sizeof(p),
+                           a, ids, nullptr, dst, (p.ne01 + 255) / 256, 1, 1);
     }
 
-    struct { uint32_t n_src; uint32_t n_rows; uint32_t idx_typesize; uint32_t dst_stride; } params =
-        { n_src, n_rows, idx_typesize, dst_stride };
-
-    dx12_buffer* buf_src = dx12_backend_buffer_from_tensor(src0);
-    dx12_buffer* buf_idx = dx12_backend_buffer_from_tensor(src1);
-    dx12_buffer* buf_dst = dx12_backend_buffer_from_tensor(dst);
-    if (!buf_src || !buf_idx || !buf_dst) {
-        // KV cache tensors may be on a different backend buffer - skip gracefully
-        return true;
-    }
-
-    apply_tensor_offset(buf_src, src0);
-    apply_tensor_offset(buf_idx, src1);
-    apply_tensor_offset(buf_dst, dst);
-
-    uint32_t total_threads = n_src * n_rows;
-    return dx12_shader_dispatch_simple(dev, cmd, "set_rows",
-        &params, sizeof(params), buf_src, buf_idx, buf_dst, total_threads);
+    uint32_t x_threads = (p.dst_mode == 1) ? (p.ne00 + 1) / 2 : p.ne00;
+    return dx12_run_mm(dev, cmd, "set_rows_gen", &p, sizeof(p),
+                       a, ids, nullptr, dst,
+                       (x_threads + 255) / 256,
+                       (uint32_t)a->ne[1],
+                       (uint32_t)(a->ne[2] * a->ne[3]));
 }
 
 // NONE: no-op
