@@ -140,6 +140,48 @@ size_t dx12_quant_type_type_size(dx12_quant_type type) {
 // DX12 Backend Context
 // ═══════════════════════════════════════════════════════════════════════════════
 
+struct dx12_upload_batch {
+    dx12_device*    dev = nullptr;
+    dx12_buffer*    staging = nullptr;
+    dx12_command_list* cmd = nullptr;
+    size_t          capacity = 0;
+    size_t          used = 0;
+    bool            pending = false;
+
+    void ensure(size_t needed) {
+        if (capacity >= needed) return;
+        size_t new_cap = capacity ? capacity * 2 : 64 * 1024 * 1024;
+        while (new_cap < needed) new_cap *= 2;
+        // Flush pending command list before destroying staging buffer it references
+        flush();
+        if (staging) dx12_buffer_destroy(staging);
+        staging = dx12_buffer_create(dev, new_cap, dx12_heap_type::upload);
+        capacity = staging ? new_cap : 0;
+        used = 0;
+        dx12_log(DX12_LOG_INFO, "upload_batch: grown to %zu MB", capacity / (1024 * 1024));
+    }
+
+    void flush() {
+        if (!pending || !cmd) return;
+        dx12_cmd_list_close(cmd);
+        dx12_cmd_list_submit_and_wait(cmd);
+        dx12_cmd_list_destroy(cmd);
+        cmd = nullptr;
+        dx12_log(DX12_LOG_INFO, "upload_batch: flushed %zu bytes", used);
+        used = 0;
+        pending = false;
+    }
+
+    void destroy() {
+        flush();
+        if (staging) {
+            dx12_buffer_destroy(staging);
+            staging = nullptr;
+        }
+        capacity = 0;
+    }
+};
+
 struct ggml_backend_dx12_context {
     dx12_device*            device = nullptr;
     dx12_command_pool*      cmd_pool = nullptr;
@@ -182,6 +224,10 @@ static dx12_buffer* dx12_backend_get_gpu_buffer(const ggml_tensor* t);
 // Module-level device cache: one DX12 device per adapter index, reused across buffer allocs
 static std::mutex g_dx12_device_cache_mutex;
 static std::unordered_map<uint32_t, dx12_device*> g_dx12_device_cache;
+
+// Per-device upload batches for batched staging copies
+static std::mutex g_upload_batch_mutex;
+static std::unordered_map<dx12_device*, dx12_upload_batch> g_upload_batches;
 
 static dx12_device* dx12_get_or_create_device(uint32_t adapter_idx) {
     std::lock_guard<std::mutex> lk(g_dx12_device_cache_mutex);
@@ -331,15 +377,19 @@ static void* dx12_buf_get_base(ggml_backend_buffer_t buf) {
 }
 
 static enum ggml_status dx12_buf_init_tensor(ggml_backend_buffer_t buf, ggml_tensor* tensor) {
-    (void)buf;
-    dx12_log(DX12_LOG_INFO, "init_tensor: %s type=%d", tensor->name, (int)tensor->type);
+    (void)buf; (void)tensor;
     return GGML_STATUS_SUCCESS;
 }
+
+static void dx12_flush_uploads(dx12_device* dev);
 
 static void dx12_buf_memset_tensor(ggml_backend_buffer_t buf, ggml_tensor* tensor,
                                     uint8_t value, size_t offset, size_t size) {
     auto* ctx = (dx12_backend_buffer_context*)buf->context;
     if (!ctx || !ctx->gpu_buffer) return;
+
+    // Keep queue order: batched set_tensor copies must land first
+    dx12_flush_uploads(ctx->device);
 
     void* mapped = dx12_buffer_map(ctx->gpu_buffer);
     size_t tensor_off = mapped
@@ -373,22 +423,77 @@ static void dx12_buf_set_tensor(ggml_backend_buffer_t buf, ggml_tensor* tensor,
         ? (size_t)((const char*)tensor->data - (const char*)mapped)
         : (size_t)((uintptr_t)tensor->data - 0x1000);
 
-    dx12_log(DX12_LOG_INFO, "upload %s off=%zu(sz=%zu) tensor_off=%zu heap=%d buf=%zu",
-             tensor->name, offset, size, tensor_off, (int)ctx->gpu_buffer->heap, ctx->gpu_buffer->size);
-
     if (mapped) {
         bool ok = dx12_buffer_upload(ctx->gpu_buffer, data, size, tensor_off + offset);
         if (!ok) dx12_log(DX12_LOG_ERROR, "upload FAILED: %s", tensor->name);
-    } else {
-        dx12_command_list* cmd = dx12_cmd_list_create(ctx->device);
-        if (!cmd) {
+        return;
+    }
+
+    // DEFAULT heap: accumulate in batched staging upload
+    // Need the owning backend context to access upload_batch
+    // Walk up from gpu_buffer context -> find the backend ctx
+    // For simplicity, device-level intermediate staging
+    dx12_backend_buffer_context* bctx = (dx12_backend_buffer_context*)buf->context;
+    auto* gpu_buf = bctx->gpu_buffer;
+
+    // We need the backend context for the upload batch. Find it via device.
+    // The backend context is the owner of the device; we use a static map lookup.
+    // In practice, ctx->device is available and we create a per-device batch.
+    // Since we're in a buffer-level callback without backend context pointer,
+    // we use a per-device scratch batch cached on the device.
+
+    // Accumulate in per-device staging area (file-scope static map)
+    std::lock_guard<std::mutex> lk(g_upload_batch_mutex);
+    auto& batch = g_upload_batches[ctx->device];
+    if (!batch.dev) {
+        batch.dev = ctx->device;
+    }
+
+    // Ensure staging buffer has room
+    batch.ensure(batch.used + size);
+
+    if (!batch.cmd) {
+        batch.cmd = dx12_cmd_list_create(ctx->device);
+        if (!batch.cmd) {
             dx12_log(DX12_LOG_ERROR, "upload FAILED: no cmd list for %s", tensor->name);
             return;
         }
-        dx12_cmd_list_reset(cmd);
-        dx12_buffer_copy_upload_to_default(ctx->device, cmd, ctx->gpu_buffer,
-                                           tensor_off + offset, data, size);
-        dx12_cmd_list_destroy(cmd);
+        dx12_cmd_list_reset(batch.cmd);
+    }
+
+    // Copy data to staging buffer
+    dx12_buffer_upload(batch.staging, data, size, batch.used);
+
+    // Transition destination to COPY_DEST if needed
+    if (gpu_buf->state != D3D12_RESOURCE_STATE_COPY_DEST) {
+        dx12_buffer_transition(batch.cmd, gpu_buf, D3D12_RESOURCE_STATE_COPY_DEST);
+    }
+
+    // Record GPU copy
+    auto* d3d_cmd = reinterpret_cast<ID3D12GraphicsCommandList10*>(batch.cmd->d3d_list.Get());
+    d3d_cmd->CopyBufferRegion(
+        gpu_buf->resource.Get(), tensor_off + offset,
+        batch.staging->resource.Get(), batch.used,
+        size);
+
+    batch.used += size;
+    batch.pending = true;
+
+    // Deferred: copies accumulate in one command list and flush on the next
+    // graph_compute/synchronize/get_tensor. The data is already captured in
+    // the staging buffer, so the caller's pointer may be freed immediately.
+    // (The historical per-tensor flush was a workaround for the wait_idle
+    // fence double-signal bug, fixed in dx12_device.cpp.)
+}
+
+// Flush all pending upload batches (called from synchronize or graph_compute)
+static void dx12_flush_uploads(dx12_device* dev) {
+    if (!dev) return;
+
+    std::lock_guard<std::mutex> lk(g_upload_batch_mutex);
+    auto it = g_upload_batches.find(dev);
+    if (it != g_upload_batches.end()) {
+        it->second.flush();
     }
 }
 
@@ -398,15 +503,49 @@ static void dx12_buf_get_tensor(ggml_backend_buffer_t buf, const ggml_tensor* te
     if (!ctx || !ctx->gpu_buffer) return;
 
     void* mapped = dx12_buffer_map(ctx->gpu_buffer);
-    if (!mapped) return;
+    if (mapped) {
+        size_t tensor_off = (const char*)tensor->data - (const char*)mapped;
+        dx12_buffer_download(ctx->gpu_buffer, data, size, tensor_off + offset);
+        return;
+    }
 
-    size_t tensor_off = (const char*)tensor->data - (const char*)mapped;
-    dx12_buffer_download(ctx->gpu_buffer, data, size, tensor_off + offset);
+    // DEFAULT heap: copy through a readback staging buffer
+    size_t tensor_off = (size_t)((uintptr_t)tensor->data - 0x1000);
+
+    dx12_flush_uploads(ctx->device);
+
+    dx12_buffer* staging = dx12_buffer_create(ctx->device, size, dx12_heap_type::readback);
+    if (!staging) {
+        dx12_log(DX12_LOG_ERROR, "get_tensor: readback alloc failed (%zu bytes)", size);
+        return;
+    }
+
+    dx12_command_list* cmd = dx12_cmd_list_create(ctx->device);
+    if (!cmd) {
+        dx12_buffer_destroy(staging);
+        return;
+    }
+    dx12_cmd_list_reset(cmd);
+    dx12_buffer_transition(cmd, ctx->gpu_buffer, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    dx12_buffer_copy(cmd, staging, 0, ctx->gpu_buffer, tensor_off + offset, size);
+    dx12_cmd_list_submit_and_wait(cmd);
+    dx12_cmd_list_destroy(cmd);
+
+    void* src = dx12_buffer_map(staging);
+    if (src) {
+        memcpy(data, src, size);
+    } else {
+        dx12_log(DX12_LOG_ERROR, "get_tensor: readback map failed: %s", tensor->name);
+    }
+    dx12_buffer_destroy(staging);
 }
 
 static void dx12_buf_clear(ggml_backend_buffer_t buf, uint8_t value) {
     auto* ctx = (dx12_backend_buffer_context*)buf->context;
     if (!ctx || !ctx->gpu_buffer) return;
+
+    // Keep queue order: batched set_tensor copies must land first
+    dx12_flush_uploads(ctx->device);
 
     std::vector<uint8_t> zero_data(ctx->gpu_buffer->size, value);
     void* mapped = dx12_buffer_map(ctx->gpu_buffer);
@@ -486,6 +625,11 @@ static void ggml_backend_dx12_free(ggml_backend_t backend) {
 
     dx12_log(DX12_LOG_INFO, "Freeing DX12 backend");
 
+    // Flush any pending uploads before teardown
+    if (ctx->device) {
+        dx12_flush_uploads(ctx->device);
+    }
+
     delete ctx->pso_cache;
     delete ctx->activation_pool;
     delete ctx->weight_pool;
@@ -493,6 +637,16 @@ static void ggml_backend_dx12_free(ggml_backend_t backend) {
     delete ctx->cmd_pool;
 
     if (ctx->device) {
+        // Remove from device cache before destroying
+        {
+            std::lock_guard<std::mutex> lk(g_dx12_device_cache_mutex);
+            auto it = g_dx12_device_cache.find(ctx->device->adapter_index);
+            if (it != g_dx12_device_cache.end() && it->second == ctx->device) {
+                g_dx12_device_cache.erase(it);
+                dx12_log(DX12_LOG_INFO, "Removed device idx=%u from cache on teardown",
+                    ctx->device->adapter_index);
+            }
+        }
         dx12_device_destroy(ctx->device);
     }
 
@@ -506,50 +660,68 @@ static ggml_backend_buffer_type_t ggml_backend_dx12_get_default_buffer_type(
     return dx12_backend_get_or_create_buffer_type(backend->device);
 }
 
-static void ggml_backend_dx12_set_tensor_async(ggml_backend_t backend,
-                                                ggml_tensor* tensor,
-                                                const void* data, size_t offset,
-                                                size_t size) {
-    (void)backend;
-    (void)tensor;
-    (void)data;
-    (void)offset;
-    (void)size;
-    // TODO: Async upload via copy queue
-    // COMPONENT: 1 — needs command list + upload heap
-}
-
-static void ggml_backend_dx12_get_tensor_async(ggml_backend_t backend,
-                                                const ggml_tensor* tensor,
-                                                void* data, size_t offset,
-                                                size_t size) {
-    (void)backend;
-    (void)tensor;
-    (void)data;
-    (void)offset;
-    (void)size;
-    // TODO: Async download via readback heap
-}
+// set_tensor_async/get_tensor_async: intentionally NOT implemented. The vtable
+// entries must stay null so ggml falls back to the synchronous buffer iface;
+// a no-op stub here silently drops scheduler input/output copies.
 
 static void ggml_backend_dx12_synchronize(ggml_backend_t backend) {
     auto* ctx = (ggml_backend_dx12_context*)backend->context;
-    if (ctx && ctx->device) {
-        dx12_device_wait_idle(ctx->device);
-    }
+    if (!ctx || !ctx->device) return;
+
+    // Flush any pending staging uploads before sync
+    dx12_flush_uploads(ctx->device);
+
+    dx12_device_wait_idle(ctx->device);
+}
+
+static bool dx12_check_device_health(dx12_device* dev) {
+    if (!dev || !dev->device) return false;
+    HRESULT reason = dev->device->GetDeviceRemovedReason();
+    if (reason == S_OK) return true;
+    dx12_log(DX12_LOG_ERROR, "Device removed: 0x%08X", reason);
+    return false;
 }
 
 static ggml_status ggml_backend_dx12_graph_compute(ggml_backend_t backend,
-                                                    ggml_cgraph* cgraph) {
+                                                     ggml_cgraph* cgraph) {
     auto* ctx = (ggml_backend_dx12_context*)backend->context;
     if (!ctx || !ctx->device || !ctx->cmd_pool) {
         dx12_log(DX12_LOG_ERROR, "graph_compute: no device/context");
         return GGML_STATUS_FAILED;
     }
 
-    dx12_log(DX12_LOG_INFO, "graph_compute: %d nodes", cgraph ? cgraph->n_nodes : 0);
+    // Check device health before compute
+    if (!dx12_check_device_health(ctx->device)) {
+        dx12_log(DX12_LOG_ERROR, "graph_compute: device lost, falling back to CPU");
+        return GGML_STATUS_FAILED;
+    }
+
+    // Flush any pending staging uploads
+    dx12_flush_uploads(ctx->device);
+
     if (!cgraph || cgraph->n_nodes == 0) return GGML_STATUS_SUCCESS;
 
-    dx12_graph_compute(ctx->device, cgraph);
+    // Record and submit this sub-graph, then wait for completion. Per-split
+    // submits keep each GPU submission small (well under the ~2s TDR limit)
+    // and results must be visible before the scheduler reads outputs anyway.
+    dx12_command_list* cmd = dx12_graph_compute_begin(ctx->device);
+    if (!cmd) {
+        dx12_log(DX12_LOG_ERROR, "graph_compute: failed to create command list");
+        return GGML_STATUS_FAILED;
+    }
+
+    if (!dx12_graph_compute(ctx->device, cmd, cgraph)) {
+        // Do not submit a partially recorded command list
+        dx12_cmd_list_destroy(cmd);
+        return GGML_STATUS_FAILED;
+    }
+
+    dx12_graph_compute_end(ctx->device, cmd);
+
+    if (!dx12_check_device_health(ctx->device)) {
+        dx12_log(DX12_LOG_ERROR, "graph_compute: device removed during execution");
+        return GGML_STATUS_FAILED;
+    }
 
     return GGML_STATUS_SUCCESS;
 }
@@ -559,15 +731,15 @@ static bool ggml_backend_dx12_supports_op(ggml_backend_t backend,
     (void)backend;
     // Check if the operation is supported on DX12
     // COMPONENT 5 (dx12_graph.cpp) provides this check
-    return dx12_op_supported(op->op, op->src[0], op->src[1]);
+    return dx12_op_supported(op);
 }
 
 static bool ggml_backend_dx12_supports_buft(ggml_backend_t backend,
                                             ggml_backend_buffer_type_t buft) {
     (void)backend;
-    (void)buft;
-    // DX12 supports its own buffer type and CPU buffer type
-    return true;
+    if (!buft) return false;
+    const char* name = buft->iface.get_name(buft);
+    return name && strcmp(name, "DX12") == 0;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -577,8 +749,8 @@ static bool ggml_backend_dx12_supports_buft(ggml_backend_t backend,
 static struct ggml_backend_i ggml_backend_dx12_interface = {
     /* get_name          */ ggml_backend_dx12_name,
     /* free              */ ggml_backend_dx12_free,
-    /* set_tensor_async  */ ggml_backend_dx12_set_tensor_async,
-    /* get_tensor_async  */ ggml_backend_dx12_get_tensor_async,
+    /* set_tensor_async  */ nullptr,
+    /* get_tensor_async  */ nullptr,
     /* set_tensor_2d_async */ nullptr,
     /* get_tensor_2d_async */ nullptr,
     /* cpy_tensor_async  */ nullptr,
@@ -612,17 +784,43 @@ static void ensure_dx12_devices_initialized();
 static ggml_backend_device *ggml_backend_dx12_device_i(size_t i);
 
 static ggml_backend_t ggml_backend_dx12_init_impl(const char* params) {
-    (void)params;
-
     dx12_log(DX12_LOG_INFO, "Initializing DX12 backend");
 
     auto* ctx = new ggml_backend_dx12_context();
 
-    // Create D3D12 device (auto-select best adapter)
-    dx12_result result = dx12_device_create(-1, &ctx->device);
-    if (result != DX12_OK) {
-        dx12_log(DX12_LOG_ERROR, "Failed to create DX12 device: %s",
-            dx12_result_string(result));
+    // Parse optional adapter index from params ("adapter=N", -1 = auto-select)
+    int32_t adapter_arg = -1;
+    if (params) {
+        int parsed = -1;
+        if (sscanf(params, "adapter=%d", &parsed) == 1) {
+            adapter_arg = parsed;
+        }
+    }
+
+    // Determine adapter index, then use cached device (avoids pointer mismatch with buffer allocator)
+    std::vector<dx12_adapter_info> adapters = dx12_enumerate_adapters();
+    if (adapters.empty()) {
+        dx12_log(DX12_LOG_ERROR, "No DX12-compatible GPU found");
+        delete ctx;
+        return nullptr;
+    }
+    uint32_t adapter_idx = (adapter_arg < 0)
+        ? dx12_select_best_adapter(adapters)
+        : (uint32_t)adapter_arg;
+    // adapter_idx is a DXGI enumeration index (can be non-contiguous when
+    // software adapters are skipped) — validate by lookup, not vector size.
+    bool found = false;
+    for (const auto& a : adapters) {
+        if (a.index == adapter_idx) { found = true; break; }
+    }
+    if (!found) {
+        dx12_log(DX12_LOG_ERROR, "Adapter index %u not among enumerated adapters", adapter_idx);
+        delete ctx;
+        return nullptr;
+    }
+    ctx->device = dx12_get_or_create_device(adapter_idx);
+    if (!ctx->device) {
+        dx12_log(DX12_LOG_ERROR, "Failed to create/get DX12 device");
         delete ctx;
         return nullptr;
     }
@@ -686,11 +884,9 @@ static ggml_backend_t ggml_backend_dx12_init_impl(const char* params) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 ggml_backend_t ggml_backend_dx12_init(int32_t adapter_index) {
-    // Convert adapter index to string param
     char params[32];
     snprintf(params, sizeof(params), "adapter=%d", adapter_index);
-    (void)params;
-    return ggml_backend_dx12_init_impl(nullptr);
+    return ggml_backend_dx12_init_impl(params);
 }
 
 bool ggml_backend_dx12_get_device_caps(ggml_backend_t backend,
@@ -784,9 +980,8 @@ static void dx12_dev_get_props(ggml_backend_dev_t dev, struct ggml_backend_dev_p
 static ggml_backend_t dx12_dev_init_backend(ggml_backend_dev_t dev, const char * params) {
     uint32_t adapter_idx = (uint32_t)(uintptr_t)dev->context;
 
-    dx12_device* d3d_dev = nullptr;
-    dx12_result result = dx12_device_create((int32_t)adapter_idx, &d3d_dev);
-    if (result != DX12_OK) return nullptr;
+    dx12_device* d3d_dev = dx12_get_or_create_device(adapter_idx);
+    if (!d3d_dev) return nullptr;
 
     auto* ctx = new ggml_backend_dx12_context();
     ctx->device = d3d_dev;
@@ -830,19 +1025,23 @@ static ggml_backend_buffer_t dx12_dev_buffer_from_host_ptr(ggml_backend_dev_t de
 
 static bool dx12_dev_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     (void)dev;
-    return dx12_op_supported(op->op, op->src[0], op->src[1]);
+    return dx12_op_supported(op);
 }
 
 static bool dx12_dev_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     (void)dev;
     if (!buft) return false;
+    // DX12 buffers only. Claiming CPU support here makes the scheduler skip
+    // the host->device input copies and dispatches see unbound buffers.
     const char* name = buft->iface.get_name(buft);
-    return name && (strcmp(name, "DX12") == 0 || strcmp(name, "CPU") == 0);
+    return name && strcmp(name, "DX12") == 0;
 }
 
 static bool dx12_dev_offload_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    (void)dev;
-    return op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_FLASH_ATTN_EXT;
+    // Conservative: never pull CPU-resident weights through the backend just
+    // to run one op. GPU placement is decided by -ngl buffer assignment.
+    (void)dev; (void)op;
+    return false;
 }
 
 static ggml_backend_event_t dx12_dev_event_new(ggml_backend_dev_t dev) {
@@ -890,10 +1089,14 @@ static void ensure_dx12_devices_initialized() {
     std::vector<dx12_adapter_info> adapters = dx12_enumerate_adapters();
     if (adapters.empty()) return;
 
+    // Register only the preferred adapter as a single ggml device. Some
+    // systems enumerate the same physical GPU under multiple DXGI indices;
+    // registering all of them makes llama.cpp split the model across
+    // "multiple GPUs" that are really one.
     uint32_t preferred = dx12_select_best_adapter(adapters);
 
     for (const auto &a : adapters) {
-        if (!a.supports_dx12) continue;
+        if (!a.supports_dx12 || a.index != preferred) continue;
 
         ggml_backend_device dev = {};
         dev.iface = dx12_device_iface;
@@ -902,16 +1105,7 @@ static void ensure_dx12_devices_initialized() {
 
         g_dx12_devices.push_back(dev);
         g_dx12_adapter_infos.push_back(a);
-    }
-
-    if (g_dx12_devices.empty() && !adapters.empty()) {
-        const auto &a = adapters[preferred];
-        ggml_backend_device dev = {};
-        dev.iface = dx12_device_iface;
-        dev.reg = &g_dx12_reg;
-        dev.context = (void*)(uintptr_t)a.index;
-        g_dx12_devices.push_back(dev);
-        g_dx12_adapter_infos.push_back(a);
+        break;
     }
 }
 

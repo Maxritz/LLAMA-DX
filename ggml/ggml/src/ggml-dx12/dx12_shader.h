@@ -65,6 +65,12 @@ struct dx12_shader_dispatch {
     uint32_t                    dispatch_x;      // Number of thread groups to dispatch in X
     uint32_t                    dispatch_y;      // Number of thread groups to dispatch in Y
     uint32_t                    dispatch_z;      // Number of thread groups to dispatch in Z
+
+    // Optional explicit GPU VAs per binding (0 = use the buffer's gpu_address).
+    // Needed when several tensors share one dx12_buffer: mutating the shared
+    // buffer's gpu_address makes every binding point at the last tensor.
+    D3D12_GPU_VIRTUAL_ADDRESS   srv_addr[4];
+    D3D12_GPU_VIRTUAL_ADDRESS   uav_addr;
 };
 
 /**

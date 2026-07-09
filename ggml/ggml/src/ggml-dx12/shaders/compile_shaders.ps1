@@ -60,11 +60,13 @@ if (-not $DxcExe -or -not (Test-Path $DxcExe)) {
 
 Write-Host "Using DXC: $DxcExe" -ForegroundColor Green
 
-# Verify SM 6.10 support
-$helpOutput = & $DxcExe -help 2>&1
-if ($helpOutput -notmatch "cs_6_10") {
-    Write-Warning "DXC may not support Shader Model 6.10. Ensure Windows SDK 22621+."
-}
+# Target a stable (non-experimental) shader model. cs_6_10 was previously used
+# for all shaders, but that requires D3D12EnableExperimentalFeatures at runtime
+# (unsupported/development mode), which has been observed to correlate with GPU
+# hangs on preview drivers even for operations unrelated to any SM 6.10 feature.
+# Only the DXLA (cooperative matrix) shaders actually need SM 6.10, and those
+# are excluded below since the DXLA dispatch path is currently disabled.
+$TargetProfile = "cs_6_6"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Shader List
@@ -87,13 +89,13 @@ $Shaders = @(
     @{Name="mul_mat_q8_0_f16"; Threads=@{X=16;Y=16;Z=1}},
     @{Name="mul_mat_batched"; Threads=@{X=8;Y=8;Z=4}},
     @{Name="mul_mat_strided"; Threads=@{X=16;Y=16;Z=1}},
-    # DXLA GEMM
-    @{Name="mul_mat_dxla_wave_f16_f16"; Threads=@{X=32;Y=1;Z=1}},
-    @{Name="mul_mat_dxla_wave_q4_0_f16"; Threads=@{X=32;Y=1;Z=1}},
-    @{Name="mul_mat_dxla_tg_f16_f16"; Threads=@{X=8;Y=16;Z=1}},
-    # DXLA Attention
-    @{Name="attn_qk_dxla"; Threads=@{X=32;Y=1;Z=1}},
-    @{Name="attn_ov_dxla"; Threads=@{X=32;Y=1;Z=1}},
+    # DXLA GEMM/Attention shaders excluded — need SM 6.10 (dx::linalg cooperative
+    # matrix), but the DXLA dispatch path is currently disabled (dx12_gemm.cpp /
+    # dx12_device.cpp), so these are unreachable dead weight. Re-add here (and
+    # switch $TargetProfile back to cs_6_10 + re-enable experimental features in
+    # dx12_device.cpp) if DXLA is ever revisited:
+    #   mul_mat_dxla_wave_f16_f16, mul_mat_dxla_wave_q4_0_f16,
+    #   mul_mat_dxla_tg_f16_f16, attn_qk_dxla, attn_ov_dxla
     # Activation
     @{Name="silu"; Threads=@{X=256;Y=1;Z=1}},
     @{Name="gelu"; Threads=@{X=256;Y=1;Z=1}},
@@ -143,7 +145,7 @@ foreach ($shader in $Shaders) {
     }
 
     $args = @(
-        "-T", "cs_6_10",
+        "-T", $TargetProfile,
         "-E", "main",
         "-enable-16bit-types",
         "-HV", "2021",

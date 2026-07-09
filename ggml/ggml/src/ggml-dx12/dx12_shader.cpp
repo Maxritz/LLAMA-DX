@@ -99,8 +99,6 @@ bool dx12_shader_dispatch(dx12_device* dev,
         D3D12_GPU_VIRTUAL_ADDRESS cbv_address =
             dx12_device_allocate_cbv(dev, constants, constants_size);
         if (cbv_address) {
-            dx12_log(DX12_LOG_INFO, "CBV: binding GPU address %p (size=%zu)",
-                     (void*)cbv_address, constants_size);
             cmd->d3d_list->SetComputeRootConstantBufferView(0, cbv_address);
         } else {
             dx12_log(DX12_LOG_ERROR,
@@ -110,11 +108,17 @@ bool dx12_shader_dispatch(dx12_device* dev,
         }
     }
 
-    // Bind SRVs (root params 1+)
+    // Bind inputs (root params 1+). The mm signature declares them as root
+    // UAVs (inputs may alias the output's resource); all others as root SRVs.
     for (uint32_t i = 0; i < num_srvs && i < 4; i++) {
         if (srvs[i]) {
-            dx12_cmd_list_set_compute_root_shader_resource_view(
-                cmd, 1 + i, srvs[i]->gpu_address);
+            D3D12_GPU_VIRTUAL_ADDRESS addr =
+                dispatch.srv_addr[i] ? dispatch.srv_addr[i] : srvs[i]->gpu_address;
+            if (dispatch.sig_type == dx12_root_signature_type::mm) {
+                dx12_cmd_list_set_compute_root_unordered_access_view(cmd, 1 + i, addr);
+            } else {
+                dx12_cmd_list_set_compute_root_shader_resource_view(cmd, 1 + i, addr);
+            }
         }
     }
 
@@ -124,10 +128,19 @@ bool dx12_shader_dispatch(dx12_device* dev,
         switch (dispatch.sig_type) {
             case dx12_root_signature_type::dequant_gemm: uav_slot = 4; break;
             case dx12_root_signature_type::attention: uav_slot = 4; break;
+            // mm: dst register = u<num_srcs> (root param 1 + num_srcs)
+            case dx12_root_signature_type::mm: uav_slot = 1 + num_srvs; break;
             default: uav_slot = 3; break;
         }
-        dx12_cmd_list_set_compute_root_unordered_access_view(
-            cmd, uav_slot, uav->gpu_address);
+        D3D12_GPU_VIRTUAL_ADDRESS dst_addr =
+            dispatch.uav_addr ? dispatch.uav_addr : uav->gpu_address;
+        dx12_cmd_list_set_compute_root_unordered_access_view(cmd, uav_slot, dst_addr);
+        if (dispatch.sig_type == dx12_root_signature_type::mm) {
+            // Fill spare UAV params so no root descriptor is left unset
+            for (uint32_t p = uav_slot + 1; p <= 4; p++) {
+                dx12_cmd_list_set_compute_root_unordered_access_view(cmd, p, dst_addr);
+            }
+        }
     }
 
     // Dispatch
@@ -152,6 +165,15 @@ bool dx12_shader_dispatch_simple(dx12_device* dev,
                                  dx12_buffer* uav,
                                  uint32_t elements) {
     if (!dev || !cmd || !shader_name || !uav) return false;
+
+    // Establish correct resource states for this dispatch's bindings. Without
+    // this, buffers get bound as SRV/UAV root descriptors regardless of their
+    // actual D3D12 resource state, and consecutive dispatches sharing a buffer
+    // have no ordering guarantee between them (can hang the GPU or produce
+    // garbage results depending on driver/hardware timing).
+    if (srv_a) dx12_buffer_transition(cmd, srv_a, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if (srv_b) dx12_buffer_transition(cmd, srv_b, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    dx12_buffer_transition(cmd, uav, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     const dx12_shader_entry* entry = dx12_get_shader_entry(shader_name);
     uint32_t tg_size = entry ? entry->thread_group_x : 256;

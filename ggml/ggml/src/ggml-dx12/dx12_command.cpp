@@ -25,8 +25,14 @@ dx12_command_list* dx12_cmd_list_create(dx12_device* dev) {
         return nullptr;
     }
 
-    // Use DIRECT queue (COMPUTE causes device removal on AMD RDNA4 + current Agility SDK)
-    D3D12_COMMAND_LIST_TYPE list_type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    // DIRECT is default. COMPUTE causes device removal (0x887A0001) on AMD RDNA4 + Agility SDK 1.721.1.
+    // Set DX12_FORCE_COMPUTE_LIST=1 to test COMPUTE list type for diagnostic purposes.
+    D3D12_COMMAND_LIST_TYPE list_type =
+#ifdef DX12_FORCE_COMPUTE_LIST
+        D3D12_COMMAND_LIST_TYPE_COMPUTE;
+#else
+        D3D12_COMMAND_LIST_TYPE_DIRECT;
+#endif
     HRESULT hr = dev->device->CreateCommandAllocator(
         list_type,
         IID_PPV_ARGS(&cmd->allocator));

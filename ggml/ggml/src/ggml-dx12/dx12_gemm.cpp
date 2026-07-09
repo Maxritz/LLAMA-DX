@@ -141,13 +141,6 @@ bool dx12_gemm_dispatch_standard(dx12_device* dev,
     dispatch.dispatch_z = dispatch_z;
     // thread_group_x/y/z = 0 (use shader defaults: 32x32x1)
 
-    dx12_log(DX12_LOG_INFO, "GEMM: M=%u N=%u K=%u stride_a=%u stride_b=%u stride_c=%u transposed=%u",
-             gc.M, gc.N, gc.K, gc.stride_a, gc.stride_b, gc.stride_c, gc.transposed_b);
-    dx12_log(DX12_LOG_INFO, "GEMM: A=%p B=%p C=%p",
-             (void*)matrix_a->gpu_address, (void*)matrix_b->gpu_address, (void*)result->gpu_address);
-    dx12_log(DX12_LOG_INFO, "GEMM: dispatch_x=%u dispatch_y=%u dispatch_z=%u",
-             dispatch.dispatch_x, dispatch.dispatch_y, dispatch.dispatch_z);
-
     dx12_buffer* srvs[2] = { matrix_a, matrix_b };
 
     bool ok = dx12_shader_dispatch(dev, cmd, dispatch,

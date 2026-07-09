@@ -141,6 +141,30 @@ static ComPtr<ID3D12RootSignature> dx12_build_root_signature(dx12_device* dev,
             break;
         }
 
+        case dx12_root_signature_type::mm: {
+            // Param 0: CBV at b0 (MMParams)
+            CD3DX12_ROOT_PARAMETER1 cbv_param;
+            cbv_param.InitAsConstantBufferView(
+                0, 0,
+                D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                D3D12_SHADER_VISIBILITY_ALL);
+            params.push_back(cbv_param);
+
+            // Params 1-4: root UAVs u0..u3. Sources bind at u0..u<n-1>, dst at
+            // u<n> (n = source count). All buffers bound as UAVs: sources often
+            // alias the destination's resource, and a root SRV bound to a
+            // UAV-state resource is invalid (hangs this driver).
+            for (uint32_t i = 0; i < 4; i++) {
+                CD3DX12_ROOT_PARAMETER1 uav_param;
+                uav_param.InitAsUnorderedAccessView(
+                    i, 0,
+                    D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                    D3D12_SHADER_VISIBILITY_ALL);
+                params.push_back(uav_param);
+            }
+            break;
+        }
+
         case dx12_root_signature_type::reduction: {
             // Param 0: CBV dimensions
             CD3DX12_ROOT_PARAMETER1 cbv_param;
@@ -318,21 +342,10 @@ dx12_pso* dx12_pso_cache::get_or_create(const char* shader_name,
         return it->second.get();
     }
 
-    dx12_log(DX12_LOG_INFO, "PSO: %s cso=%zuB sig_type=%d creating root signature...",
-             shader_name, cso_size, (int)sig_type);
-    fflush(stderr);
-
     // Get root signature
     dx12_root_signature_cache sig_cache(dev);
     ID3D12RootSignature* root_sig = sig_cache.get_or_create(sig_type);
     if (!root_sig) return nullptr;
-
-    dx12_log(DX12_LOG_INFO, "PSO: %s root signature created, creating pipeline...",
-             shader_name);
-    fflush(stderr);
-
-    dx12_log(DX12_LOG_INFO, "PSO: %s cso=%zuB sig_type=%d root_sig=%p",
-             shader_name, cso_size, (int)sig_type, (void*)root_sig);
 
     // Create PSO
     D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc{};
