@@ -164,6 +164,19 @@ those weight tensors are placed in CPU buffers automatically by llama.cpp), MoE 
 | Full graph on GPU | 28 | 271 | naive per-output-element matmul |
 | + GEMV decode kernels | **~90** | **~290** | kernel efficiency (headroom to ~400 t/s) |
 
+### Tested models (RX 9070 XT, `-ngl 99 -fa off`)
+
+| Model | Arch | Result |
+|---|---|---|
+| Llama-3.2-1B-Instruct Q8_0 | llama | works, ~90 t/s decode; output token-identical to CPU |
+| Llama-3-8B Q8_0 (8.5 GB) | llama | works, ~40 t/s decode |
+| Qwen2.5-Coder-3B Q8_0 | qwen2 | works, ~62 t/s decode |
+| Qwen3-4B Q8_0 | qwen3 | works, ~55 t/s decode |
+| Gemma-4 E4B Q4_0 | gemma (per-layer embd) | loads, but impractically slow — arch-specific ops fall back to CPU and thrash copies; needs dedicated kernels |
+
+K-quant models (Q4_K_M etc.) run, but their weight matmuls execute on CPU (no K-quant
+kernels yet), so expect CPU-class speed.
+
 Remaining perf work: shared-memory tiled prefill GEMM, wave-intrinsic reductions,
 FLASH_ATTN_EXT kernel, K-quant matmul kernels, quantized KV cache.
 
