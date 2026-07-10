@@ -269,10 +269,6 @@ bool dx12_graph_validate(dx12_device* dev, ggml_cgraph* graph,
 dx12_command_list* dx12_graph_compute_begin(dx12_device* dev) {
     dx12_command_list* cmd = dx12_cmd_list_create(dev);
     if (!cmd) return nullptr;
-    if (!dx12_cmd_list_reset(cmd)) {
-        dx12_cmd_list_destroy(cmd);
-        return nullptr;
-    }
     return cmd;
 }
 

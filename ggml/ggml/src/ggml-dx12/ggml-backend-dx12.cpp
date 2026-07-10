@@ -404,7 +404,6 @@ static void dx12_buf_memset_tensor(ggml_backend_buffer_t buf, ggml_tensor* tenso
     } else {
         dx12_command_list* cmd = dx12_cmd_list_create(ctx->device);
         if (cmd) {
-            dx12_cmd_list_reset(cmd);
             dx12_buffer_copy_upload_to_default(ctx->device, cmd, ctx->gpu_buffer,
                                                tensor_off + offset, zero_data.data(), size);
             dx12_cmd_list_destroy(cmd);
@@ -469,7 +468,6 @@ static void dx12_buf_set_tensor(ggml_backend_buffer_t buf, ggml_tensor* tensor,
             dx12_log(DX12_LOG_ERROR, "upload FAILED: no cmd list for %s", tensor->name);
             return;
         }
-        dx12_cmd_list_reset(batch.cmd);
     }
 
     // Copy data to staging buffer
@@ -536,7 +534,6 @@ static void dx12_buf_get_tensor(ggml_backend_buffer_t buf, const ggml_tensor* te
         dx12_buffer_destroy(staging);
         return;
     }
-    dx12_cmd_list_reset(cmd);
     dx12_buffer_transition(cmd, ctx->gpu_buffer, D3D12_RESOURCE_STATE_COPY_SOURCE);
     dx12_buffer_copy(cmd, staging, 0, ctx->gpu_buffer, tensor_off + offset, size);
     dx12_cmd_list_submit_and_wait(cmd);
@@ -565,7 +562,6 @@ static void dx12_buf_clear(ggml_backend_buffer_t buf, uint8_t value) {
     } else {
         dx12_command_list* cmd = dx12_cmd_list_create(ctx->device);
         if (!cmd) return;
-        dx12_cmd_list_reset(cmd);
         dx12_buffer_copy_upload_to_default(ctx->device, cmd, ctx->gpu_buffer,
                                            0, zero_data.data(), ctx->gpu_buffer->size);
         dx12_cmd_list_destroy(cmd);
