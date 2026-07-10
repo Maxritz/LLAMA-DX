@@ -75,6 +75,7 @@ struct dx12_device {
     D3D12_FEATURE_DATA_D3D12_OPTIONS1 options1{};
     D3D12_FEATURE_DATA_D3D12_OPTIONS4 options4{};
     D3D12_FEATURE_DATA_D3D12_OPTIONS9 options9{};
+    bool                             options16_available = false;
     D3D12_FEATURE_DATA_LINEAR_ALGEBRA_SUPPORT linalg_support{};
 
     // Adapter info

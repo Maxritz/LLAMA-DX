@@ -19,6 +19,7 @@ D3D12_HEAP_TYPE dx12_heap_type_to_d3d(dx12_heap_type type) {
         case dx12_heap_type::upload:    return D3D12_HEAP_TYPE_UPLOAD;
         case dx12_heap_type::default_: return D3D12_HEAP_TYPE_DEFAULT;
         case dx12_heap_type::readback:  return D3D12_HEAP_TYPE_READBACK;
+        case dx12_heap_type::gpu_upload: return D3D12_HEAP_TYPE_GPU_UPLOAD;
     }
     return D3D12_HEAP_TYPE_DEFAULT;
 }
@@ -28,6 +29,7 @@ D3D12_RESOURCE_STATES dx12_heap_type_default_state(dx12_heap_type type) {
         case dx12_heap_type::upload:    return D3D12_RESOURCE_STATE_GENERIC_READ;
         case dx12_heap_type::default_: return D3D12_RESOURCE_STATE_COMMON;
         case dx12_heap_type::readback:  return D3D12_RESOURCE_STATE_COPY_DEST;
+        case dx12_heap_type::gpu_upload: return D3D12_RESOURCE_STATE_GENERIC_READ;
     }
     return D3D12_RESOURCE_STATE_COMMON;
 }
@@ -59,7 +61,7 @@ dx12_buffer* dx12_buffer_create(dx12_device* dev, size_t size, dx12_heap_type ty
     desc.Format = DXGI_FORMAT_UNKNOWN;
     desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    desc.Flags = (type == dx12_heap_type::default_)
+    desc.Flags = (type == dx12_heap_type::default_ || type == dx12_heap_type::gpu_upload)
         ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
         : D3D12_RESOURCE_FLAG_NONE;
 
@@ -123,9 +125,10 @@ void dx12_buffer_destroy(dx12_buffer* buf) {
 void* dx12_buffer_map(dx12_buffer* buf) {
     if (!buf || !buf->resource) return nullptr;
 
-    // Only UPLOAD and READBACK heaps can be mapped
+    // Only UPLOAD, GPU_UPLOAD, and READBACK heaps can be mapped
     if (buf->heap != dx12_heap_type::upload &&
-        buf->heap != dx12_heap_type::readback) {
+        buf->heap != dx12_heap_type::readback &&
+        buf->heap != dx12_heap_type::gpu_upload) {
         return nullptr;
     }
 
@@ -224,8 +227,8 @@ void dx12_buffer_transition(dx12_command_list* cmd,
                             D3D12_RESOURCE_STATES new_state) {
     if (!cmd || !buf) return;
 
-    // UPLOAD/READBACK heaps have fixed states and cannot be transitioned
-    if (buf->heap == dx12_heap_type::upload || buf->heap == dx12_heap_type::readback) {
+    // UPLOAD/GPU_UPLOAD/READBACK heaps have fixed states and cannot be transitioned
+    if (buf->heap == dx12_heap_type::upload || buf->heap == dx12_heap_type::gpu_upload || buf->heap == dx12_heap_type::readback) {
         return;
     }
 

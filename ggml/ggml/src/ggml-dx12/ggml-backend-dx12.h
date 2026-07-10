@@ -66,6 +66,9 @@ typedef struct {
     bool     dxla_int8;              // INT8 component type supported
     bool     dxla_int4;              // INT4 component type supported
 
+    // DirectX 12 Options 16 (GPU_UPLOAD heap / ReBAR, native enum since Agility SDK 1.613)
+    bool     gpu_upload_heap;        // D3D12_HEAP_TYPE_GPU_UPLOAD (=5)
+
     // GPU Info
     char     adapter_name[128];      // Human-readable GPU name
     uint64_t dedicated_vram_bytes;   // Dedicated video memory

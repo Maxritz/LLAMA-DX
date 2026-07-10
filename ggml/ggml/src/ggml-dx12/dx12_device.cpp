@@ -318,6 +318,12 @@ void dx12_detect_device_caps(dx12_device* dev) {
     d->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS9,
                            &dev->options9, sizeof(dev->options9));
 
+    // Options16: GPU_UPLOAD heap (ReBAR, Agility SDK 1.613+)
+    D3D12_FEATURE_DATA_D3D12_OPTIONS16 opts16{};
+    HRESULT hr16 = d->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16,
+                                          &opts16, sizeof(opts16));
+    dev->options16_available = SUCCEEDED(hr16);
+
     // --- DXLA detection ---
     // DX Linear Algebra - coarse tier check gates everything
     D3D12_FEATURE_DATA_LINEAR_ALGEBRA_SUPPORT linalg{};
@@ -337,6 +343,8 @@ void dx12_detect_device_caps(dx12_device* dev) {
     c.native_16bit = dev->options4.Native16BitShaderOpsSupported;
     c.resource_heap_tier = dev->options.ResourceHeapTier;
     c.resource_binding_tier = dev->options.ResourceBindingTier;
+    c.gpu_upload_heap = dev->options16_available &&
+                         opts16.GPUUploadHeapSupported;
 
     // --- DXLA granular query ---
     // DXLA granular query - per-scope, per-operation

@@ -26,6 +26,7 @@ enum class dx12_heap_type {
     upload,     // CPU-visible, GPU-read-only  → model weights upload
     default_,  // GPU-only, fastest access     → active tensors, KV cache
     readback,  // GPU-write, CPU-read          → output logits, profiling
+    gpu_upload, // ReBAR-backed: CPU-write via PCIe, GPU-read from VRAM (D3D12_HEAP_TYPE_CUSTOM + WRITE_COMBINE + L1)
 };
 
 D3D12_HEAP_TYPE dx12_heap_type_to_d3d(dx12_heap_type type);
