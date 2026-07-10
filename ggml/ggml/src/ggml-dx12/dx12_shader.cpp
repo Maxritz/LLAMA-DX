@@ -238,7 +238,7 @@ bool dx12_shader_dispatch_gemm(dx12_device* dev,
     params.N = N;
     params.K = K;
     params.stride_A = K;          // A is MxK
-    params.stride_B = transposed_b ? N : K; // B is KxN (or NxK if transposed)
+    params.stride_B = transposed_b ? K : N; // B is KxN (or NxK if transposed)
     params.stride_C = N;          // C is MxN
     params.transposed_b = transposed_b ? 1 : 0;
 

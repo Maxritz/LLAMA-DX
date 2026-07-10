@@ -127,7 +127,7 @@ bool dx12_gemm_dispatch_standard(dx12_device* dev,
     gc.N = params->N;
     gc.K = params->K;
     gc.stride_a = params->stride_a ? params->stride_a : params->K;
-    gc.stride_b = params->stride_b ? params->stride_b : params->N;
+    gc.stride_b = params->stride_b ? params->stride_b : (params->transposed_b ? params->K : params->N);
     gc.stride_c = params->stride_c ? params->stride_c : params->N;
     gc.transposed_b = params->transposed_b ? 1 : 0;
     gc.alpha_f16 = 0x3C00; // 1.0 in F16
@@ -297,7 +297,7 @@ bool dx12_gemm_dispatch_quantized(dx12_device* dev,
     qgc.N = params->N;
     qgc.K = params->K;
     qgc.stride_a = params->stride_a ? params->stride_a : params->K;
-    qgc.stride_b = params->stride_b ? params->stride_b : params->N;
+    qgc.stride_b = params->stride_b ? params->stride_b : (params->transposed_b ? params->K : params->N);
     qgc.stride_c = params->stride_c ? params->stride_c : params->N;
     qgc.transposed_b = params->transposed_b ? 1 : 0;
     qgc.quant_type = (uint32_t)params->quant_a;

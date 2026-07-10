@@ -19,6 +19,7 @@ set(TEST_SOURCES
     test_dx12_shader_perf.cpp
     test_sm610_dxla_probe.cpp
     test_dxla_wave_bench.cpp
+    test_dxla_wave_trans_bench.cpp
 )
 
 foreach(TEST_SRC ${TEST_SOURCES})
