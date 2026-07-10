@@ -4,9 +4,9 @@
 
 ### 1. DXC Version: Use 1.10.2605.2, NOT 1.10.2605.24
 
-The newer DXC 1.10.2605.24 generates ~10x larger CSOs (52KB vs 5KB) that produce `Unknown DXIL LinalgMatrixLayout` at PSO creation. The older 1.10.2605.2 works.
+The newer DXC 1.10.2605.24 (at `E:\DXllama\dxc\bin\x64\`) generates ~10x larger CSOs (52KB vs 5KB) that produce `Unknown DXIL LinalgMatrixLayout` at PSO creation. The older 1.10.2605.2 works.
 
-**Path**: `C:\Users\rr\Desktop\Notllama-loc\new-DXMLDXAL\dxc-1.10.2605.2\bin\x64\dxc.exe`
+**Path**: `E:\DXllama\dxc-1.10.2605.2\bin\x64\dxc.exe`
 
 **Fix**: CMake cache variable `DXC_EXECUTABLE` defaults to the wrong DXC. Set it manually:
 ```cmake
@@ -102,26 +102,46 @@ After dispatching the scalar shader with garbage output (OOB GPU access), the de
 
 **Fix**: Soft-reload the driver with `Ctrl+Alt+Win+B` before re-testing. The test must produce correct GPU memory accesses to avoid device removal.
 
-## Safe Compilation Recipe for DXLA Wave Shaders (Updated)
+### 10. Staging Buffer Deferred Destruction (RDNA4 Compute Queue)
+
+Immediately destroying upload buffers (`DestroyBuffer` → Release) after the copy fence signals causes the AMD kernel driver to crash on RDNA4 compute queues. The CPU unmaps/frees staging descriptors while the DMA scheduler's background worker is still flushing caches, triggering a deferred TDR (device reports `0x887A0006` on the next API call, even though the previous fence completed OK).
+
+**Fix**: Retain all upload staging buffers alive until the GPU queue is fully idle:
+```cpp
+std::vector<rdna4::DX12Buffer> stagingBuffers; // keep alive
+// ... submit uploads, each push to stagingBuffers ...
+fence->Signal(); WaitForSingleObject(...);  // sync
+for (auto& sb : stagingBuffers) allocator.DestroyBuffer(sb); // safe now
+stagingBuffers.clear();
+```
+
+Do not call `DestroyBuffer` inside upload lambdas — accumulate and destroy after the final fence wait.
+
+### 11. RAW UAV NumElements Must Match Actual Buffer Size (RDNA4)
+
+When creating a RAW UAV (`DXGI_FORMAT_R32_TYPELESS + D3D12_BUFFER_UAV_FLAG_RAW`), `NumElements` is in 32-bit DWORDs. If the buffer is smaller than `NumElements * 4` (e.g. an F16 buffer of `vs * em * 2` bytes with `NumElements = vs * em`), the descriptor covers a larger VA range than the allocation. RDNA4's GPU page walker hangs on the unmapped pages, producing a deferred TDR.
+
+```
+// WRONG — buffer is F16 (2 bytes/element), UAV expects 4 bytes/element:
+NumElements = vs * em;        // expects vs*em*4 bytes, buffer is vs*em*2 bytes → HANG
+
+// RIGHT:
+NumElements = vs * em;        // for F32 buffers (4 bytes/element)
+NumElements = vs * em / 2;    // for F16 buffers (2 bytes/element, must be even)
+```
+
+**Fix**: Ensure `NumElements` computes to the exact buffer byte size divided by 4. Prefer F32 upload buffers for RWByteAddressBuffer RAW UAV views to avoid confusion.
+
+## Safe Compilation Recipe for DXLA Wave Shaders
 
 ```powershell
-# Non-transposed B (RowMajor) — weight matrices
-& "C:\Users\rr\Desktop\Notllama-loc\new-DXMLDXAL\dxc-1.10.2605.2\bin\x64\dxc.exe" `
+& "E:\DXllama\dxc-1.10.2605.2\bin\x64\dxc.exe" `
     -T cs_6_10 -E main `
     -enable-16bit-types `
     -O3 `
-    -I "C:\Users\rr\Desktop\Notllama-loc\new-DXMLDXAL\dxc-1.10.2605.2\inc\hlsl" `
+    -I "E:\DXllama\dxc-1.10.2605.2\inc\hlsl" `
     -Fo "shaders/mul_mat_dxla_wave_f16_f16.cso" `
     "shaders/mul_mat_dxla_wave_f16_f16.hlsl"
-
-# Transposed B (ColMajor) — attention keys
-& "C:\Users\rr\Desktop\Notllama-loc\new-DXMLDXAL\dxc-1.10.2605.2\bin\x64\dxc.exe" `
-    -T cs_6_10 -E main `
-    -enable-16bit-types `
-    -O3 `
-    -I "C:\Users\rr\Desktop\Notllama-loc\new-DXMLDXAL\dxc-1.10.2605.2\inc\hlsl" `
-    -Fo "shaders/mul_mat_dxla_wave_f16_f16_trans.cso" `
-    "shaders/mul_mat_dxla_wave_f16_f16_trans.hlsl"
 ```
 
 ## Verifying a DXLA CSO Works
@@ -140,54 +160,4 @@ After dispatching the scalar shader with garbage output (OOB GPU access), the de
 | Scalar GEMV F16 | 4096×4096 | 42.7 µs | 786 |
 | Scalar GEMM F16 (tile) | 32×4096×4096 | 1955.9 µs | 549 |
 | DXLA Wave GEMM F16 | 32×4096×4096 | 59.6 µs | 18,010 |
-| DXLA Wave speedup | — | 32.81× | 32.81× |
-
-### 10. Transposed-B GEMM: Separate Shader Variant with ColMajor
-
-`MatrixLayout` cannot be runtime-selected (issue #3). For transposed B (e.g., attention Q×K^T where K is N×K and we read as K^T), the B tile must be loaded with `MatrixLayout::ColMajor`.
-
-**Shaders**:
-- `mul_mat_dxla_wave_f16_f16.hlsl` — RowMajor (non-transposed B, K×N weights)
-- `mul_mat_dxla_wave_f16_f16_trans.hlsl` — ColMajor (transposed B, N×K keys)
-
-**ColMajor reasoning**: Physical B is N×K row-major. To read B^T elements in order (varying k across rows, varying tile_col across columns), ColMajor makes the loaded tile's columns vary the N dimension and rows vary the K dimension — matching B^T's logical layout.
-
-### 11. stride_b Fix: Non-transposed = N, Transposed = K
-
-The stride_b for the physical matrix B must be the column count (elements per row), not the row count:
-
-| Case | Physical B | Row stride | CPU code (fixed) |
-|------|-----------|------------|-----------------|
-| Non-transposed (weights) | K×N | N | `params->N` |
-| Transposed (keys in QK) | N×K | K | `params->K` |
-
-**Bug**: `dx12_gemm.cpp:196` had `params->transposed_b ? params->N : params->K` — swapping the two cases. For a non-square 4096×14336 weight matrix, this produced stride=4096 instead of the correct stride=14336, causing OOB reads and garbage output.
-
-### 12. DXC Path Updated
-
-Old: `E:/DXllama/dxc-1.10.2605.2/bin/x64/dxc.exe`
-New: `C:/Users/rr/Desktop/Notllama-loc/new-DXMLDXAL/dxc-1.10.2605.2/bin/x64/dxc.exe`
-
-Include path updated accordingly. All DXLA shaders recompiled with new DXC path.
-
-## Safe Compilation Recipe for DXLA Wave Shaders (Updated)
-
-```powershell
-& "C:\Users\rr\Desktop\Notllama-loc\new-DXMLDXAL\dxc-1.10.2605.2\bin\x64\dxc.exe" `
-    -T cs_6_10 -E main `
-    -enable-16bit-types `
-    -O3 `
-    -I "C:\Users\rr\Desktop\Notllama-loc\new-DXMLDXAL\dxc-1.10.2605.2\inc\hlsl" `
-    -Fo "shaders/mul_mat_dxla_wave_f16_f16_trans.cso" `
-    "shaders/mul_mat_dxla_wave_f16_f16_trans.hlsl"
-```
-
-## Updated Performance Baseline (RX 9070 XT)
-
-| Shader | Size | Latency | GFLOPS |
-|--------|------|---------|--------|
-| Scalar GEMV F16 | 4096×4096 | 42.7 µs | 786 |
-| Scalar GEMM F16 (tile) | 32×4096×4096 | 1955.9 µs | 549 |
-| DXLA Wave GEMM F16 (RowMajor) | 32×4096×4096 | 59.6 µs | 18,010 |
-| DXLA Wave GEMM F16 (ColMajor trans) | 32×4096×4096 | TBD | TBD |
 | DXLA Wave speedup | — | 32.81× | 32.81× |

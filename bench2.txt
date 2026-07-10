@@ -1,0 +1,163 @@
+[DX12 INF] Adapter[0]: AMD Radeon RX 9070 XT, VRAM=15.4GB, DX12=YES
+[DX12 INF] Selected adapter[0]: AMD Radeon RX 9070 XT (VRAM=15.4GB)
+[DX12 INF] device_cache MISS for idx=0, creating new
+[DX12 INF] Adapter[0]: AMD Radeon RX 9070 XT, VRAM=15.4GB, DX12=YES
+[DX12 INF] D3D12 device created: FL=12_2
+[DX12 INF] Device caps: WaveOps=YES WaveSize=32-64 Native16bit=YES
+[DX12 INF] CBV ring buffer created: 4MB
+[DX12 INF] DX12 device ready: AMD Radeon RX 9070 XT
+[DX12 INF] Device removal reason check: S_OK
+[DX12 INF] buft_alloc: idx=0 size=1065703936 heap=default DONE
+[DX12 INF] device_cache HIT for idx=0
+[DX12 INF] buft_alloc: idx=0 size=1061177856 heap=default DONE
+[DX12 INF] device_cache HIT for idx=0
+[DX12 INF] buft_alloc: idx=0 size=618564096 heap=default DONE
+[DX12 INF] upload_batch: grown to 512 MB
+[DX12 INF] upload_batch: submitted 377487360 bytes (fence=1)
+[DX12 INF] upload_batch: submitted 255083544 bytes (fence=2)
+[DX12 INF] upload_batch: submitted 255037460 bytes (fence=3)
+[DX12 INF] upload_batch: submitted 264488976 bytes (fence=4)
+[DX12 INF] upload_batch: submitted 262412308 bytes (fence=5)
+[DX12 INF] upload_batch: submitted 264488976 bytes (fence=6)
+[DX12 INF] upload_batch: submitted 255037460 bytes (fence=7)
+[DX12 INF] upload_batch: submitted 264488976 bytes (fence=8)
+[DX12 INF] upload_batch: submitted 262412308 bytes (fence=9)
+[DX12 INF] upload_batch: submitted 264488976 bytes (fence=10)
+[DX12 INF] device_cache HIT for idx=0
+[DX12 INF] DX12 backend initialized on AMD Radeon RX 9070 XT
+[DX12 INF] device_cache HIT for idx=0
+[DX12 INF] buft_alloc: idx=0 size=4194304 heap=default DONE
+[DX12 INF] upload_batch: submitted 20008960 bytes (fence=11)
+[DX12 INF] device_cache HIT for idx=0
+[DX12 INF] buft_alloc: idx=0 size=10485760 heap=default DONE
+[DX12 INF] device_cache HIT for idx=0
+[DX12 INF] buft_alloc: idx=0 size=303305728 heap=default DONE
+[DX12 INF] upload_batch: submitted 11010048 bytes (fence=21)
+[DX12 INF] upload_batch: submitted 2621440 bytes (fence=24)
+[DX12 INF] upload_batch: submitted 1024 bytes (fence=26)
+[DX12 INF] upload_batch: submitted 2048 bytes (fence=28)
+[DX12 INF] upload_batch: submitted 2048 bytes (fence=30)
+[DX12 INF] upload_batch: submitted 262144 bytes (fence=32)
+[DX12 INF] upload_batch: submitted 2621440 bytes (fence=38)
+[DX12 INF] upload_batch: submitted 11010048 bytes (fence=44)
+[DX12 INF] upload_batch: submitted 2621440 bytes (fence=50)
+[DX12 INF] upload_batch: submitted 2621440 bytes (fence=56)
+[DX12 INF] upload_batch: submitted 2621440 bytes (fence=62)
+[DX12 INF] upload_batch: submitted 2621440 bytes (fence=68)
+[DX12 INF] upload_batch: submitted 1024 bytes (fence=72)
+[DX12 INF] upload_batch: submitted 2048 bytes (fence=75)
+[DX12 INF] upload_batch: submitted 2048 bytes (fence=77)
+[DX12 INF] upload_batch: submitted 262144 bytes (fence=79)
+[DX12 INF] upload_batch: submitted 4 bytes (fence=82)
+[DX12 INF] upload_batch: submitted 11010048 bytes (fence=89)
+[DX12 INF] upload_batch: submitted 2621440 bytes (fence=92)
+[DX12 INF] upload_batch: submitted 1024 bytes (fence=94)
+[DX12 INF] upload_batch: submitted 2048 bytes (fence=96)
+[DX12 INF] upload_batch: submitted 2048 bytes (fence=98)
+[DX12 INF] upload_batch: submitted 262144 bytes (fence=100)
+[DX12 INF] upload_batch: submitted 2621440 bytes (fence=106)
+[DX12 INF] upload_batch: submitted 11010048 bytes (fence=112)
+[DX12 INF] upload_batch: submitted 2621440 bytes (fence=118)
+[DX12 INF] upload_batch: submitted 2621440 bytes (fence=124)
+[DX12 INF] upload_batch: submitted 2621440 bytes (fence=130)
+[DX12 INF] upload_batch: submitted 2621440 bytes (fence=136)
+[DX12 INF] upload_batch: submitted 1024 bytes (fence=140)
+[DX12 INF] upload_batch: submitted 2048 bytes (fence=143)
+[DX12 INF] upload_batch: submitted 2048 bytes (fence=145)
+[DX12 INF] upload_batch: submitted 262144 bytes (fence=147)
+[DX12 INF] upload_batch: submitted 4 bytes (fence=150)
+[DX12 INF] upload_batch: submitted 11010048 bytes (fence=157)
+[DX12 INF] upload_batch: submitted 2621440 bytes (fence=160)
+[DX12 INF] upload_batch: submitted 1024 bytes (fence=162)
+[DX12 INF] upload_batch: submitted 2048 bytes (fence=164)
+[DX12 INF] upload_batch: submitted 2048 bytes (fence=166)
+[DX12 INF] upload_batch: submitted 262144 bytes (fence=168)
+[DX12 INF] upload_batch: submitted 2621440 bytes (fence=174)
+[DX12 INF] upload_batch: submitted 11010048 bytes (fence=180)
+[DX12 INF] upload_batch: submitted 2621440 bytes (fence=186)
+[DX12 INF] upload_batch: submitted 2621440 bytes (fence=192)
+[DX12 INF] upload_batch: submitted 2621440 bytes (fence=198)
+[DX12 INF] upload_batch: submitted 2621440 bytes (fence=204)
+[DX12 INF] upload_batch: submitted 1024 bytes (fence=208)
+[DX12 INF] upload_batch: submitted 2048 bytes (fence=211)
+[DX12 INF] upload_batch: submitted 2048 bytes (fence=213)
+[DX12 INF] upload_batch: submitted 262144 bytes (fence=215)
+[DX12 INF] upload_batch: submitted 4 bytes (fence=218)
+[DX12 INF] upload_batch: submitted 11010048 bytes (fence=225)
+[DX12 INF] upload_batch: submitted 2621440 bytes (fence=228)
+[DX12 INF] upload_batch: submitted 1024 bytes (fence=230)
+[DX12 INF] upload_batch: submitted 2048 bytes (fence=232)
+[DX12 INF] upload_batch: submitted 2048 bytes (fence=234)
+[DX12 INF] upload_batch: submitted 262144 bytes (fence=236)
+[DX12 INF] upload_batch: submitted 2621440 bytes (fence=242)
+[DX12 INF] upload_batch: submitted 11010048 bytes (fence=248)
+[DX12 INF] upload_batch: submitted 2621440 bytes (fence=254)
+[DX12 INF] upload_batch: submitted 2621440 bytes (fence=260)
+[DX12 INF] upload_batch: submitted 2621440 bytes (fence=266)
+[DX12 INF] upload_batch: submitted 2621440 bytes (fence=272)
+[DX12 INF] upload_batch: submitted 1024 bytes (fence=276)
+[DX12 INF] upload_batch: submitted 2048 bytes (fence=279)
+[DX12 INF] upload_batch: submitted 2048 bytes (fence=281)
+[DX12 INF] upload_batch: submitted 262144 bytes (fence=283)
+[DX12 INF] upload_batch: submitted 4 bytes (fence=286)
+[DX12 INF] upload_batch: submitted 11010048 bytes (fence=293)
+[DX12 INF] upload_batch: submitted 2621440 bytes (fence=296)
+[DX12 INF] upload_batch: submitted 1024 bytes (fence=298)
+[DX12 INF] upload_batch: submitted 2048 bytes (fence=300)
+[DX12 INF] upload_batch: submitted 2048 bytes (fence=302)
+[DX12 INF] upload_batch: submitted 262144 bytes (fence=304)
+[DX12 INF] upload_batch: submitted 2621440 bytes (fence=310)
+[DX12 INF] upload_batch: submitted 11010048 bytes (fence=316)
+[DX12 INF] upload_batch: submitted 2621440 bytes (fence=322)
+[DX12 INF] upload_batch: submitted 2621440 bytes (fence=328)
+[DX12 INF] upload_batch: submitted 2621440 bytes (fence=334)
+[DX12 INF] upload_batch: submitted 2621440 bytes (fence=340)
+[DX12 INF] upload_batch: submitted 1024 bytes (fence=344)
+[DX12 INF] upload_batch: submitted 2048 bytes (fence=347)
+[DX12 INF] upload_batch: submitted 2048 bytes (fence=349)
+[DX12 INF] upload_batch: submitted 262144 bytes (fence=351)
+[DX12 INF] upload_batch: submitted 4 bytes (fence=354)
+[DX12 INF] upload_batch: submitted 11010048 bytes (fence=361)
+[DX12 INF] upload_batch: submitted 2621440 bytes (fence=364)
+[DX12 INF] upload_batch: submitted 1024 bytes (fence=366)
+[DX12 INF] upload_batch: submitted 2048 bytes (fence=368)
+[DX12 INF] upload_batch: submitted 2048 bytes (fence=370)
+[DX12 INF] upload_batch: submitted 262144 bytes (fence=372)
+[DX12 INF] upload_batch: submitted 2621440 bytes (fence=378)
+[DX12 INF] upload_batch: submitted 11010048 bytes (fence=384)
+[DX12 INF] upload_batch: submitted 2621440 bytes (fence=390)
+[DX12 INF] upload_batch: submitted 2621440 bytes (fence=396)
+[DX12 INF] upload_batch: submitted 2621440 bytes (fence=402)
+[DX12 INF] upload_batch: submitted 2621440 bytes (fence=408)
+[DX12 INF] upload_batch: submitted 1024 bytes (fence=412)
+[DX12 INF] upload_batch: submitted 2048 bytes (fence=415)
+[DX12 INF] upload_batch: submitted 2048 bytes (fence=417)
+[DX12 INF] upload_batch: submitted 262144 bytes (fence=419)
+[DX12 INF] upload_batch: submitted 4 bytes (fence=422)
+| model                          |       size |     params | backend    | ngl | threads | n_batch |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | ------: | ------: | --------------: | -------------------: |
+| gemma4 E4B Q4_0                |   4.49 GiB |     7.52 B | DX12       |  99 |       1 |     512 |           pp256 |         52.78 ┬▒ 0.09 |
+[DX12 INF] Freeing DX12 backend
+[DX12 INF] Removed device idx=0 from cache on teardown
+[DX12 INF] Destroying DX12 device
+[DX12 INF] device_cache MISS for idx=0, creating new
+[DX12 INF] Adapter[0]: AMD Radeon RX 9070 XT, VRAM=15.4GB, DX12=YES
+[DX12 INF] D3D12 device created: FL=12_2
+[DX12 INF] Device caps: WaveOps=YES WaveSize=32-64 Native16bit=YES
+[DX12 INF] CBV ring buffer created: 4MB
+[DX12 INF] DX12 device ready: AMD Radeon RX 9070 XT
+[DX12 INF] Device removal reason check: S_OK
+[DX12 INF] DX12 backend initialized on AMD Radeon RX 9070 XT
+[DX12 INF] device_cache HIT for idx=0
+[DX12 INF] buft_alloc: idx=0 size=4194304 heap=default DONE
+[DX12 INF] device_cache HIT for idx=0
+[DX12 INF] buft_alloc: idx=0 size=10485760 heap=default DONE
+[DX12 INF] device_cache HIT for idx=0
+[DX12 INF] buft_alloc: idx=0 size=68419584 heap=default DONE
+[DX12 INF] upload_batch: grown to 64 MB
+[DX12 INF] upload_batch: submitted 43008 bytes (fence=10)
+[DX12 INF] upload_batch: submitted 10240 bytes (fence=13)
+[DX12 INF] upload_batch: submitted 4 bytes (fence=15)
+[DX12 INF] upload_batch: submitted 8 bytes (fence=17)
+[DX12 INF] upload_batch: submitted 8 bytes (fence=19)
+[DX12 INF] upload_batch: submitted 1024 bytes (fence=21)
