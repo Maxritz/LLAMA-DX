@@ -4,9 +4,9 @@
 
 ### 1. DXC Version: Use 1.10.2605.2, NOT 1.10.2605.24
 
-The newer DXC 1.10.2605.24 (at `E:\DXllama\dxc\bin\x64\`) generates ~10x larger CSOs (52KB vs 5KB) that produce `Unknown DXIL LinalgMatrixLayout` at PSO creation. The older 1.10.2605.2 works.
+The newer DXC 1.10.2605.24 generates ~10x larger CSOs (52KB vs 5KB) that produce `Unknown DXIL LinalgMatrixLayout` at PSO creation. The older 1.10.2605.2 works.
 
-**Path**: `E:\DXllama\dxc-1.10.2605.2\bin\x64\dxc.exe`
+**Path**: `C:\Users\rr\Desktop\Notllama-loc\new-DXMLDXAL\dxc-1.10.2605.2\bin\x64\dxc.exe`
 
 **Fix**: CMake cache variable `DXC_EXECUTABLE` defaults to the wrong DXC. Set it manually:
 ```cmake
@@ -102,16 +102,26 @@ After dispatching the scalar shader with garbage output (OOB GPU access), the de
 
 **Fix**: Soft-reload the driver with `Ctrl+Alt+Win+B` before re-testing. The test must produce correct GPU memory accesses to avoid device removal.
 
-## Safe Compilation Recipe for DXLA Wave Shaders
+## Safe Compilation Recipe for DXLA Wave Shaders (Updated)
 
 ```powershell
-& "E:\DXllama\dxc-1.10.2605.2\bin\x64\dxc.exe" `
+# Non-transposed B (RowMajor) — weight matrices
+& "C:\Users\rr\Desktop\Notllama-loc\new-DXMLDXAL\dxc-1.10.2605.2\bin\x64\dxc.exe" `
     -T cs_6_10 -E main `
     -enable-16bit-types `
     -O3 `
-    -I "E:\DXllama\dxc-1.10.2605.2\inc\hlsl" `
+    -I "C:\Users\rr\Desktop\Notllama-loc\new-DXMLDXAL\dxc-1.10.2605.2\inc\hlsl" `
     -Fo "shaders/mul_mat_dxla_wave_f16_f16.cso" `
     "shaders/mul_mat_dxla_wave_f16_f16.hlsl"
+
+# Transposed B (ColMajor) — attention keys
+& "C:\Users\rr\Desktop\Notllama-loc\new-DXMLDXAL\dxc-1.10.2605.2\bin\x64\dxc.exe" `
+    -T cs_6_10 -E main `
+    -enable-16bit-types `
+    -O3 `
+    -I "C:\Users\rr\Desktop\Notllama-loc\new-DXMLDXAL\dxc-1.10.2605.2\inc\hlsl" `
+    -Fo "shaders/mul_mat_dxla_wave_f16_f16_trans.cso" `
+    "shaders/mul_mat_dxla_wave_f16_f16_trans.hlsl"
 ```
 
 ## Verifying a DXLA CSO Works
@@ -130,4 +140,54 @@ After dispatching the scalar shader with garbage output (OOB GPU access), the de
 | Scalar GEMV F16 | 4096×4096 | 42.7 µs | 786 |
 | Scalar GEMM F16 (tile) | 32×4096×4096 | 1955.9 µs | 549 |
 | DXLA Wave GEMM F16 | 32×4096×4096 | 59.6 µs | 18,010 |
+| DXLA Wave speedup | — | 32.81× | 32.81× |
+
+### 10. Transposed-B GEMM: Separate Shader Variant with ColMajor
+
+`MatrixLayout` cannot be runtime-selected (issue #3). For transposed B (e.g., attention Q×K^T where K is N×K and we read as K^T), the B tile must be loaded with `MatrixLayout::ColMajor`.
+
+**Shaders**:
+- `mul_mat_dxla_wave_f16_f16.hlsl` — RowMajor (non-transposed B, K×N weights)
+- `mul_mat_dxla_wave_f16_f16_trans.hlsl` — ColMajor (transposed B, N×K keys)
+
+**ColMajor reasoning**: Physical B is N×K row-major. To read B^T elements in order (varying k across rows, varying tile_col across columns), ColMajor makes the loaded tile's columns vary the N dimension and rows vary the K dimension — matching B^T's logical layout.
+
+### 11. stride_b Fix: Non-transposed = N, Transposed = K
+
+The stride_b for the physical matrix B must be the column count (elements per row), not the row count:
+
+| Case | Physical B | Row stride | CPU code (fixed) |
+|------|-----------|------------|-----------------|
+| Non-transposed (weights) | K×N | N | `params->N` |
+| Transposed (keys in QK) | N×K | K | `params->K` |
+
+**Bug**: `dx12_gemm.cpp:196` had `params->transposed_b ? params->N : params->K` — swapping the two cases. For a non-square 4096×14336 weight matrix, this produced stride=4096 instead of the correct stride=14336, causing OOB reads and garbage output.
+
+### 12. DXC Path Updated
+
+Old: `E:/DXllama/dxc-1.10.2605.2/bin/x64/dxc.exe`
+New: `C:/Users/rr/Desktop/Notllama-loc/new-DXMLDXAL/dxc-1.10.2605.2/bin/x64/dxc.exe`
+
+Include path updated accordingly. All DXLA shaders recompiled with new DXC path.
+
+## Safe Compilation Recipe for DXLA Wave Shaders (Updated)
+
+```powershell
+& "C:\Users\rr\Desktop\Notllama-loc\new-DXMLDXAL\dxc-1.10.2605.2\bin\x64\dxc.exe" `
+    -T cs_6_10 -E main `
+    -enable-16bit-types `
+    -O3 `
+    -I "C:\Users\rr\Desktop\Notllama-loc\new-DXMLDXAL\dxc-1.10.2605.2\inc\hlsl" `
+    -Fo "shaders/mul_mat_dxla_wave_f16_f16_trans.cso" `
+    "shaders/mul_mat_dxla_wave_f16_f16_trans.hlsl"
+```
+
+## Updated Performance Baseline (RX 9070 XT)
+
+| Shader | Size | Latency | GFLOPS |
+|--------|------|---------|--------|
+| Scalar GEMV F16 | 4096×4096 | 42.7 µs | 786 |
+| Scalar GEMM F16 (tile) | 32×4096×4096 | 1955.9 µs | 549 |
+| DXLA Wave GEMM F16 (RowMajor) | 32×4096×4096 | 59.6 µs | 18,010 |
+| DXLA Wave GEMM F16 (ColMajor trans) | 32×4096×4096 | TBD | TBD |
 | DXLA Wave speedup | — | 32.81× | 32.81× |

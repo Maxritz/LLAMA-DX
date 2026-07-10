@@ -20,7 +20,7 @@ message(STATUS "Using Agility SDK from: ${AGILITY_SDK_DIR}")
 # DXC Compiler Detection
 # ═══════════════════════════════════════════════════════════════════════════════
 # DXC can come from: (1) Windows SDK, (2) Agility SDK, (3) Standalone
-set(DXC_EXECUTABLE "E:/DXllama/dxc-1.10.2605.2/bin/x64/dxc.exe" CACHE FILEPATH "DXC compiler" FORCE)
+set(DXC_EXECUTABLE "C:/Users/rr/Desktop/Notllama-loc/new-DXMLDXAL/dxc-1.10.2605.2/bin/x64/dxc.exe" CACHE FILEPATH "DXC compiler" FORCE)
 
 if(NOT DXC_EXECUTABLE)
     message(FATAL_ERROR "dxc.exe not found. Install Windows SDK 22621+ or DXC standalone.")
@@ -189,6 +189,7 @@ set(DX12_CSO_ARRAYS "")
 # DXLA shaders require SM 6.10 for dx::linalg cooperative matrix
 set(DX12_SHADERS_DXLA
     mul_mat_dxla_wave_f16_f16
+    mul_mat_dxla_wave_f16_f16_trans
     mul_mat_dxla_wave_q4_0_f16
     mul_mat_dxla_tg_f16_f16
     attn_qk_dxla
@@ -212,7 +213,7 @@ foreach(SHADER_NAME ${DX12_SHADERS})
             -Qembed_debug
             -HV 2021
             -I "${DX12_SHADER_DIR}"
-            -I "E:/DXllama/dxc-1.10.2605.2/inc/hlsl"
+            -I "C:/Users/rr/Desktop/Notllama-loc/new-DXMLDXAL/dxc-1.10.2605.2/inc/hlsl"
             -Fo ${CSO_FILE}
             ${HLSL_FILE}
         DEPENDS ${HLSL_FILE} ${DX12_SHADER_DIR}/common.hlsli ${DX12_SHADER_DIR}/kquants.hlsli
@@ -244,7 +245,7 @@ foreach(SHADER_NAME ${DX12_SHADERS_DXLA})
             -Qembed_debug
             -HV 2021
             -I "${DX12_SHADER_DIR}"
-            -I "E:/DXllama/dxc-1.10.2605.2/inc/hlsl"
+            -I "C:/Users/rr/Desktop/Notllama-loc/new-DXMLDXAL/dxc-1.10.2605.2/inc/hlsl"
             -Fo ${CSO_FILE}
             ${HLSL_FILE}
         DEPENDS ${HLSL_FILE} ${DX12_SHADER_DIR}/common.hlsli ${DX12_SHADER_DIR}/kquants.hlsli

@@ -167,6 +167,8 @@ bool dx12_gemm_dispatch_dxla_wave(dx12_device* dev,
     const char* shader_name = "mul_mat_dxla_wave_f16_f16";
     if (params->quant_a == DX12_QUANT_Q4_0) {
         shader_name = "mul_mat_dxla_wave_q4_0_f16";
+    } else if (params->transposed_b) {
+        shader_name = "mul_mat_dxla_wave_f16_f16_trans";
     }
 
     dx12_buffer_transition(cmd, matrix_a, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -193,7 +195,7 @@ bool dx12_gemm_dispatch_dxla_wave(dx12_device* dev,
     dc.N = params->N;
     dc.K = params->K;
     dc.stride_a = params->K;
-    dc.stride_b = params->transposed_b ? params->N : params->K;
+    dc.stride_b = params->transposed_b ? params->K : params->N;
     dc.stride_c = params->N;
     dc.transposed_b = params->transposed_b ? 1 : 0;
     dc.wave_size = wave_size;
