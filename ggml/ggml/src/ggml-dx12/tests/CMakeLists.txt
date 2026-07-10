@@ -20,6 +20,7 @@ set(TEST_SOURCES
     test_sm610_dxla_probe.cpp
     test_dxla_wave_bench.cpp
     test_dxla_wave_trans_bench.cpp
+    test_upload_bench.cpp
 )
 
 foreach(TEST_SRC ${TEST_SOURCES})
