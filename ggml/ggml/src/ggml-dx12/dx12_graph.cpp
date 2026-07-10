@@ -39,6 +39,9 @@ static bool dx12_dims_fit_u32(const ggml_tensor* t) {
 
 static bool dx12_mul_mat_is_fast2d(const ggml_tensor* dst);
 static bool dx12_dispatch_glu(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
+static bool dx12_dispatch_unary_impl(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst,
+                                     uint32_t op, float p0 = 0.0f, float p1 = 0.0f);
+static bool dx12_dispatch_pad(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
 
 bool dx12_op_supported(const ggml_tensor* node) {
     if (!node) return false;
@@ -77,20 +80,33 @@ bool dx12_op_supported(const ggml_tensor* node) {
         }
 
         case GGML_OP_SCALE:
-            if (dx12_op_disabled("scale")) return false;
-            return node->src[0] && node->src[0]->type == GGML_TYPE_F32 &&
-                   node->type == GGML_TYPE_F32 &&
-                   ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(node) &&
-                   (ggml_nelements(node) + 255) / 256 <= DX12_MAX_GROUPS;
-
         case GGML_OP_UNARY: {
-            if (dx12_op_disabled("unary")) return false;
-            const enum ggml_unary_op uop = ggml_get_unary_op(node);
-            if (uop != GGML_UNARY_OP_SILU && uop != GGML_UNARY_OP_GELU) return false;
-            return node->src[0] && node->src[0]->type == GGML_TYPE_F32 &&
-                   node->type == GGML_TYPE_F32 &&
-                   ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(node) &&
-                   (ggml_nelements(node) + 255) / 256 <= DX12_MAX_GROUPS;
+            if (node->op == GGML_OP_SCALE && dx12_op_disabled("scale")) return false;
+            if (node->op == GGML_OP_UNARY) {
+                if (dx12_op_disabled("unary")) return false;
+                const enum ggml_unary_op uop = ggml_get_unary_op(node);
+                if (uop != GGML_UNARY_OP_SILU && uop != GGML_UNARY_OP_GELU &&
+                    uop != GGML_UNARY_OP_TANH) return false;
+            }
+            const ggml_tensor* a = node->src[0];
+            if (!a || a->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32) return false;
+            if (!ggml_are_same_shape(a, node)) return false;
+            if ((node->ne[0] + 255) / 256 > DX12_MAX_GROUPS) return false;
+            if (node->ne[1] > DX12_MAX_GROUPS) return false;
+            if (node->ne[2] * node->ne[3] > DX12_MAX_GROUPS) return false;
+            return dx12_dims_fit_u32(a) && dx12_dims_fit_u32(node);
+        }
+
+        case GGML_OP_PAD: {
+            if (dx12_op_disabled("pad")) return false;
+            const ggml_tensor* a = node->src[0];
+            if (!a || a->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32) return false;
+            if (!ggml_is_contiguous(node)) return false;
+            if (((const int32_t*)node->op_params)[8] != 0) return false; // circular pad
+            if ((node->ne[0] + 255) / 256 > DX12_MAX_GROUPS) return false;
+            if (node->ne[1] > DX12_MAX_GROUPS) return false;
+            if (node->ne[2] * node->ne[3] > DX12_MAX_GROUPS) return false;
+            return dx12_dims_fit_u32(a) && dx12_dims_fit_u32(node);
         }
 
         case GGML_OP_GLU: {
@@ -157,7 +173,9 @@ bool dx12_op_supported(const ggml_tensor* node) {
             const ggml_tensor* ids = node->src[1];
             if (!a || !ids || node->type != GGML_TYPE_F32) return false;
             if (a->type != GGML_TYPE_F32 && a->type != GGML_TYPE_F16 &&
-                a->type != GGML_TYPE_Q8_0 && a->type != GGML_TYPE_Q4_0) return false;
+                a->type != GGML_TYPE_Q8_0 && a->type != GGML_TYPE_Q4_0 &&
+                a->type != GGML_TYPE_Q4_K && a->type != GGML_TYPE_Q5_K &&
+                a->type != GGML_TYPE_Q6_K) return false;
             if (ids->type != GGML_TYPE_I32) return false;
             if (a->ne[2] != 1 || a->ne[3] != 1) return false;
             if (ids->ne[1] != 1 || ids->ne[2] != 1) return false;
@@ -288,6 +306,7 @@ bool dx12_graph_compute(dx12_device* dev, dx12_command_list* cmd, ggml_cgraph* g
                 switch (ggml_get_unary_op(node)) {
                     case GGML_UNARY_OP_SILU: ok = dx12_dispatch_silu(dev, cmd, node); break;
                     case GGML_UNARY_OP_GELU: ok = dx12_dispatch_gelu(dev, cmd, node); break;
+                    case GGML_UNARY_OP_TANH: ok = dx12_dispatch_unary_impl(dev, cmd, node, 2); break;
                     default:
                         dx12_log(DX12_LOG_ERROR, "Unary op %s not implemented on DX12",
                                  ggml_unary_op_name(ggml_get_unary_op(node)));
@@ -295,6 +314,7 @@ bool dx12_graph_compute(dx12_device* dev, dx12_command_list* cmd, ggml_cgraph* g
                         break;
                 }
                 break;
+            case GGML_OP_PAD:           ok = dx12_dispatch_pad(dev, cmd, node); break;
             case GGML_OP_GLU:           ok = dx12_dispatch_glu(dev, cmd, node); break;
             case GGML_OP_RMS_NORM:      ok = dx12_dispatch_rms_norm(dev, cmd, node); break;
             case GGML_OP_SOFT_MAX:      ok = dx12_dispatch_soft_max(dev, cmd, node); break;
@@ -444,7 +464,9 @@ static bool dx12_mul_mat_is_fast2d(const ggml_tensor* dst) {
     if (a->ne[2] != 1 || a->ne[3] != 1 || b->ne[2] != 1 || b->ne[3] != 1) return false;
     if (!ggml_is_contiguous(a) || !ggml_is_contiguous(b) || !ggml_is_contiguous(dst)) return false;
     return a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16 ||
-           a->type == GGML_TYPE_Q8_0 || a->type == GGML_TYPE_Q4_0;
+           a->type == GGML_TYPE_Q8_0 || a->type == GGML_TYPE_Q4_0 ||
+           a->type == GGML_TYPE_Q4_K || a->type == GGML_TYPE_Q5_K ||
+           a->type == GGML_TYPE_Q6_K;
 }
 
 // Strided/batched mul_mat (attention QK/V over KV cache views, permuted srcs)
@@ -499,12 +521,17 @@ bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor
     // Much better weight-read coalescing than the tiled kernel at M == 1.
     bool gemv = (M == 1) && ((N + 3) / 4 <= DX12_MAX_GROUPS);
 
+    // K-quants share one shader pair; the quant selector rides in the CBV pad
+    uint32_t kq_type = 0;
     const char* shader_name = nullptr;
     switch (a->type) {
         case GGML_TYPE_F32:  shader_name = gemv ? "mv_f32"  : "mm_f32";  break;
         case GGML_TYPE_F16:  shader_name = gemv ? "mv_f16"  : "mm_f16";  break;
         case GGML_TYPE_Q8_0: shader_name = gemv ? "mv_q8_0" : "mm_q8_0"; break;
         case GGML_TYPE_Q4_0: shader_name = gemv ? "mv_q4_0" : "mm_q4_0"; break;
+        case GGML_TYPE_Q4_K: shader_name = gemv ? "mv_kq" : "mm_kq"; kq_type = 4; break;
+        case GGML_TYPE_Q5_K: shader_name = gemv ? "mv_kq" : "mm_kq"; kq_type = 5; break;
+        case GGML_TYPE_Q6_K: shader_name = gemv ? "mv_kq" : "mm_kq"; kq_type = 6; break;
         default:
             dx12_log(DX12_LOG_ERROR, "MUL_MAT: unsupported weight type %s", ggml_type_name(a->type));
             return false;
@@ -526,18 +553,9 @@ bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor
     if (buf_a != buf_c) dx12_buffer_transition(cmd, buf_a, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     if (buf_b != buf_c && buf_b != buf_a) dx12_buffer_transition(cmd, buf_b, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
-    struct { uint32_t M, N, K, pad; } params = { M, N, K, 0 };
-
     struct dx12_shader_dispatch dispatch{};
     dispatch.shader_name = shader_name;
     dispatch.sig_type = dx12_root_signature_type::mm;
-    if (gemv) {
-        dispatch.dispatch_x = (N + 3) / 4; // 4 rows per 256-thread group
-        dispatch.dispatch_y = 1;
-    } else {
-        dispatch.dispatch_x = (N + 15) / 16;
-        dispatch.dispatch_y = (M + 15) / 16;
-    }
     dispatch.dispatch_z = 1;
     // Explicit per-tensor VAs: a/b/dst may share one dx12_buffer, so the
     // shared gpu_address field cannot represent all three at once.
@@ -552,26 +570,96 @@ bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor
 
     dx12_buffer* srvs[2] = { buf_a, buf_b };
 
-    return dx12_shader_dispatch(dev, cmd, dispatch, &params, sizeof(params), srvs, 2, buf_c);
+    if (gemv) {
+        struct { uint32_t M, N, K, qtype; } params = { M, N, K, kq_type };
+        dispatch.dispatch_x = (N + 3) / 4; // 4 rows per 256-thread group
+        dispatch.dispatch_y = 1;
+        return dx12_shader_dispatch(dev, cmd, dispatch, &params, sizeof(params), srvs, 2, buf_c);
+    }
+
+    // Prefill: one dispatch cannot be preempted, so a large M*N*K (K-quant 7B
+    // prefill is ~35G MACs) exceeds the ~2s TDR. Chunk along M into separate
+    // dispatches; chunks write disjoint C rows, so no barrier is needed
+    // between them.
+    const uint64_t max_macs = kq_type ? 500ull * 1000 * 1000 : 2000ull * 1000 * 1000;
+    uint32_t m_chunk = M;
+    uint64_t macs = (uint64_t)M * N * K;
+    if (macs > max_macs) {
+        m_chunk = (uint32_t)(max_macs / ((uint64_t)N * K));
+        if (m_chunk == 0) m_chunk = 1;
+    }
+
+    D3D12_GPU_VIRTUAL_ADDRESS b_base = dispatch.srv_addr[1];
+    D3D12_GPU_VIRTUAL_ADDRESS c_base = dispatch.uav_addr;
+    for (uint32_t m0 = 0; m0 < M; m0 += m_chunk) {
+        uint32_t mc = (m0 + m_chunk <= M) ? m_chunk : (M - m0);
+        struct { uint32_t M, N, K, qtype; } params = { mc, N, K, kq_type };
+        dispatch.srv_addr[1] = b_base + (uint64_t)m0 * K * 4;   // B rows are K f32
+        dispatch.uav_addr    = c_base + (uint64_t)m0 * N * 4;   // C rows are N f32
+        dispatch.dispatch_x = (N + 15) / 16;
+        dispatch.dispatch_y = (mc + 15) / 16;
+        if (!dx12_shader_dispatch(dev, cmd, dispatch, &params, sizeof(params), srvs, 2, buf_c)) {
+            return false;
+        }
+    }
+    return true;
 }
 
-// SCALE: dst = src * scale + bias (contiguous F32)
+// Strided unary/scale: op 0 = silu, 1 = gelu, 2 = tanh, 3 = x*p0 + p1
+static bool dx12_dispatch_unary_impl(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst,
+                                     uint32_t op, float p0, float p1) {
+    const ggml_tensor* a = dst->src[0];
+
+    struct {
+        uint32_t ne0, ne1, ne2, ne3;
+        uint32_t snb0, snb1, snb2, snb3;
+        uint32_t dnb0, dnb1, dnb2, dnb3;
+        uint32_t op; float p0, p1; uint32_t pad;
+    } p{};
+    p.ne0 = (uint32_t)dst->ne[0]; p.ne1 = (uint32_t)dst->ne[1];
+    p.ne2 = (uint32_t)dst->ne[2]; p.ne3 = (uint32_t)dst->ne[3];
+    p.snb0 = (uint32_t)a->nb[0]; p.snb1 = (uint32_t)a->nb[1];
+    p.snb2 = (uint32_t)a->nb[2]; p.snb3 = (uint32_t)a->nb[3];
+    p.dnb0 = (uint32_t)dst->nb[0]; p.dnb1 = (uint32_t)dst->nb[1];
+    p.dnb2 = (uint32_t)dst->nb[2]; p.dnb3 = (uint32_t)dst->nb[3];
+    p.op = op; p.p0 = p0; p.p1 = p1;
+
+    return dx12_run_mm(dev, cmd, "ew_unary", &p, sizeof(p),
+                       a, nullptr, nullptr, dst,
+                       (p.ne0 + 255) / 256, p.ne1, p.ne2 * p.ne3);
+}
+
+// SCALE: dst = src * scale + bias (F32, arbitrary strides)
 bool dx12_dispatch_scale(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
-    uint32_t n = tensor_nelements(dst);
     float scale, bias;
     memcpy(&scale, (const char*)dst->op_params + 0, sizeof(float));
     memcpy(&bias,  (const char*)dst->op_params + 4, sizeof(float));
-
-    struct { uint32_t n; float scale; float bias; uint32_t pad; } p = { n, scale, bias, 0 };
-    return dx12_run_mm(dev, cmd, "ew_scale", &p, sizeof(p),
-                       dst->src[0], nullptr, nullptr, dst, (n + 255) / 256, 1, 1);
+    return dx12_dispatch_unary_impl(dev, cmd, dst, 3, scale, bias);
 }
 
-static bool dx12_dispatch_unary_impl(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst, uint32_t op) {
-    uint32_t n = tensor_nelements(dst);
-    struct { uint32_t n; uint32_t op; uint32_t pad[2]; } p = { n, op, {0, 0} };
-    return dx12_run_mm(dev, cmd, "ew_unary", &p, sizeof(p),
-                       dst->src[0], nullptr, nullptr, dst, (n + 255) / 256, 1, 1);
+// PAD (non-circular): F32 strided src -> F32 contiguous dst
+static bool dx12_dispatch_pad(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
+    const ggml_tensor* a = dst->src[0];
+    const int32_t* op = (const int32_t*)dst->op_params;
+
+    struct {
+        uint32_t ne0, ne1, ne2, ne3;
+        uint32_t lp0, lp1, lp2, lp3;
+        uint32_t ne00, ne01, ne02, ne03;
+        uint32_t nb00, nb01, nb02, nb03;
+    } p{};
+    p.ne0 = (uint32_t)dst->ne[0]; p.ne1 = (uint32_t)dst->ne[1];
+    p.ne2 = (uint32_t)dst->ne[2]; p.ne3 = (uint32_t)dst->ne[3];
+    p.lp0 = (uint32_t)op[0]; p.lp1 = (uint32_t)op[2];
+    p.lp2 = (uint32_t)op[4]; p.lp3 = (uint32_t)op[6];
+    p.ne00 = (uint32_t)a->ne[0]; p.ne01 = (uint32_t)a->ne[1];
+    p.ne02 = (uint32_t)a->ne[2]; p.ne03 = (uint32_t)a->ne[3];
+    p.nb00 = (uint32_t)a->nb[0]; p.nb01 = (uint32_t)a->nb[1];
+    p.nb02 = (uint32_t)a->nb[2]; p.nb03 = (uint32_t)a->nb[3];
+
+    return dx12_run_mm(dev, cmd, "pad_f32", &p, sizeof(p),
+                       a, nullptr, nullptr, dst,
+                       (p.ne0 + 255) / 256, p.ne1, p.ne2 * p.ne3);
 }
 
 // SILU activation (contiguous F32)
@@ -754,6 +842,9 @@ bool dx12_dispatch_get_rows(dx12_device* dev, dx12_command_list* cmd, ggml_tenso
         case GGML_TYPE_F16:  src_type = 1; break;
         case GGML_TYPE_Q8_0: src_type = 2; break;
         case GGML_TYPE_Q4_0: src_type = 3; break;
+        case GGML_TYPE_Q4_K: src_type = 4; break;
+        case GGML_TYPE_Q5_K: src_type = 5; break;
+        case GGML_TYPE_Q6_K: src_type = 6; break;
         default:
             dx12_log(DX12_LOG_ERROR, "GET_ROWS: unsupported src type %s", ggml_type_name(a->type));
             return false;

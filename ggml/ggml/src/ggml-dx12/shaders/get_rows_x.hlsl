@@ -1,17 +1,20 @@
 /*
  * get_rows_x.hlsl
- * PURPOSE: ggml GET_ROWS, 2D src0 in {F32, F16, Q8_0, Q4_0}, I32 ids -> F32 dst
+ * PURPOSE: ggml GET_ROWS, 2D src0 in {F32, F16, Q8_0, Q4_0, Q4_K, Q5_K, Q6_K},
+ * I32 ids -> F32 dst
  *
  * dst[:, r] = dequant(src0[:, ids[r]])
  * Dispatch: x = ceil(ne00/256), y = n_rows(ids).
  */
+
+#include "kquants.hlsli"
 
 struct GetRowsParams {
     uint ne00;      // row length (elements)
     uint nb01;      // src0 row byte stride
     uint nb10;      // ids element byte stride
     uint dnb1;      // dst row byte stride
-    uint src_type;  // 0=f32, 1=f16, 2=q8_0, 3=q4_0
+    uint src_type;  // 0=f32, 1=f16, 2=q8_0, 3=q4_0, 4=q4_K, 5=q5_K, 6=q6_K
     uint pad[3];
 };
 
@@ -28,6 +31,9 @@ float load_elem(uint row_base, uint e) {
         uint addr = row_base + e * 2;
         uint w = A.Load(addr & ~3u);
         return f16tof32((addr & 2u) ? (w >> 16) : w);
+    }
+    if (p.src_type >= 4) {
+        return dequant_kq(A, p.src_type, row_base, e);
     }
     uint blk = e >> 5;
     uint j = e & 31u;
