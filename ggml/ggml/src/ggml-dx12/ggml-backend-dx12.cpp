@@ -307,7 +307,10 @@ static size_t dx12_buft_get_alignment(ggml_backend_buffer_type_t buft) {
 
 static size_t dx12_buft_get_max_size(ggml_backend_buffer_type_t buft) {
     (void)buft;
-    return SIZE_MAX;
+    // Shaders address buffers with 32-bit byte offsets and large committed
+    // resources fail on this driver (a single 4GB weight buffer device-removes).
+    // ggml-alloc splits allocations across multiple buffers at this size.
+    return 1024ull * 1024 * 1024;
 }
 
 static size_t dx12_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor* tensor) {
@@ -447,6 +450,15 @@ static void dx12_buf_set_tensor(ggml_backend_buffer_t buf, ggml_tensor* tensor,
     auto& batch = g_upload_batches[ctx->device];
     if (!batch.dev) {
         batch.dev = ctx->device;
+    }
+
+    // Cap staging growth: flush the batch instead of growing past 256MB
+    // (unbounded doubling ends at a multi-GB committed resource, which fails
+    // and wedges the device). A single tensor larger than the cap still gets
+    // a staging buffer of its own size below.
+    static const size_t UPLOAD_BATCH_MAX = 256ull * 1024 * 1024;
+    if (batch.used > 0 && batch.used + size > UPLOAD_BATCH_MAX) {
+        batch.flush();
     }
 
     // Ensure staging buffer has room

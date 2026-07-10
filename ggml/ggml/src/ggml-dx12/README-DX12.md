@@ -99,7 +99,9 @@ Op coverage (each verified via `test-backend-ops` before being claimed in
 
 | Op | Shader | Notes |
 |---|---|---|
-| MUL_MAT (weights) | `mm_f32/f16/q8_0/q4_0`, `mv_*` | 2D contiguous; `mv_*` GEMV path for single-token decode (4 rows/group, 64-lane K split) |
+| MUL_MAT (weights) | `mm_*`, `mv_*`, `mm_kq`, `mv_kq` | 2D contiguous F32/F16/Q8_0/Q4_0/Q4_K/Q5_K/Q6_K; GEMV path for single-token decode; large prefill chunked along M (TDR guard) |
+| PAD | `pad_f32` | non-circular |
+| TANH / strided SCALE | `ew_unary` | gemma softcapping |
 | MUL_MAT (attention) | `mms_f32/f16` | Strided + batched (KV-cache views, permutes, GQA broadcast) |
 | ADD / MUL | `ew_bin` | F32, src1 broadcast, arbitrary strides |
 | SCALE | `ew_scale` | scale + bias from op_params |
@@ -163,6 +165,26 @@ those weight tensors are placed in CPU buffers automatically by llama.cpp), MoE 
 | MUL_MAT-only offload | 4.3 | 44 | ~500 CPU<->GPU syncs/token |
 | Full graph on GPU | 28 | 271 | naive per-output-element matmul |
 | + GEMV decode kernels | **~90** | **~290** | kernel efficiency (headroom to ~400 t/s) |
+
+### Tested models (RX 9070 XT, `-ngl 99 -fa off`)
+
+| Model | Arch | Result |
+|---|---|---|
+| Llama-3.2-1B-Instruct Q8_0 | llama | llama-bench pp512 376 t/s, tg128 110 t/s; greedy output token-identical to CPU |
+| Llama-3-8B Q8_0 (8.5 GB) | llama | ~40 t/s decode |
+| Qwen2.5-Coder-3B Q8_0 | qwen2 | ~62 t/s decode |
+| Qwen3-4B Q8_0 | qwen3 | ~55 t/s decode |
+| Qwen2.5-Coder-7B Q4_K_M | qwen2 | tg64 25 t/s, pp128 22 t/s (K-quant kernels; prefill kernel still scalar) |
+| gemma4 toolcall Q8_0 | gemma4 | ~32 t/s decode, greedy identical to CPU |
+| gemma-4 E4B Q4_0 | gemma4 PLE | ~16 t/s decode |
+
+**Gemma note:** use `-no-cnv` with `llama-completion` — its conversation mode stalls on
+the gemma chat template (a llama-completion issue, not a backend one). `llama-server`
+is unaffected.
+
+K-quants (Q4_K / Q5_K / Q6_K) run on GPU via `mv_kq`/`mm_kq` (dequant ported bit-exact
+from ggml-quants.c). Large prefill matmuls are chunked along M so no single dispatch
+can exceed the ~2s TDR window.
 
 Remaining perf work: shared-memory tiled prefill GEMM, wave-intrinsic reductions,
 FLASH_ATTN_EXT kernel, K-quant matmul kernels, quantized KV cache.

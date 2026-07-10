@@ -144,10 +144,13 @@ set(DX12_SHADERS
     mv_f16
     mv_q8_0
     mv_q4_0
+    mv_kq
+    mm_kq
     ew_bin
     ew_scale
     ew_unary
     ew_glu
+    pad_f32
     rms_norm_row
     soft_max_row
     get_rows_x
@@ -200,7 +203,7 @@ foreach(SHADER_NAME ${DX12_SHADERS})
             -I "E:/DXllama/dxc/inc/hlsl"
             -Fo ${CSO_FILE}
             ${HLSL_FILE}
-        DEPENDS ${HLSL_FILE} ${DX12_SHADER_DIR}/common.hlsli
+        DEPENDS ${HLSL_FILE} ${DX12_SHADER_DIR}/common.hlsli ${DX12_SHADER_DIR}/kquants.hlsli
         COMMENT "Compiling ${SHADER_NAME}.hlsl -> ${SHADER_NAME}.cso"
         VERBATIM
     )
