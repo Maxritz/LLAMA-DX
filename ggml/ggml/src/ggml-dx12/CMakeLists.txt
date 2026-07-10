@@ -46,6 +46,7 @@ set(DX12_SOURCES
     dx12_device.cpp
     dx12_buffer.cpp
     dx12_command.cpp
+    dx12_ring.cpp
     dx12_descriptor.cpp
     dx12_shader.cpp
     dx12_quantize.cpp
@@ -60,6 +61,7 @@ set(DX12_HEADERS
     dx12_device.h
     dx12_buffer.h
     dx12_command.h
+    dx12_ring.h
     dx12_descriptor.h
     dx12_shader.h
     dx12_quantize.h
