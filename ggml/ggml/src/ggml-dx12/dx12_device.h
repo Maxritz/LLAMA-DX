@@ -61,15 +61,20 @@ struct dx12_device {
     ComPtr<IDXGIAdapter4>           adapter;
     ComPtr<ID3D12Device10>          device;
     ComPtr<ID3D12CommandQueue>      command_queue;
+    ComPtr<ID3D12CommandQueue>      copy_queue;       // separate queue for async DMA uploads
     ComPtr<ID3D12Fence>             fence;
+    ComPtr<ID3D12Fence>             copy_fence;       // fence for copy queue synchronization
     HANDLE                          fence_event = nullptr;
+    HANDLE                          copy_fence_event = nullptr;
     std::atomic<uint64_t>           fence_value{0};
+    std::atomic<uint64_t>           copy_fence_value{0};
 
     // Feature detection
     dx12_device_caps                caps{};
     D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
     D3D12_FEATURE_DATA_D3D12_OPTIONS1 options1{};
     D3D12_FEATURE_DATA_D3D12_OPTIONS4 options4{};
+    D3D12_FEATURE_DATA_D3D12_OPTIONS9 options9{};
     D3D12_FEATURE_DATA_LINEAR_ALGEBRA_SUPPORT linalg_support{};
 
     // Adapter info

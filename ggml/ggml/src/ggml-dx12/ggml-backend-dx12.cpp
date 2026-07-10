@@ -152,7 +152,6 @@ struct dx12_upload_batch {
         if (capacity >= needed) return;
         size_t new_cap = capacity ? capacity * 2 : 64 * 1024 * 1024;
         while (new_cap < needed) new_cap *= 2;
-        // Flush pending command list before destroying staging buffer it references
         flush();
         if (staging) dx12_buffer_destroy(staging);
         staging = dx12_buffer_create(dev, new_cap, dx12_heap_type::upload);
@@ -676,7 +675,7 @@ static ggml_backend_buffer_type_t ggml_backend_dx12_get_default_buffer_type(
 // entries must stay null so ggml falls back to the synchronous buffer iface;
 // a no-op stub here silently drops scheduler input/output copies.
 
-static void ggml_backend_dx12_synchronize(ggml_backend_t backend) {
+void ggml_backend_dx12_synchronize(ggml_backend_t backend) {
     auto* ctx = (ggml_backend_dx12_context*)backend->context;
     if (!ctx || !ctx->device) return;
 

@@ -6,6 +6,7 @@
 
 #include "ggml-backend-dx12.h"
 #include <cstdio>
+#include <cstring>
 
 static int g_passed=0,g_failed=0;
 #define TEST(n) void test_##n()
@@ -13,8 +14,10 @@ static int g_passed=0,g_failed=0;
 #define ASSERT(c) do{if(!(c)){printf("FAIL\n  -> %s\n",#c);g_failed++;return;}}while(0)
 #define PASS() do{printf("PASS\n");g_passed++;}while(0)
 
+extern "C" void ggml_backend_free(struct ggml_backend* backend);
+
 TEST(backend_init) {
-    ggml_backend_t backend = ggml_backend_dx12_init(-1);
+    struct ggml_backend* backend = ggml_backend_dx12_init(-1);
     ASSERT(backend != nullptr);
     printf("(backend=%s)", ggml_backend_dx12_version_string());
     ggml_backend_free(backend);
@@ -22,7 +25,7 @@ TEST(backend_init) {
 }
 
 TEST(device_caps_query) {
-    ggml_backend_t backend = ggml_backend_dx12_init(-1);
+    struct ggml_backend* backend = ggml_backend_dx12_init(-1);
     ASSERT(backend != nullptr);
     dx12_device_caps caps;
     bool ok = ggml_backend_dx12_get_device_caps(backend, &caps);
@@ -36,7 +39,7 @@ TEST(device_caps_query) {
 }
 
 TEST(vram_tracking) {
-    ggml_backend_t backend = ggml_backend_dx12_init(-1);
+    struct ggml_backend* backend = ggml_backend_dx12_init(-1);
     ASSERT(backend != nullptr);
     uint64_t total=0, used=0, model=0, kv=0;
     ggml_backend_dx12_get_vram_usage(backend, &total, &used, &model, &kv);
@@ -47,7 +50,7 @@ TEST(vram_tracking) {
 }
 
 TEST(synchronize) {
-    ggml_backend_t backend = ggml_backend_dx12_init(-1);
+    struct ggml_backend* backend = ggml_backend_dx12_init(-1);
     ASSERT(backend != nullptr);
     ggml_backend_dx12_synchronize(backend);
     ggml_backend_free(backend);

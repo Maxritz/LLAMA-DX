@@ -20,7 +20,7 @@ message(STATUS "Using Agility SDK from: ${AGILITY_SDK_DIR}")
 # DXC Compiler Detection
 # ═══════════════════════════════════════════════════════════════════════════════
 # DXC can come from: (1) Windows SDK, (2) Agility SDK, (3) Standalone
-set(DXC_EXECUTABLE "E:/DXllama/dxc/bin/x64/dxc.exe" CACHE FILEPATH "DXC compiler")
+set(DXC_EXECUTABLE "E:/DXllama/dxc-1.10.2605.2/bin/x64/dxc.exe" CACHE FILEPATH "DXC compiler" FORCE)
 
 if(NOT DXC_EXECUTABLE)
     message(FATAL_ERROR "dxc.exe not found. Install Windows SDK 22621+ or DXC standalone.")
@@ -98,7 +98,6 @@ option(DX12_FORCE_COMPUTE_LIST "Use D3D12_COMMAND_LIST_TYPE_COMPUTE instead of D
 target_compile_definitions(ggml-backend-dx12
     PRIVATE
         DX12_AGILITY_SDK_VERSION=${DX12_AGILITY_SDK_VERSION}
-        DX12_SYSTEM_D3D12
         $<$<CONFIG:Debug>:DX12_DEBUG_LAYER>
         $<$<CONFIG:Debug>:DX12_GPU_VALIDATION>
         $<IF:$<BOOL:${DX12_FORCE_COMPUTE_LIST}>,DX12_FORCE_COMPUTE_LIST,>
@@ -135,7 +134,9 @@ set(DX12_SHADERS
     mul_mat_batched
     mul_mat_strided
     mm_f32
+    mm_f32_tiled
     mm_f16
+    mm_f16_tiled
     mm_q8_0
     mm_q4_0
     mms_f32
@@ -157,14 +158,13 @@ set(DX12_SHADERS
     cpy_gen
     rope_f32
     set_rows_gen
-    # DXLA GEMM/attention shaders excluded — need SM 6.10 (dx::linalg
-    # cooperative matrix), but the DXLA dispatch path is disabled
-    # (dx12_gemm.cpp / dx12_device.cpp), so these were unreachable dead
-    # weight forcing every shader to require D3D12EnableExperimentalFeatures.
-    # Re-add (and switch cs_6_6 below back to cs_6_10 + re-enable experimental
-    # features in dx12_device.cpp) if DXLA is ever revisited:
-    #   mul_mat_dxla_wave_f16_f16, mul_mat_dxla_wave_q4_0_f16,
-    #   mul_mat_dxla_tg_f16_f16, attn_qk_dxla, attn_ov_dxla
+    # DXLA shaders — SM 6.10 (dx::linalg cooperative matrix)
+    # Compiled separately with cs_6_10 target below
+    mul_mat_dxla_wave_f16_f16
+    mul_mat_dxla_wave_q4_0_f16
+    mul_mat_dxla_tg_f16_f16
+    attn_qk_dxla
+    attn_ov_dxla
     soft_max
     silu
     gelu
@@ -176,6 +176,7 @@ set(DX12_SHADERS
     rope
     diag_mask_inf
     flash_attn
+    mm_fused_act
     ffn_fused
     set_rows
 )
@@ -184,6 +185,17 @@ set(DX12_SHADERS
 set(DX12_CSO_FILES "")
 set(DX12_SHADER_NAMES "")
 set(DX12_CSO_ARRAYS "")
+
+# DXLA shaders require SM 6.10 for dx::linalg cooperative matrix
+set(DX12_SHADERS_DXLA
+    mul_mat_dxla_wave_f16_f16
+    mul_mat_dxla_wave_q4_0_f16
+    mul_mat_dxla_tg_f16_f16
+    attn_qk_dxla
+    attn_ov_dxla
+)
+# Remove DXLA shaders from main list (they get special compile rules)
+list(REMOVE_ITEM DX12_SHADERS ${DX12_SHADERS_DXLA})
 
 foreach(SHADER_NAME ${DX12_SHADERS})
     set(HLSL_FILE ${DX12_SHADER_DIR}/${SHADER_NAME}.hlsl)
@@ -200,7 +212,7 @@ foreach(SHADER_NAME ${DX12_SHADERS})
             -Qembed_debug
             -HV 2021
             -I "${DX12_SHADER_DIR}"
-            -I "E:/DXllama/dxc/inc/hlsl"
+            -I "E:/DXllama/dxc-1.10.2605.2/inc/hlsl"
             -Fo ${CSO_FILE}
             ${HLSL_FILE}
         DEPENDS ${HLSL_FILE} ${DX12_SHADER_DIR}/common.hlsli ${DX12_SHADER_DIR}/kquants.hlsli
@@ -211,6 +223,37 @@ foreach(SHADER_NAME ${DX12_SHADERS})
     list(APPEND DX12_CSO_FILES ${CSO_FILE})
     
     # Build C array name list
+    string(REPLACE "." "_" ARRAY_NAME "cso_${SHADER_NAME}")
+    list(APPEND DX12_CSO_ARRAYS "${ARRAY_NAME}")
+    list(APPEND DX12_SHADER_NAMES "${SHADER_NAME}")
+endforeach()
+
+# DXLA shaders: cs_6_10 for dx::linalg cooperative matrix support
+foreach(SHADER_NAME ${DX12_SHADERS_DXLA})
+    set(HLSL_FILE ${DX12_SHADER_DIR}/${SHADER_NAME}.hlsl)
+    set(CSO_FILE ${DX12_CSO_DIR}/${SHADER_NAME}.cso)
+    
+    add_custom_command(
+        OUTPUT ${CSO_FILE}
+        COMMAND ${DXC_EXECUTABLE}
+            -T cs_6_10
+            -E main
+            -enable-16bit-types
+            -O3
+            -Zi
+            -Qembed_debug
+            -HV 2021
+            -I "${DX12_SHADER_DIR}"
+            -I "E:/DXllama/dxc-1.10.2605.2/inc/hlsl"
+            -Fo ${CSO_FILE}
+            ${HLSL_FILE}
+        DEPENDS ${HLSL_FILE} ${DX12_SHADER_DIR}/common.hlsli ${DX12_SHADER_DIR}/kquants.hlsli
+        COMMENT "Compiling DXLA ${SHADER_NAME}.hlsl -> ${SHADER_NAME}.cso (cs_6_10)"
+        VERBATIM
+    )
+    
+    list(APPEND DX12_CSO_FILES ${CSO_FILE})
+    
     string(REPLACE "." "_" ARRAY_NAME "cso_${SHADER_NAME}")
     list(APPEND DX12_CSO_ARRAYS "${ARRAY_NAME}")
     list(APPEND DX12_SHADER_NAMES "${SHADER_NAME}")

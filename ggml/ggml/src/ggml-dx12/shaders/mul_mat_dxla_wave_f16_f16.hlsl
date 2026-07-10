@@ -36,7 +36,7 @@ void main(uint3 gid : SV_GroupID) {
             : (k * params.stride_b + tile_col) * 2;
 
         MatA a_tile = MatA::Load(matrix_a, a_offset, params.stride_a * 2, MatrixLayout::RowMajor);
-        MatB b_tile = MatB::Load(matrix_b, b_offset, params.stride_b * 2, params.transposed_b ? MatrixLayout::ColMajor : MatrixLayout::RowMajor);
+        MatB b_tile = MatB::Load(matrix_b, b_offset, params.stride_b * 2, MatrixLayout::RowMajor);
         acc.MultiplyAccumulate(a_tile, b_tile);
     }
 

@@ -42,18 +42,23 @@ dx12_command_list* dx12_cmd_list_create(dx12_device* dev) {
         return nullptr;
     }
 
-    hr = dev->device->CreateCommandList1(
+    // Use CreateCommandList (not CreateCommandList1) so the list is
+    // created in OPEN state with the allocator already bound.
+    // This avoids the need for separate Reset calls on a fresh allocator,
+    // which can return E_FAIL on some drivers (AMD RDNA4 + Agility SDK).
+    hr = dev->device->CreateCommandList(
         0,
         list_type,
-        D3D12_COMMAND_LIST_FLAG_NONE,
+        cmd->allocator.Get(),
+        nullptr,
         IID_PPV_ARGS(&cmd->d3d_list));
     if (FAILED(hr)) {
-        dx12_log(DX12_LOG_ERROR, "CreateCommandList1 failed: hr=0x%08X", hr);
+        dx12_log(DX12_LOG_ERROR, "CreateCommandList failed: hr=0x%08X", hr);
         delete cmd;
         return nullptr;
     }
 
-    cmd->is_recording = false;
+    cmd->is_recording = true;
     cmd->is_closed = false;
 
     return cmd;
@@ -72,6 +77,14 @@ void dx12_cmd_list_destroy(dx12_command_list* cmd) {
 
 bool dx12_cmd_list_reset(dx12_command_list* cmd) {
     if (!cmd || !cmd->allocator || !cmd->d3d_list) return false;
+
+    // Wait for GPU to finish before resetting allocator.
+    // allocator->Reset() fails with E_FAIL if the GPU is still executing
+    // commands recorded with this allocator (DX12 spec requirement).
+    if (cmd->fence_value > 0) {
+        dx12_device_wait_for_fence(cmd->device, cmd->fence_value);
+        cmd->fence_value = 0;
+    }
 
     HRESULT hr = cmd->allocator->Reset();
     if (FAILED(hr)) {

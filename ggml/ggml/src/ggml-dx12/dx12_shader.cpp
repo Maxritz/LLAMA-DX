@@ -87,17 +87,28 @@ bool dx12_shader_dispatch(dx12_device* dev,
         entry->cso_data, entry->cso_size,
         dispatch.sig_type,
         tg_size);
-
     if (!pso) return false;
 
     // Set PSO and root signature
     dx12_cmd_list_set_root_signature(cmd, pso->root_signature.Get());
     dx12_cmd_list_set_pso(cmd, pso->pipeline_state.Get());
 
-    // Bind constants (root param 0) - CBV via ring buffer
-    if (constants && constants_size > 0) {
+    // Bind constants (root param 0).
+    // All root parameters MUST be bound before Dispatch — leaving a root CBV
+    // unbound gives the GPU VA 0, which causes a GPU page fault (0xC0000005).
+    // When no constants are provided, bind a zero-filled CBV of minimum size.
+    static const uint32_t zero_cbv[64] = {}; // 256 bytes = min CBV allocation
+    if (dispatch.sig_type == dx12_root_signature_type::mm) {
+        if (constants && constants_size > 0) {
+            uint32_t num_constants = constants_size / 4;
+            cmd->d3d_list->SetComputeRoot32BitConstants(0, num_constants, constants, 0);
+        }
+        // mm type with no constants: root constants default to zero, no bind needed
+    } else {
+        const void* cbv_data = (constants && constants_size > 0) ? constants : zero_cbv;
+        uint32_t cbv_size = (constants && constants_size > 0) ? (uint32_t)constants_size : (uint32_t)sizeof(zero_cbv);
         D3D12_GPU_VIRTUAL_ADDRESS cbv_address =
-            dx12_device_allocate_cbv(dev, constants, constants_size);
+            dx12_device_allocate_cbv(dev, cbv_data, cbv_size);
         if (cbv_address) {
             cmd->d3d_list->SetComputeRootConstantBufferView(0, cbv_address);
         } else {

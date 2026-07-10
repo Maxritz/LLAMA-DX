@@ -142,13 +142,14 @@ static ComPtr<ID3D12RootSignature> dx12_build_root_signature(dx12_device* dev,
         }
 
         case dx12_root_signature_type::mm: {
-            // Param 0: CBV at b0 (MMParams)
-            CD3DX12_ROOT_PARAMETER1 cbv_param;
-            cbv_param.InitAsConstantBufferView(
-                0, 0,
-                D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+            // Param 0: root 32-bit constants — max 48 DWORDs to stay
+            // within 64-DWORD root sig limit (48 + 4*2 root UAVs = 56).
+            // Covers all shader CB sizes: GEMV=4, softmax~20, rope~30.
+            CD3DX12_ROOT_PARAMETER1 root_const;
+            root_const.InitAsConstants(
+                48, 0, 0,
                 D3D12_SHADER_VISIBILITY_ALL);
-            params.push_back(cbv_param);
+            params.push_back(root_const);
 
             // Params 1-4: root UAVs u0..u3. Sources bind at u0..u<n-1>, dst at
             // u<n> (n = source count). All buffers bound as UAVs: sources often

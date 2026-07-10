@@ -1,9 +1,10 @@
 /*
- * soft_max_row.hlsl
+ * soft_max_row.hlsl — wave-optimized
  * PURPOSE: ggml SOFT_MAX, F32, optional F16/F32 mask, max_bias == 0 (slope 1)
  *
- * dst[row,:] = softmax(src0[row,:] * scale + mask[i01, i02%ne12, i03%ne13])
- * One 256-thread group per row. Dispatch: x = ne01, y = ne02, z = ne03.
+ * Hybrid reduction: WaveActiveMax/WaveActiveSum within each wave,
+ * cross-wave reduction via shared memory. Uses WaveGetLaneCount()+WaveIsFirstLane()
+ * to be safe on both Wave32 (RDNA) and Wave64 (GCN).
  */
 
 struct SoftMaxParams {
@@ -19,9 +20,9 @@ struct SoftMaxParams {
 };
 
 ConstantBuffer<SoftMaxParams> p : register(b0);
-RWByteAddressBuffer A : register(u0); // src0
-RWByteAddressBuffer M : register(u1); // mask (or src0 again when has_mask == 0)
-RWByteAddressBuffer D : register(u2); // dst
+RWByteAddressBuffer A : register(u0);
+RWByteAddressBuffer M : register(u1);
+RWByteAddressBuffer D : register(u2);
 
 groupshared float sdata[256];
 
@@ -40,7 +41,10 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     uint dst_base  = gid.x * p.dnb1 + gid.y * p.dnb2 + gid.z * p.dnb3;
     uint mask_base = gid.x * p.mnb1 + (gid.y % p.mne2) * p.mnb2 + (gid.z % p.mne3) * p.mnb3;
 
-    // pass 1: max
+    uint wlc = WaveGetLaneCount();
+    uint num_waves = 256 / wlc;
+
+    // pass 1: max — 256-thread per-element max + wave reduce + cross-wave reduce
     float vmax = -3.402823466e38f;
     for (uint i = gtid.x; i < p.ne0; i += 256) {
         float x = asfloat(A.Load(src_base + i * 4)) * p.scale;
@@ -49,15 +53,18 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     }
     sdata[gtid.x] = vmax;
     GroupMemoryBarrierWithGroupSync();
-    [unroll]
-    for (uint s = 128; s > 0; s >>= 1) {
-        if (gtid.x < s) sdata[gtid.x] = max(sdata[gtid.x], sdata[gtid.x + s]);
-        GroupMemoryBarrierWithGroupSync();
-    }
-    float row_max = sdata[0];
+
+    float wave_max = WaveActiveMax(sdata[gtid.x]);
+    if (WaveIsFirstLane()) sdata[gtid.x / wlc] = wave_max;
     GroupMemoryBarrierWithGroupSync();
 
-    // pass 2: exp + sum (store exp into dst)
+    float row_max = (gtid.x < num_waves) ? sdata[gtid.x] : -3.402823466e38f;
+    if (gtid.x < num_waves) row_max = WaveActiveMax(row_max);
+    if (gtid.x == 0) sdata[0] = row_max;
+    GroupMemoryBarrierWithGroupSync();
+    row_max = sdata[0];
+
+    // pass 2: exp + sum — store exp into dst, wave reduce the sum
     float sum = 0.0f;
     for (uint j = gtid.x; j < p.ne0; j += 256) {
         float x = asfloat(A.Load(src_base + j * 4)) * p.scale;
@@ -68,11 +75,15 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     }
     sdata[gtid.x] = sum;
     GroupMemoryBarrierWithGroupSync();
-    [unroll]
-    for (uint s2 = 128; s2 > 0; s2 >>= 1) {
-        if (gtid.x < s2) sdata[gtid.x] += sdata[gtid.x + s2];
-        GroupMemoryBarrierWithGroupSync();
-    }
+
+    float wave_sum = WaveActiveSum(sdata[gtid.x]);
+    if (WaveIsFirstLane()) sdata[gtid.x / wlc] = wave_sum;
+    GroupMemoryBarrierWithGroupSync();
+
+    float fsum = (gtid.x < num_waves) ? sdata[gtid.x] : 0.0f;
+    if (gtid.x < num_waves) fsum = WaveActiveSum(fsum);
+    if (gtid.x == 0) sdata[0] = fsum;
+    GroupMemoryBarrierWithGroupSync();
     float inv_sum = 1.0f / sdata[0];
 
     // pass 3: normalize

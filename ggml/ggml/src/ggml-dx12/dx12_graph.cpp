@@ -12,6 +12,9 @@
 #include <ggml-impl.h>
 #include <cstring>
 
+// Forward declarations
+static bool dx12_dispatch_mul_mat_fused_act(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst, uint32_t act_op);
+
 static void apply_tensor_offset(dx12_buffer* buf, const ggml_tensor* t) {
     if (!buf || !t) return;
     D3D12_GPU_VIRTUAL_ADDRESS addr = dx12_backend_tensor_gpu_addr(t);
@@ -517,9 +520,53 @@ bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor
     uint32_t N = (uint32_t)a->ne[1];
     uint32_t M = (uint32_t)b->ne[1];
 
-    // Decode path (single token): GEMV kernel, one 64-lane reduction per row.
+    // Decode path (single token): GEMV kernel, Wave32-native reduction per row.
+    // 8 rows per 256-thread group (32 threads/row, WaveActiveSum in hardware).
     // Much better weight-read coalescing than the tiled kernel at M == 1.
-    bool gemv = (M == 1) && ((N + 3) / 4 <= DX12_MAX_GROUPS);
+    bool gemv = (M == 1) && ((N + 7) / 8 <= DX12_MAX_GROUPS);
+
+    // DXLA Wave path for F16 prefill (M > 1).
+    // GEMV (M == 1) stays on scalar mv_f16 — it's VRAM-bandwidth-bound,
+    // not compute-bound. DXLA wave's 16×16 tiles waste 15/16 lanes at M=1.
+    if (a->type == GGML_TYPE_F16 && dev->caps.dxla_wave && M > 1) {
+        dx12_buffer* buf_a = dx12_backend_buffer_from_tensor(a);
+        dx12_buffer* buf_b = dx12_backend_buffer_from_tensor(b);
+        dx12_buffer* buf_c = dx12_backend_buffer_from_tensor(dst);
+        if (!buf_a || !buf_b || !buf_c) return false;
+        dx12_gemm_params params{};
+        params.M = M;
+        params.N = N;
+        params.K = K;
+        params.quant_a = DX12_QUANT_F16;
+        params.quant_b = DX12_QUANT_F16;
+        params.alpha = 1.0f;
+        params.batch_count = 1;
+        params.transposed_b = false;
+        params.stride_a = K;
+        params.stride_b = K;
+        params.stride_c = N;
+        return dx12_gemm_dispatch_dxla_wave(dev, cmd, buf_a, buf_b, buf_c, &params);
+    }
+    // DXLA Wave path for Q4_0 prefill (M > 1)
+    else if (a->type == GGML_TYPE_Q4_0 && dev->caps.dxla_wave && M > 1) {
+        dx12_buffer* buf_a = dx12_backend_buffer_from_tensor(a);
+        dx12_buffer* buf_b = dx12_backend_buffer_from_tensor(b);
+        dx12_buffer* buf_c = dx12_backend_buffer_from_tensor(dst);
+        if (!buf_a || !buf_b || !buf_c) return false;
+        dx12_gemm_params params{};
+        params.M = M;
+        params.N = N;
+        params.K = K;
+        params.quant_a = DX12_QUANT_Q4_0;
+        params.quant_b = DX12_QUANT_F16;
+        params.alpha = 1.0f;
+        params.batch_count = 1;
+        params.transposed_b = false;
+        params.stride_a = K;
+        params.stride_b = K;
+        params.stride_c = N;
+        return dx12_gemm_dispatch_dxla_wave(dev, cmd, buf_a, buf_b, buf_c, &params);
+    }
 
     // K-quants share one shader pair; the quant selector rides in the CBV pad
     uint32_t kq_type = 0;
@@ -572,7 +619,7 @@ bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor
 
     if (gemv) {
         struct { uint32_t M, N, K, qtype; } params = { M, N, K, kq_type };
-        dispatch.dispatch_x = (N + 3) / 4; // 4 rows per 256-thread group
+        dispatch.dispatch_x = (N + 7) / 8; // 8 rows per 256-thread group (32 lanes/row)
         dispatch.dispatch_y = 1;
         return dx12_shader_dispatch(dev, cmd, dispatch, &params, sizeof(params), srvs, 2, buf_c);
     }
@@ -598,6 +645,66 @@ bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor
         dispatch.uav_addr    = c_base + (uint64_t)m0 * N * 4;   // C rows are N f32
         dispatch.dispatch_x = (N + 15) / 16;
         dispatch.dispatch_y = (mc + 15) / 16;
+        if (!dx12_shader_dispatch(dev, cmd, dispatch, &params, sizeof(params), srvs, 2, buf_c)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Fused matmul+activation: dispatches mm_fused_act (tiled GEMM with act applied at store time).
+// Eliminates the separate UNARY dispatch + barrier for FFN matmul->SiLU/GELU chains.
+// Only fuses F16 weight prefill (M > 1). Falls through to dx12_dispatch_mul_mat otherwise.
+static bool dx12_dispatch_mul_mat_fused_act(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst, uint32_t act_op) {
+    ggml_tensor* a = dst->src[0];
+    ggml_tensor* b = dst->src[1];
+
+    if (!dx12_mul_mat_is_fast2d(dst) || a->type != GGML_TYPE_F16) return false;
+
+    uint32_t K = (uint32_t)a->ne[0];
+    uint32_t N = (uint32_t)a->ne[1];
+    uint32_t M = (uint32_t)b->ne[1];
+    if (M <= 1) return false;
+
+    dx12_buffer* buf_a = dx12_backend_buffer_from_tensor(a);
+    dx12_buffer* buf_b = dx12_backend_buffer_from_tensor(b);
+    dx12_buffer* buf_c = dx12_backend_buffer_from_tensor(dst);
+    if (!buf_a || !buf_b || !buf_c) return false;
+
+    dx12_buffer_transition(cmd, buf_c, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (buf_a != buf_c) dx12_buffer_transition(cmd, buf_a, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (buf_b != buf_c && buf_b != buf_a) dx12_buffer_transition(cmd, buf_b, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    struct dx12_shader_dispatch dispatch{};
+    dispatch.shader_name = "mm_fused_act";
+    dispatch.sig_type = dx12_root_signature_type::mm;
+    dispatch.dispatch_z = 1;
+    dispatch.srv_addr[0] = dx12_backend_tensor_gpu_addr(a);
+    dispatch.srv_addr[1] = dx12_backend_tensor_gpu_addr(b);
+    dispatch.uav_addr    = dx12_backend_tensor_gpu_addr(dst);
+    if (!dispatch.srv_addr[0] || !dispatch.srv_addr[1] || !dispatch.uav_addr) return false;
+
+    dx12_buffer* srvs[2] = { buf_a, buf_b };
+
+    const uint64_t max_macs = 2000ull * 1000 * 1000;
+    uint32_t m_chunk = M;
+    uint64_t macs = (uint64_t)M * N * K;
+    if (macs > max_macs) {
+        m_chunk = (uint32_t)(max_macs / ((uint64_t)N * K));
+        if (m_chunk == 0) m_chunk = 1;
+    }
+
+    D3D12_GPU_VIRTUAL_ADDRESS b_base = dispatch.srv_addr[1];
+    D3D12_GPU_VIRTUAL_ADDRESS c_base = dispatch.uav_addr;
+    uint32_t tile = 32;
+
+    for (uint32_t m0 = 0; m0 < M; m0 += m_chunk) {
+        uint32_t mc = (m0 + m_chunk <= M) ? m_chunk : (M - m0);
+        struct { uint32_t M, N, K, op; } params = { mc, N, K, act_op };
+        dispatch.srv_addr[1] = b_base + (uint64_t)m0 * K * 4;
+        dispatch.uav_addr    = c_base + (uint64_t)m0 * N * 4;
+        dispatch.dispatch_x = (N + tile - 1) / tile;
+        dispatch.dispatch_y = (mc + tile - 1) / tile;
         if (!dx12_shader_dispatch(dev, cmd, dispatch, &params, sizeof(params), srvs, 2, buf_c)) {
             return false;
         }

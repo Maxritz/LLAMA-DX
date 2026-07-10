@@ -25,27 +25,12 @@
 // Agility SDK Exports — Tells Windows to load D3D12Core.dll from our package
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// These are consumed by the Windows loader before D3D12CreateDevice is called
-// When built as DLL, exports work automatically.
-// When built as EXE, link with agility_exports.def or define DX12_SYSTEM_D3D12
-// and load agility_shim.dll before D3D12CreateDevice.
-#if !defined(DX12_SYSTEM_D3D12)
+// These exports tell the Windows loader to redirect D3D12 calls to the
+// D3D12Core.dll in our D3D12/ subdirectory instead of the system one.
+#pragma comment(linker, "/export:D3D12SDKVersion")
+#pragma comment(linker, "/export:D3D12SDKPath")
 extern "C" { __declspec(dllexport) extern const UINT D3D12SDKVersion = 721; }
 extern "C" { __declspec(dllexport) extern const char* D3D12SDKPath = ".\\D3D12\\"; }
-#elif defined(DX12_AGILITY_EXPORTS)
-extern "C" { extern const UINT D3D12SDKVersion = 721; }
-extern "C" { extern const char* D3D12SDKPath = ".\\D3D12\\"; }
-#else
-static HMODULE g_agility_shim = nullptr;
-
-static void dx12_load_agility_shim() {
-    if (g_agility_shim) return;
-    g_agility_shim = LoadLibraryA("agility_shim.dll");
-    if (g_agility_shim) {
-        dx12_log(DX12_LOG_INFO, "Loaded Agility SDK shim (agility_shim.dll)");
-    }
-}
-#endif
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Logging
@@ -329,15 +314,17 @@ void dx12_detect_device_caps(dx12_device* dev) {
     d->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS4,
                            &dev->options4, sizeof(dev->options4));
 
-    // --- DXLA disabled ---
-#if 0
+    // Options9: WaveMMA tier (RDNA3+ WMMA hardware)
+    d->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS9,
+                           &dev->options9, sizeof(dev->options9));
+
+    // --- DXLA detection ---
     // DX Linear Algebra - coarse tier check gates everything
     D3D12_FEATURE_DATA_LINEAR_ALGEBRA_SUPPORT linalg{};
     HRESULT hr_linalg = d->CheckFeatureSupport(D3D12_FEATURE_LINEAR_ALGEBRA_SUPPORT,
                                                 &linalg, sizeof(linalg));
     bool has_linalg = SUCCEEDED(hr_linalg) &&
                       linalg.LinearAlgebraTier >= D3D12_LINEAR_ALGEBRA_TIER_1_0;
-#endif
 
     // Fill caps structure
     dx12_device_caps& c = dev->caps;
@@ -351,8 +338,7 @@ void dx12_detect_device_caps(dx12_device* dev) {
     c.resource_heap_tier = dev->options.ResourceHeapTier;
     c.resource_binding_tier = dev->options.ResourceBindingTier;
 
-    // --- DXLA granular query disabled ---
-#if 0
+    // --- DXLA granular query ---
     // DXLA granular query - per-scope, per-operation
     if (has_linalg) {
         // Wave-scope matrix multiply — two-step query (step1: count, step2: shapes)
@@ -444,7 +430,6 @@ void dx12_detect_device_caps(dx12_device* dev) {
                        (c.vendor == DX12_VENDOR_NVIDIA);
         c.dxla_int4 = (c.vendor == DX12_VENDOR_NVIDIA);
     }
-#endif // DXLA disabled
 
     // GPU info from adapter desc
     wcstombs(c.adapter_name, dev->adapter_desc.Description, sizeof(c.adapter_name) - 1);
@@ -493,6 +478,8 @@ void dx12_detect_device_caps(dx12_device* dev) {
         c.wave_ops ? "YES" : "NO",
         c.wave_lane_count_min, c.wave_lane_count_max,
         c.native_16bit ? "YES" : "NO");
+    dx12_log(DX12_LOG_INFO, "Device caps: WaveMMATier=%d (0=not sup, 10=tier1.0)",
+        (int)dev->options9.WaveMMATier);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -503,17 +490,13 @@ dx12_result dx12_device_create(int32_t adapter_index, dx12_device** out_device) 
     if (!out_device) return DX12_ERROR_INVALID_ARGUMENT;
     *out_device = nullptr;
 
-    // --- SM 6.10 experimental features disabled ---
-    // Shaders now compile against the stable cs_6_6 profile (see
-    // shaders/compile_shaders.ps1); the DXLA shaders that actually needed SM
-    // 6.10 were dropped from the build since the DXLA dispatch path is dead
-    // code. Nothing left requires D3D12ExperimentalShaderModels, and it was
-    // confirmed (via matched before/after tests at an identical buft_alloc
-    // call) to correlate with GPU hangs during plain resource allocation on
-    // this preview RDNA4 driver. Re-add if DXLA shaders come back.
-#if 0
+    // --- SM 6.10 experimental features ---
+    // D3D12Core.dll is loaded before main() via D3D12SDKVersion export above.
+    // Required for dx::linalg cooperative matrix ops (Shader Model 6.10).
+    // Requires: Windows Developer Mode + Agility SDK 1.721+ + preview driver.
     static bool s_features_enabled = false;
     if (!s_features_enabled) {
+        _putenv_s("AMD_GPU_DEBUG_PREVIEW", "1");
         UUID experimental[] = { D3D12ExperimentalShaderModels };
         HRESULT hr_exp = D3D12EnableExperimentalFeatures(1, experimental, nullptr, nullptr);
         s_features_enabled = true;
@@ -523,7 +506,6 @@ dx12_result dx12_device_create(int32_t adapter_index, dx12_device** out_device) 
             dx12_log(DX12_LOG_WARN, "D3D12EnableExperimentalFeatures failed: 0x%08X", hr_exp);
         }
     }
-#endif
 
     // Enable debug layer in debug builds
 #ifdef DX12_DEBUG_LAYER
@@ -531,10 +513,6 @@ dx12_result dx12_device_create(int32_t adapter_index, dx12_device** out_device) 
 #ifdef DX12_GPU_VALIDATION
     dx12_enable_gpu_validation();
 #endif
-#endif
-
-#if defined(DX12_SYSTEM_D3D12) && !defined(DX12_AGILITY_EXPORTS)
-    dx12_load_agility_shim();
 #endif
 
     auto* dev = new dx12_device();
@@ -646,6 +624,11 @@ dx12_result dx12_device_create(int32_t adapter_index, dx12_device** out_device) 
         delete dev;
         return DX12_ERROR_DEVICE_LOST;
     }
+
+    // COPY queue deferred: AMD driver instability with dual queues.
+    // Re-enable once fence cross-queue sync is validated.
+    dev->copy_queue = nullptr;
+    dx12_log(DX12_LOG_INFO, "Copy queue: disabled (dual-queue TBD)");
 
     // Detect capabilities
     dx12_detect_device_caps(dev);
@@ -766,7 +749,13 @@ void dx12_device_destroy(dx12_device* dev) {
         CloseHandle(dev->fence_event);
         dev->fence_event = nullptr;
     }
+    if (dev->copy_fence_event) {
+        CloseHandle(dev->copy_fence_event);
+        dev->copy_fence_event = nullptr;
+    }
 
+    dev->copy_fence.Reset();
+    dev->copy_queue.Reset();
     dev->fence.Reset();
     dev->command_queue.Reset();
     dev->info_queue.Reset();

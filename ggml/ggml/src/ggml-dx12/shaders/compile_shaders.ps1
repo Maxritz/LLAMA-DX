@@ -116,7 +116,39 @@ $Shaders = @(
     # Misc
     @{Name="get_rows"; Threads=@{X=256;Y=1;Z=1}},
     @{Name="permute"; Threads=@{X=256;Y=1;Z=1}},
-    @{Name="copy"; Threads=@{X=256;Y=1;Z=1}}
+    @{Name="copy"; Threads=@{X=256;Y=1;Z=1}},
+    # Elementwise (dx12_graph dispatch)
+    @{Name="ew_bin"; Threads=@{X=256;Y=1;Z=1}},
+    @{Name="ew_unary"; Threads=@{X=256;Y=1;Z=1}},
+    @{Name="ew_glu"; Threads=@{X=256;Y=1;Z=1}},
+    @{Name="ew_scale"; Threads=@{X=256;Y=1;Z=1}},
+    # Normalization (dx12_graph dispatch)
+    @{Name="soft_max_row"; Threads=@{X=256;Y=1;Z=1}},
+    @{Name="rms_norm_row"; Threads=@{X=256;Y=1;Z=1}},
+    @{Name="rope_f32"; Threads=@{X=64;Y=1;Z=1}},
+    @{Name="pad_f32"; Threads=@{X=256;Y=1;Z=1}},
+    # Copy / scatter / gather (dx12_graph dispatch)
+    @{Name="cpy_gen"; Threads=@{X=256;Y=1;Z=1}},
+    @{Name="get_rows_x"; Threads=@{X=256;Y=1;Z=1}},
+    @{Name="set_rows_gen"; Threads=@{X=256;Y=1;Z=1}},
+    @{Name="set_rows"; Threads=@{X=256;Y=1;Z=1}},
+    @{Name="write_const"; Threads=@{X=256;Y=1;Z=1}},
+    # GEMV (Wave32-native, 8 rows × 32 lanes)
+    @{Name="mv_f32"; Threads=@{X=256;Y=1;Z=1}},
+    @{Name="mv_f16"; Threads=@{X=256;Y=1;Z=1}},
+    @{Name="mv_q8_0"; Threads=@{X=256;Y=1;Z=1}},
+    @{Name="mv_q4_0"; Threads=@{X=256;Y=1;Z=1}},
+    @{Name="mv_kq"; Threads=@{X=256;Y=1;Z=1}},
+    # GEMM (tile-based prefill, M>1)
+    @{Name="mm_f32"; Threads=@{X=16;Y=16;Z=1}},
+    @{Name="mm_f16"; Threads=@{X=16;Y=16;Z=1}},
+    @{Name="mm_q4_0"; Threads=@{X=16;Y=16;Z=1}},
+    @{Name="mm_q8_0"; Threads=@{X=16;Y=16;Z=1}},
+    @{Name="mm_kq"; Threads=@{X=16;Y=16;Z=1}},
+    @{Name="mm_fused_act"; Threads=@{X=32;Y=32;Z=1}},
+    # Strided mul_mat (attention QK/V)
+    @{Name="mms_f32"; Threads=@{X=16;Y=16;Z=1}},
+    @{Name="mms_f16"; Threads=@{X=16;Y=16;Z=1}}
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════

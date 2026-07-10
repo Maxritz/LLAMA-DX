@@ -5,6 +5,7 @@
  */
 
 #include "dx12_device.h"
+#include "dx12_buffer.h"
 #include <cstdio>
 
 static int g_passed=0,g_failed=0;
