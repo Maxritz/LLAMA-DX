@@ -7,6 +7,7 @@
 #include "dx12_graph.h"
 #include "dx12_shader.h"
 #include "dx12_gemm.h"
+#include "dx12_profiler.h"
 #include "dx12_quantize.h"
 #include "dx12_ring.h"
 #include "ggml-backend-dx12.h"
@@ -290,12 +291,8 @@ dx12_command_list* dx12_graph_compute_begin(dx12_device* dev) {
 void dx12_graph_compute_end(dx12_device* dev, dx12_command_list* cmd) {
     if (!dev || !cmd) return;
 
-    // Submit via ring buffer (non-blocking, just signals fence + advances head)
+    // Submit via ring buffer, then wait immediately for the GPU to complete.
     uint64_t fence = dx12_ring_submit(dev->ring);
-
-    // Wait for completion — the scheduler needs results before the next token.
-    // This is the blocking ~400µs cost. The ring saves the allocator
-    // create/destroy churn (~15µs) and enables future pipelining.
     if (fence > 0) {
         dx12_device_wait_for_fence(dev, fence);
     }
@@ -316,11 +313,20 @@ bool dx12_graph_compute(dx12_device* dev, dx12_command_list* cmd, ggml_cgraph* g
         return false;
     }
 
+    // Reset GPU timer for this sub-graph
+    if (dev->gpu_timer) dev->gpu_timer->reset();
+
     // Execute each node in topological order
     for (int i = 0; i < graph->n_nodes; i++) {
         ggml_tensor* node = graph->nodes[i];
         bool ok = false;
         bool dispatched = true;
+
+        bool record_timing = dev->gpu_timer &&
+            node->op != GGML_OP_VIEW && node->op != GGML_OP_RESHAPE &&
+            node->op != GGML_OP_PERMUTE && node->op != GGML_OP_TRANSPOSE &&
+            node->op != GGML_OP_NONE;
+        if (record_timing) dev->gpu_timer->begin(cmd, ggml_op_name(node->op));
 
         switch (node->op) {
             case GGML_OP_MUL_MAT:       ok = dx12_dispatch_mul_mat(dev, cmd, node); break;
@@ -365,6 +371,8 @@ bool dx12_graph_compute(dx12_device* dev, dx12_command_list* cmd, ggml_cgraph* g
                 break;
         }
 
+        if (record_timing) dev->gpu_timer->end(cmd);
+
         if (!ok) {
             dx12_log(DX12_LOG_ERROR, "Dispatch failed for op %s at node %d",
                 ggml_op_name(node->op), i);
@@ -376,6 +384,10 @@ bool dx12_graph_compute(dx12_device* dev, dx12_command_list* cmd, ggml_cgraph* g
         // across dispatches (dx12_buffer.cpp:243-244), and state-transition barriers
         // (UAV→SRV/COPY_DST) handle the rest. The old global UAV barrier was redundant.
     }
+
+    // Resolve GPU queries before submit (results are read after fence wait)
+    if (dev->gpu_timer) dev->gpu_timer->resolve(cmd);
+
     return true;
 }
 

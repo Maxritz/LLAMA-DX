@@ -49,6 +49,7 @@ constexpr uint64_t DX12_BUFFER_ALIGNMENT = 256;
 struct dx12_buffer;
 struct dx12_command_list;
 struct dx12_descriptor_heap;
+struct dx12_gpu_timer;
 struct dx12_pso;
 struct dx12_ring_context;
 
@@ -103,6 +104,13 @@ struct dx12_device {
 
     // Ring-buffer command submission (pre-allocated, fence-polling)
     dx12_ring_context*              ring = nullptr;
+
+    // GPU timestamp profiler (per-dispatch timing)
+    dx12_gpu_timer*                 gpu_timer = nullptr;
+
+    // Deferred staging buffers: upload buffers kept alive until GPU queue is idle,
+    // then destroyed. Prevents RDNA4 compute-queue driver crash (HOW-TO-FIX #10).
+    std::vector<dx12_buffer*>       pending_staging;
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════

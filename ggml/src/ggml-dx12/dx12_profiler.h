@@ -29,6 +29,10 @@ struct dx12_gpu_timer {
     void end(dx12_command_list* cmd);
     double get_time_ms(uint32_t query_idx);
     void resolve(dx12_command_list* cmd);
+    void dump_results();
+    void reset();
+
+    std::vector<std::string> query_names;
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════

@@ -49,9 +49,9 @@ bool dx12_gpu_timer::init(dx12_device* dev, uint32_t max_q) {
 }
 
 void dx12_gpu_timer::begin(dx12_command_list* cmd, const char* name) {
-    (void)name;
     if (!cmd || !cmd->d3d_list || current_query >= max_queries) return;
     cmd->d3d_list->EndQuery(query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, current_query * 2);
+    query_names.push_back(name ? name : "unknown");
 }
 
 void dx12_gpu_timer::end(dx12_command_list* cmd) {
@@ -78,6 +78,24 @@ double dx12_gpu_timer::get_time_ms(uint32_t query_idx) {
     uint64_t end = data[1];
     readback_buf->Unmap(0, nullptr);
     return (double)(end - begin) * gpu_freq_ms;
+}
+
+void dx12_gpu_timer::dump_results() {
+    if (current_query == 0) return;
+    dx12_log(DX12_LOG_INFO, "=== GPU Timings ===");
+    double total = 0.0;
+    for (uint32_t i = 0; i < current_query; i++) {
+        double ms = get_time_ms(i);
+        total += ms;
+        const char* name = i < query_names.size() ? query_names[i].c_str() : "?";
+        dx12_log(DX12_LOG_INFO, "  %s: %.3f ms", name, ms);
+    }
+    dx12_log(DX12_LOG_INFO, "--- TOTAL: %.3f ms ---", total);
+}
+
+void dx12_gpu_timer::reset() {
+    current_query = 0;
+    query_names.clear();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

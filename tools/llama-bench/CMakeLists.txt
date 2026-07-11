@@ -16,7 +16,7 @@ endif()
 
 set(TARGET llama-bench)
 
-add_executable(${TARGET} main.cpp)
+add_executable(${TARGET} main.cpp agility_shim.cpp)
 target_link_libraries(${TARGET} PRIVATE llama-bench-impl)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 

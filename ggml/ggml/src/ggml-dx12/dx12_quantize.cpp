@@ -163,8 +163,10 @@ bool dx12_upload_quantized_weights_async(dx12_device* dev,
     dx12_buffer_copy(cmd, gpu_buf, 0, upload, 0, size);
     dx12_buffer_transition(cmd, gpu_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
-    // NOTE: upload buffer must persist until GPU copy completes
-    // In production, use a ring buffer staging allocator
+    // Defer upload buffer destruction until GPU completes the copy
+    // (HOW-TO-FIX #10: RDNA4 compute queue crashes if staging is freed early)
+    dev->pending_staging.push_back(upload);
+
     *out_buffer = gpu_buf;
 
     (void)type;

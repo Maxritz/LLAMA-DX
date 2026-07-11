@@ -20,6 +20,7 @@
 #include "dx12_quantize.h"
 #include "dx12_gemm.h"
 #include "dx12_graph.h"
+#include "dx12_profiler.h"
 #include "dx12_ring.h"
 
 #include <ggml.h>
@@ -679,7 +680,8 @@ void ggml_backend_dx12_synchronize(ggml_backend_t backend) {
     // Flush any pending staging uploads before sync
     dx12_flush_uploads(ctx->device);
 
-    dx12_device_wait_idle(ctx->device);
+    // Wait for all in-flight ring submissions (no extra Signal needed)
+    dx12_ring_wait_idle(ctx->device->ring);
 }
 
 static bool dx12_check_device_health(dx12_device* dev) {
