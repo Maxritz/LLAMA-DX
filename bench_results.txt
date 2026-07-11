@@ -3,30 +3,41 @@
 ### Build: 9ce7bf7 (ring_wait_idle + GPU timer + DXLA wave MMA)
 ### Date: 2026-07-12
 
-### Command: llama-bench -b 512 -ngl 99 -p 128 -n 32
+### Command: llama-bench -b 512 -ngl 99 -p 128 -n 32 (rocmforge: -p 64 -n 16)
 
-| Model | Size | Params | Backend | Test | t/s |
-|---|---|---|---|---|---|
-| llama 1B Q8_0 | 1.22 GiB | 1.24 B | **DX12** | pp128 | **363.63** |
-| llama 1B Q8_0 | 1.22 GiB | 1.24 B | **Vulkan** | pp128 | **13802.99** |
-| llama 1B Q8_0 | 1.22 GiB | 1.24 B | **DX12** | tg32 | **90.88** |
-| llama 1B Q8_0 | 1.22 GiB | 1.24 B | **Vulkan** | tg32 | **336.99** |
-| qwen2 3B Q8_0 | 3.36 GiB | 3.40 B | **DX12** | pp128 | **126.56** |
-| qwen2 3B Q8_0 | 3.36 GiB | 3.40 B | **Vulkan** | pp128 | n/a |
-| qwen2 3B Q8_0 | 3.36 GiB | 3.40 B | **DX12** | tg32 | **52.26** |
-| qwen2 3B Q8_0 | 3.36 GiB | 3.40 B | **Vulkan** | tg32 | n/a |
-| qwen3 4B Q6_K | 3.07 GiB | 4.02 B | **DX12** | pp128 | **28.72** |
-| qwen3 4B Q6_K | 3.07 GiB | 4.02 B | **Vulkan** | pp128 | **3738.65** |
-| qwen3 4B Q6_K | 3.07 GiB | 4.02 B | **DX12** | tg32 | **25.14** |
-| qwen3 4B Q6_K | 3.07 GiB | 4.02 B | **Vulkan** | tg32 | **147.94** |
-| gemma4 E4B Q4_0 | 4.49 GiB | 7.52 B | **DX12** | pp128 | **630.76** |
-| gemma4 E4B Q4_0 | 4.49 GiB | 7.52 B | **Vulkan** | pp128 | **1167.65** |
-| gemma4 E4B Q4_0 | 4.49 GiB | 7.52 B | **DX12** | tg32 | n/a (TDR) |
-| gemma4 E4B Q4_0 | 4.49 GiB | 7.52 B | **Vulkan** | tg32 | **137.90** |
-| rocmforge 7B Q8_0 | 7.54 GiB | 7.62 B | **DX12** | pp64 | **20.42** |
-| rocmforge 7B Q8_0 | 7.54 GiB | 7.62 B | **Vulkan** | pp64 | **2188.82** |
-| rocmforge 7B Q8_0 | 7.54 GiB | 7.62 B | **DX12** | tg16 | **11.63** |
-| rocmforge 7B Q8_0 | 7.54 GiB | 7.62 B | **Vulkan** | tg16 | **71.08** |
+#### DX12 (ring_wait_idle)
+
+| Model | Size | Params | pp128 | tg32 |
+|---|---|---|---|---|
+| llama 1B Q8_0 | 1.22 GiB | 1.24 B | 363.63 | 90.88 |
+| qwen2 3B Q8_0 | 3.36 GiB | 3.40 B | 126.56 | 52.26 |
+| qwen3 4B Q6_K | 3.07 GiB | 4.02 B | 28.72 | 25.14 |
+| gemma4 E4B Q4_0 | 4.49 GiB | 7.52 B | 630.76 | n/a (TDR) |
+| rocmforge 7B Q8_0 | 7.54 GiB | 7.62 B | 20.42* | 11.63* |
+
+(*pp64/tg16)
+
+#### Vulkan
+
+| Model | Size | Params | pp128 | tg32 |
+|---|---|---|---|---|
+| llama 1B Q8_0 | 1.22 GiB | 1.24 B | 15344.23 | 340.76 |
+| qwen2 3B Q8_0 | 3.36 GiB | 3.40 B | 6117.73 | 146.03 |
+| qwen3 4B Q6_K | 3.07 GiB | 4.02 B | 3591.80 | 126.33 |
+| gemma4 E4B Q4_0 | 4.49 GiB | 7.52 B | 2005.54 | 114.79 |
+| rocmforge 7B Q8_0 | 7.54 GiB | 7.62 B | 2345.62* | 76.59* |
+
+(*pp64/tg16)
+
+#### Comparison (tg only, more reliable)
+
+| Model | DX12 tg | Vulkan tg | Ratio |
+|---|---|---|---|
+| llama 1B Q8_0 | 90.88 | 340.76 | 3.75x |
+| qwen2 3B Q8_0 | 52.26 | 146.03 | 2.79x |
+| qwen3 4B Q6_K | 25.14 | 126.33 | 5.03x |
+| gemma4 E4B Q4_0 | n/a (TDR) | 114.79 | - |
+| rocmforge 7B Q8_0 | 11.63* | 76.59* | 6.58x |
 
 ### Key Changes in This Commit
 1. **ring_wait_idle in synchronize**: replaced `dx12_device_wait_idle` (Signal+WaitForSingleObject) with `dx12_ring_wait_idle` (fence-polling only) — eliminates per-split Signal overhead
@@ -35,7 +46,7 @@
 4. **DXLA wave alpha_f16**: proper F16 alpha factor for GEMM shader constants
 
 ### Notes
-- CX12 pp numbers highly variable due to fence wait in `dx12_graph_compute_end` (stalls per split)
-- gemma4 E4B Q4_0 and rocmforge 7B Q8_0 TDR on DX12 for tg tests (GPU timeout, need smaller batch)
-- Vulkan numbers appear inflated for pp on some models (possible batching/caching effect); tg numbers are cross-validated
-- Previous baseline (pre-ring-buffer): gemma4 E4B Q4_0 pp128 = 53.43 t/s on DX12
+- Vulkan pp numbers are still suspiciously high on small models (batching/caching effect); tg numbers are more reliable for comparison
+- Vulkan tg outperforms DX12 by 2.8-6.6x across tested models — suggests DXLA wave shader dispatch overhead or suboptimal kernel launch pattern
+- GPU TDR (0x887A0006 device removed) on gemma4 E4B Q4_0 tg32 DX12; workaround: smaller batch (-b 256)
+- Previous baseline (pre-ring-buffer): gemma4 E4B Q4_0 pp128 = 53.43 t/s on DX12 (ring_wait_idle improved this to 630.76 t/s, ~11.8x)
