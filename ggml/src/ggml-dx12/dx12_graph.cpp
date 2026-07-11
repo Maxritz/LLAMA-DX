@@ -371,10 +371,10 @@ bool dx12_graph_compute(dx12_device* dev, dx12_command_list* cmd, ggml_cgraph* g
             return false;
         }
 
-        // Order dependent dispatches: flush UAV writes before the next node reads them
-        if (dispatched) {
-            dx12_cmd_list_global_uav_barrier(cmd);
-        }
+        // No barrier needed between dispatched nodes — dx12_buffer_transition already
+        // inserts per-resource UAV barriers when a buffer stays in UNORDERED_ACCESS
+        // across dispatches (dx12_buffer.cpp:243-244), and state-transition barriers
+        // (UAV→SRV/COPY_DST) handle the rest. The old global UAV barrier was redundant.
     }
     return true;
 }
