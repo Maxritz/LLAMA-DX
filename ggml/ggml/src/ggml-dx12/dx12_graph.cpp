@@ -13,6 +13,7 @@
 #include "ggml-backend-dx12.h"
 #include <ggml-impl.h>
 #include <cstring>
+#include <cstdio>
 
 // Forward declarations
 static bool dx12_dispatch_mul_mat_fused_act(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst, uint32_t act_op);
@@ -271,6 +272,9 @@ bool dx12_graph_validate(dx12_device* dev, ggml_cgraph* graph,
 dx12_command_list* dx12_graph_compute_begin(dx12_device* dev) {
     if (!dev || !dev->ring) return nullptr;
 
+    dx12_profile_scope acq(dev->gpu_timer, nullptr, "ring_acquire");
+    (void)acq;
+
     // Acquire a slot from the ring buffer (pre-allocated, fence-polling)
     dx12_ring_slot* slot = dx12_ring_acquire(dev->ring);
     if (!slot) return nullptr;
@@ -291,7 +295,12 @@ dx12_command_list* dx12_graph_compute_begin(dx12_device* dev) {
 void dx12_graph_compute_end(dx12_device* dev, dx12_command_list* cmd) {
     if (!dev || !cmd) return;
 
-    // Submit via ring buffer, then wait immediately for the GPU to complete.
+    dx12_profile_scope sub(dev->gpu_timer, nullptr, "ring_submit");
+    (void)sub;
+
+    // Submit via ring buffer, then wait for GPU completion.
+    // Per-split fence wait keeps GPU submissions serialized, avoiding
+    // ring-buffer stalls and ensuring sync correctness.
     uint64_t fence = dx12_ring_submit(dev->ring);
     if (fence > 0) {
         dx12_device_wait_for_fence(dev, fence);
@@ -601,7 +610,26 @@ bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor
         params.stride_c = N;
         return dx12_gemm_dispatch_dxla_wave(dev, cmd, buf_a, buf_b, buf_c, &params);
     }
-
+    // DXLA Wave path for Q8_0 prefill (M > 1)
+    else if (a->type == GGML_TYPE_Q8_0 && dev->caps.dxla_wave && M > 1) {
+        dx12_buffer* buf_a = dx12_backend_buffer_from_tensor(a);
+        dx12_buffer* buf_b = dx12_backend_buffer_from_tensor(b);
+        dx12_buffer* buf_c = dx12_backend_buffer_from_tensor(dst);
+        if (!buf_a || !buf_b || !buf_c) return false;
+        dx12_gemm_params params{};
+        params.M = M;
+        params.N = N;
+        params.K = K;
+        params.quant_a = DX12_QUANT_Q8_0;
+        params.quant_b = DX12_QUANT_F16;
+        params.alpha = 1.0f;
+        params.batch_count = 1;
+        params.transposed_b = false;
+        params.stride_a = K;
+        params.stride_b = K;
+        params.stride_c = N;
+        return dx12_gemm_dispatch_dxla_wave(dev, cmd, buf_a, buf_b, buf_c, &params);
+    }
     // K-quants share one shader pair; the quant selector rides in the CBV pad
     uint32_t kq_type = 0;
     const char* shader_name = nullptr;
@@ -679,8 +707,16 @@ bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor
         dispatch.uav_addr    = c_base + (uint64_t)m0 * N * 4;   // C rows are N f32
         dispatch.dispatch_x = (N + 15) / 16;
         dispatch.dispatch_y = (mc + 15) / 16;
+        if (dev->gpu_timer && dx12_profile_enabled()) {
+            char chunk_name[64];
+            snprintf(chunk_name, sizeof(chunk_name), "%s.chunk.%u", shader_name, m0 / m_chunk);
+            dev->gpu_timer->begin(cmd, chunk_name);
+        }
         if (!dx12_shader_dispatch(dev, cmd, dispatch, &params, sizeof(params), srvs, 2, buf_c)) {
             return false;
+        }
+        if (dev->gpu_timer && dx12_profile_enabled()) {
+            dev->gpu_timer->end(cmd);
         }
     }
     return true;

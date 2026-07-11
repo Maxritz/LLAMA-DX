@@ -59,9 +59,10 @@ const char* dx12_quant_gemm_shader_name(dx12_quant_type weight_quant,
     (void)activation_quant;
 
     if (use_dxla) {
-        // DXLA path: dequant happens in registers before Matrix multiply
+        // DXLA path: dequant happens in groupshared before Matrix::Load
         switch (weight_quant) {
             case DX12_QUANT_Q4_0: return "mul_mat_dxla_wave_q4_0_f16";
+            case DX12_QUANT_Q8_0: return "mul_mat_dxla_wave_q8_0_f16";
             default: break;
         }
     }

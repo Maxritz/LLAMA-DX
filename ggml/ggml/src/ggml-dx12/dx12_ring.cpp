@@ -178,18 +178,26 @@ dx12_ring_slot* dx12_ring_submit_and_acquire(dx12_ring_context* ring) {
 }
 
 void dx12_ring_wait_idle(dx12_ring_context* ring) {
-    if (!ring || !ring->dev) return;
+    if (!ring || !ring->dev || ring->count == 0) return;
 
-    // Wait for the oldest in-flight slot's fence
+    // D3D12 fences are monotonic: waiting for the highest value signals
+    // that all lower values are also complete. Find and wait once.
+    uint64_t max_fence = 0;
     for (uint32_t i = 0; i < ring->count; i++) {
         uint32_t idx = (ring->tail + i) % ring->capacity;
         auto& slot = ring->slots[idx];
-        if (slot.in_flight && slot.fence_value > 0) {
-            dx12_device_wait_for_fence(ring->dev, slot.fence_value);
-            slot.in_flight = false;
+        if (slot.in_flight && slot.fence_value > max_fence) {
+            max_fence = slot.fence_value;
         }
     }
+    if (max_fence > 0) {
+        dx12_device_wait_for_fence(ring->dev, max_fence);
+    }
 
+    for (uint32_t i = 0; i < ring->count; i++) {
+        uint32_t idx = (ring->tail + i) % ring->capacity;
+        ring->slots[idx].in_flight = false;
+    }
     ring->tail = ring->head;
     ring->count = 0;
 }

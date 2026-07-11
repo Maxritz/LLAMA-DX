@@ -168,7 +168,6 @@ struct dx12_upload_batch {
         dx12_cmd_list_submit_and_wait(cmd);
         dx12_cmd_list_destroy(cmd);
         cmd = nullptr;
-        dx12_log(DX12_LOG_INFO, "upload_batch: flushed %zu bytes", used);
         used = 0;
         pending = false;
     }
@@ -680,8 +679,15 @@ void ggml_backend_dx12_synchronize(ggml_backend_t backend) {
     // Flush any pending staging uploads before sync
     dx12_flush_uploads(ctx->device);
 
-    // Wait for all in-flight ring submissions (no extra Signal needed)
+    // Wait for all in-flight ring submissions
     dx12_ring_wait_idle(ctx->device->ring);
+
+    // Dump GPU timings if DX12_PROFILE env var is set.
+    // After ring_wait_idle, the GPU has completed the latest resolve.
+    // Note: sub-graphs before the last are overwritten by timer->reset().
+    if (ctx->device->gpu_timer && dx12_profile_enabled()) {
+        ctx->device->gpu_timer->dump_results();
+    }
 }
 
 static bool dx12_check_device_health(dx12_device* dev) {
@@ -711,9 +717,10 @@ static ggml_status ggml_backend_dx12_graph_compute(ggml_backend_t backend,
 
     if (!cgraph || cgraph->n_nodes == 0) return GGML_STATUS_SUCCESS;
 
-    // Record and submit this sub-graph, then wait for completion. Per-split
-    // submits keep each GPU submission small (well under the ~2s TDR limit)
-    // and results must be visible before the scheduler reads outputs anyway.
+    // Record and submit this sub-graph. The ring buffer handles fence waiting
+    // lazily — synchronize() drains all in-flight submissions. This avoids
+    // per-split CPU stalls (the previous bottleneck) while keeping each GPU
+    // submission small (well under the ~2s TDR limit).
     dx12_command_list* cmd = dx12_graph_compute_begin(ctx->device);
     if (!cmd) {
         dx12_log(DX12_LOG_ERROR, "graph_compute: failed to create command list");

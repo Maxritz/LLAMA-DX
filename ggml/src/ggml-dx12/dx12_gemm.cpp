@@ -23,10 +23,15 @@ dx12_gemm_path dx12_select_gemm_path(dx12_device* dev,
         return DX12_GEMM_STANDARD;
     }
 
-    // Some quant formats only work with standard GEMM
-    if (weight_quant != DX12_QUANT_F16 &&
-        weight_quant != DX12_QUANT_F32 &&
-        weight_quant != DX12_QUANT_Q4_0) {
+    // Allowed quant types for DXLA wave/TG path. Q4_0 and Q8_0 have dedicated
+    // wave-scope shaders that dequant in groupshared before Matrix::Load.
+    // K-quants (Q4_K/Q5_K/Q6_K) need separate shaders — fall through to standard.
+    if (weight_quant == DX12_QUANT_F16 ||
+        weight_quant == DX12_QUANT_F32 ||
+        weight_quant == DX12_QUANT_Q4_0 ||
+        weight_quant == DX12_QUANT_Q8_0) {
+        // Allowed for DXLA — proceed to dimension check
+    } else {
         return DX12_GEMM_STANDARD;
     }
 
@@ -165,10 +170,14 @@ bool dx12_gemm_dispatch_dxla_wave(dx12_device* dev,
     }
 
     const char* shader_name = "mul_mat_dxla_wave_f16_f16";
-    if (params->quant_a == DX12_QUANT_Q4_0) {
-        shader_name = "mul_mat_dxla_wave_q4_0_f16";
-    } else if (params->transposed_b) {
-        shader_name = "mul_mat_dxla_wave_f16_f16_trans";
+    switch (params->quant_a) {
+        case DX12_QUANT_Q4_0: shader_name = "mul_mat_dxla_wave_q4_0_f16"; break;
+        case DX12_QUANT_Q8_0: shader_name = "mul_mat_dxla_wave_q8_0_f16"; break;
+        default:
+            if (params->transposed_b) {
+                shader_name = "mul_mat_dxla_wave_f16_f16_trans";
+            }
+            break;
     }
 
     dx12_buffer_transition(cmd, matrix_a, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);

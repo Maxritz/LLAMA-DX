@@ -157,7 +157,90 @@ NumElements = vs * em / 2;    // for F16 buffers (2 bytes/element, must be even)
 
 | Shader | Size | Latency | GFLOPS |
 |--------|------|---------|--------|
-| Scalar GEMV F16 | 4096×4096 | 42.7 µs | 786 |
-| Scalar GEMM F16 (tile) | 32×4096×4096 | 1955.9 µs | 549 |
-| DXLA Wave GEMM F16 | 32×4096×4096 | 59.6 µs | 18,010 |
-| DXLA Wave speedup | — | 32.81× | 32.81× |
+| Scalar GEMV F16 | 4096x4096 | 42.7 us | 786 |
+| Scalar GEMM F16 (tile) | 32x4096x4096 | 1955.9 us | 549 |
+| DXLA Wave GEMM F16 | 32x4096x4096 | 59.6 us | 18,010 |
+| DXLA Wave speedup | - | 32.81x | 32.81x |
+
+# SESSION SUMMARY (2026-07-12, ongoing)
+
+## Objective
+- Fix DX12 dispatch bottleneck by removing per-split fence wait, adding GPU/CPU profiler (DX12_PROFILE), and adding Q8_0 DXLA wave shader support.
+- Build and benchmark the DX12 backend against previous numbers.
+
+## Build Fixes
+- CMake builds with Visual Studio 17 2022 generator (-G "Visual Studio 17 2022" -A x64 -T host=x64). Ninja generator detects Clang instead of MSVC with CMake 4.3 -- do not use Ninja.
+- Strawberry Perl PATH conflict: use full path to CMake after running vcvars64.bat, with set PATH=C:\Program Files\CMake\bin;%PATH%.
+- Build output is in build-msvc\bin\Release\.
+- Be sure to copy Agility SDK DLLs from dist\dx12-bundle\D3D12\ to the build output directory (build-msvc\bin\Release\D3D12\). Without them, D3D12CreateDevice with FL 12_2 fails and falls back to system runtime (FL 12_1), causing severe performance regression.
+
+## Baseline Regression Root Cause
+- Clean git 67f64f3 gave tg32=27.13 t/s for Llama 1B Q8_0 when run from build-msvc\bin\Release\.
+- Expected baseline is ~90.88 t/s (recorded in bench_results.txt, run from dist\dx12-bundle\ with Agility SDK DLLs present).
+- The regression is NOT from code changes -- the code is identical between these commits.
+- ROOT CAUSE: The EXE searches for .\D3D12\D3D12Core.dll relative to working directory. Without it, FL 12_2 device creation fails, falling back to the system D3D12 runtime (FL 12_1 or missing driver optimization paths).
+- With Agility SDK DLLs copied into build output, baseline recovers to ~85 t/s.
+
+## All Changes Are Stashed
+All source changes are in git stash. Files modified:
+- ggml/ggml/src/ggml-dx12/CMakeLists.txt -- adds Q8_0 DXLA shader to build
+- ggml/ggml/src/ggml-dx12/dx12_gemm.cpp -- Q8_0 routing to DXLA path
+- ggml/ggml/src/ggml-dx12/dx12_graph.cpp -- fence wait removal (reverted), profiler scopes
+- ggml/ggml/src/ggml-dx12/dx12_profiler.cpp -- D3D12_FEATURE_DATA_GPU_BASED_VALIDATION fix, profile scope for ring_wait_idle
+- ggml/ggml/src/ggml-dx12/dx12_profiler.h -- dx12_profile_scope, enhanced dump_results, dx12_profile_enabled()
+- ggml/ggml/src/ggml-dx12/dx12_quantize.cpp -- minor fix
+- ggml/ggml/src/ggml-dx12/dx12_ring.cpp -- ring_wait_idle optimized to single fence wait
+- ggml/ggml/src/ggml-dx12/ggml-backend-dx12.cpp -- profiler initialization
+- ggml/ggml/src/ggml-dx12/shaders/compile_shaders.ps1 -- added Q8_0 DXLA compilation
+- ggml/ggml/src/ggml-dx12/shaders/mul_mat_dxla_wave_q4_0_f16.hlsl -- modified (Q4_0 DXLA tweaks)
+- ggml/src/ggml-dx12/CMakeLists.txt -- adds Q8_0 shader
+- ggml/src/ggml-dx12/dx12_gemm.cpp -- Q8_0 path routing (duplicate, in both ggml/ggml/ and ggml/ paths)
+- ggml/src/ggml-dx12/dx12_graph.cpp -- profiler scopes
+- ggml/src/ggml-dx12/dx12_profiler.cpp -- profiler changes
+- ggml/src/ggml-dx12/dx12_profiler.h -- profiler changes
+- ggml/src/ggml-dx12/dx12_quantize.cpp -- minor fix
+- ggml/src/ggml-dx12/dx12_ring.cpp -- ring optimization
+- ggml/src/ggml-dx12/ggml-backend-dx12.cpp -- profiler init
+- ggml/src/ggml-dx12/generated/dx12_shader_registry.cpp -- updated for new CSOs
+- ggml/src/ggml-dx12/generated/mv_f16.cso -- updated CSO
+- ggml/src/ggml-dx12/shaders/compile_shaders.ps1 -- Q8_0 DXLA
+- ggml/src/ggml-dx12/shaders/mul_mat_dxla_wave_q4_0_f16.hlsl -- Q4_0 DXLA tweaks
+
+Deleted files: INTEGRATION_GUIDE.md, README-DX12.md, agility_shim.cpp, build-dx12.ps1, build/, dx12_backend_exports.def, dx12_buffer.cpp/.h, dx12_command.cpp/.h, dx12_descriptor.cpp/.h, dx12_device.cpp/.h, dx12_gemm.h, dx12_graph.h, dx12_quantize.h, dx12_ring.h, dx12_shader.cpp/.h, dx12_shader_cache.cpp/.h, generated/*.cso (most), ggml-backend-dx12.h, llama_cpp_dx12_component_plan.md, shaders/CMakeLists.txt, shaders/DX12_AI_PIPELINE.hlsli, shaders/*.hlsl (most), tests/.
+
+## Fence Wait Removal Status
+- Fence wait removal was tested WITHOUT Agility SDK DLLs. Results: catastrophic regression (tg32 dropped from 27 to 4 t/s for Llama 1B Q8_0). Reverted for the Agility SDK benchmark run.
+- The fence wait removal may still be unsafe even with proper Agility SDK DLLs. It needs careful incremental testing:
+  1. First test profiler + Q8_0 DXLA + ring optimization (no fence removal)
+  2. Then test fence removal alone
+  3. If fence removal still regresses, abandon it
+
+## Build Command
+```powershell
+& "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+set PATH=C:\Program Files\CMake\bin;%PATH%
+& "C:\Program Files\CMake\bin\cmake.exe" -B build-msvc -G "Visual Studio 17 2022" -A x64 -T host=x64 `
+    -DCMAKE_BUILD_TYPE=Release `
+    -DGGML_DX12=ON `
+    -DGGML_CUDA=OFF `
+    -DGGML_VULKAN=OFF `
+    -DGGML_METAL=OFF `
+    -DGGML_BLAS=OFF `
+    -DCMAKE_INSTALL_PREFIX="E:/DXllama/OptimiseDX/build-msvc" `
+    -DLLAMA_BENCH=ON `
+    -DCMAKE_VERBOSE_MAKEFILE=OFF `
+    -DDXC_EXECUTABLE="E:/DXllama/dxc-1.10.2605.2/bin/x64/dxc.exe"
+& "C:\Program Files\CMake\bin\cmake.exe" --build build-msvc --config Release --target llama-bench -j 8
+```
+
+## Benchmark Command
+```powershell
+cd build-msvc\bin\Release
+.\llama-bench.exe -m E:\DXllama\gguf\Llama-1B-Q8_0.gguf -p 512 -n 128 -ngl 99 -t 8 -o 0,1,2
+```
+
+## Agility SDK DLLs (must copy before running benchmark)
+```powershell
+New-Item -ItemType Directory -Force -Path build-msvc\bin\Release\D3D12
+Copy-Item -Path "dist\dx12-bundle\D3D12\*" -Destination "build-msvc\bin\Release\D3D12\" -Recurse -Force
+```

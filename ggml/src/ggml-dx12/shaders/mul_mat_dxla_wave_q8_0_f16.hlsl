@@ -2,7 +2,7 @@
 #include <dx/linalg.h>
 using namespace dx::linalg;
 
-struct DXLAWaveQ4GEMMParams {
+struct DXLAWaveQ8GEMMParams {
     uint M, N, K;
     uint stride_a, stride_b, stride_c;
     uint transposed_b;
@@ -10,14 +10,14 @@ struct DXLAWaveQ4GEMMParams {
     uint reserved[9];
 };
 
-ConstantBuffer<DXLAWaveQ4GEMMParams> params : register(b0);
+ConstantBuffer<DXLAWaveQ8GEMMParams> params : register(b0);
 ByteAddressBuffer weights_a : register(t0);
 ByteAddressBuffer matrix_b : register(t1);
 RWByteAddressBuffer result : register(u0);
 
 static const uint TILE = 16;
-static const uint Q4_0_BLOCK_SIZE = 32;
-static const uint Q4_0_BYTES = 18;
+static const uint Q8_0_BLOCK_SIZE = 32;
+static const uint Q8_0_BYTES = 34;
 
 groupshared half s_a[TILE * TILE];
 
@@ -25,15 +25,16 @@ using MatA = Matrix<ComponentType::F16, TILE, TILE, MatrixUse::A, MatrixScope::W
 using MatB = Matrix<ComponentType::F16, TILE, TILE, MatrixUse::B, MatrixScope::Wave>;
 using MatC = Matrix<ComponentType::F32, TILE, TILE, MatrixUse::Accumulator, MatrixScope::Wave>;
 
-float dequant_q4_0_elem(uint blk, uint lane) {
-    uint off = blk * Q4_0_BYTES;
+float dequant_q8_0_elem(uint blk, uint lane) {
+    uint off = blk * Q8_0_BYTES;
     uint s0 = weights_a.Load(off / 4);
     float d = f16_to_f32((uint16_t)(s0 & 0xFFFF));
-    uint qs_off = off + 2 + (lane / 2);
+    uint qs_off = off + 2 + lane;
     uint qs_word = weights_a.Load(qs_off / 4);
-    uint shift = ((qs_off % 4) * 8 + (lane & 1) * 4);
-    uint nibble = (qs_word >> shift) & 0xF;
-    return d * ((float)nibble - 8.0f);
+    uint byte_idx = qs_off % 4;
+    int qs = (int)((qs_word >> (byte_idx * 8)) & 0xFF);
+    qs = qs > 127 ? qs - 256 : qs;
+    return d * (float)qs;
 }
 
 [numthreads(32, 1, 1)]
@@ -52,7 +53,7 @@ void main(uint3 gid : SV_GroupID) {
         uint a_global_row = tile_row + lr;
         uint a_global_col = k + lc;
         uint a_flat = a_global_row * params.K + a_global_col;
-        float a_f32 = dequant_q4_0_elem(a_flat / Q4_0_BLOCK_SIZE, a_flat % Q4_0_BLOCK_SIZE);
+        float a_f32 = dequant_q8_0_elem(a_flat / Q8_0_BLOCK_SIZE, a_flat % Q8_0_BLOCK_SIZE);
         s_a[lr * TILE + lc] = (half)a_f32;
         GroupMemoryBarrierWithGroupSync();
 
