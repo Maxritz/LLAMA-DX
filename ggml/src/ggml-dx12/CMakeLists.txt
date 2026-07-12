@@ -181,6 +181,10 @@ set(DX12_SHADERS
     mm_fused_act
     ffn_fused
     set_rows
+    write_const
+    get_rows
+    permute
+    copy
 )
 
 # Compile each .hlsl -> .cso

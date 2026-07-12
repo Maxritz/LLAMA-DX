@@ -28,6 +28,7 @@ struct dx12_command_list {
     uint64_t                            fence_value = 0;
     bool                                is_recording = false;
     bool                                is_closed = false;
+    bool                                first_use = true;
     ID3D12PipelineState*                last_pso = nullptr;
     ID3D12RootSignature*                last_root_sig = nullptr;
 };

@@ -60,6 +60,7 @@ dx12_command_list* dx12_cmd_list_create(dx12_device* dev) {
 
     cmd->is_recording = true;
     cmd->is_closed = false;
+    cmd->first_use = true;
     cmd->last_pso = nullptr;
     cmd->last_root_sig = nullptr;
 
@@ -79,6 +80,19 @@ void dx12_cmd_list_destroy(dx12_command_list* cmd) {
 
 bool dx12_cmd_list_reset(dx12_command_list* cmd) {
     if (!cmd || !cmd->allocator || !cmd->d3d_list) return false;
+
+    // Skip allocator Reset on first use: calling allocator->Reset()
+    // on a fresh allocator returns E_FAIL on AMD RDNA4 drivers.
+    // CreateCommandList already left the list open with allocator bound,
+    // so we only flip the tracking state without touching the D3D12 API.
+    if (cmd->first_use) {
+        cmd->first_use = false;
+        cmd->is_recording = true;
+        cmd->is_closed = false;
+        cmd->last_pso = nullptr;
+        cmd->last_root_sig = nullptr;
+        return true;
+    }
 
     // Wait for GPU to finish before resetting allocator.
     // allocator->Reset() fails with E_FAIL if the GPU is still executing
@@ -166,6 +180,7 @@ uint64_t dx12_cmd_list_submit(dx12_command_list* cmd) {
     // Close if still recording
     if (cmd->is_recording) {
         if (!dx12_cmd_list_close(cmd)) return 0;
+        cmd->first_use = false; // allocator now used; next Reset needs full path
     }
 
     if (!cmd->is_closed) return 0;

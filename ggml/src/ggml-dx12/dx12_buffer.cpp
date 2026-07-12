@@ -265,7 +265,7 @@ void dx12_buffer_transition_batch(dx12_command_list* cmd,
                                    uint32_t count) {
     if (!cmd || !cmd->d3d_list || !bufs || !new_states || count == 0) return;
 
-    D3D12_RESOURCE_BARRIER barriers[8];
+    D3D12_RESOURCE_BARRIER barriers[8] = {};
     uint32_t n = 0;
 
     for (uint32_t i = 0; i < count && i < 8; i++) {
