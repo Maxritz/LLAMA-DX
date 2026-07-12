@@ -32,6 +32,7 @@ struct dx12_command_list {
     ID3D12PipelineState*                last_pso = nullptr;
     ID3D12RootSignature*                last_root_sig = nullptr;
     struct dx12_ring_slot*              ring_slot = nullptr; // region-tracked CBV source
+    struct dx12_barrier_tracker*        barrier_tracker = nullptr;
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════

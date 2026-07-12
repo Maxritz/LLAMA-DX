@@ -310,6 +310,86 @@ void dx12_buffer_transition_batch(dx12_command_list* cmd,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Barrier Coalescing
+// ═══════════════════════════════════════════════════════════════════════════════
+
+void dx12_barrier_pre_dispatch(dx12_command_list* cmd,
+                                dx12_barrier_tracker* tracker,
+                                dx12_buffer** bufs,
+                                const D3D12_RESOURCE_STATES* new_states,
+                                uint32_t count) {
+    if (!cmd || !cmd->d3d_list || !tracker || !bufs || !new_states || count == 0) return;
+
+    D3D12_RESOURCE_BARRIER barriers[16];
+    uint32_t n = 0;
+
+    std::vector<ID3D12Resource*> this_written;
+    std::vector<ID3D12Resource*> this_read;
+
+    for (uint32_t i = 0; i < count && i < 16; i++) {
+        dx12_buffer* buf = bufs[i];
+        if (!buf) continue;
+        if (!buf->resource) continue;
+        // Non-DEFAULT heaps have fixed states — cannot transition
+        if (buf->heap == dx12_heap_type::upload ||
+            buf->heap == dx12_heap_type::gpu_upload ||
+            buf->heap == dx12_heap_type::readback) continue;
+
+        // Skip duplicate buffer entries (aliased tensors)
+        bool dup = false;
+        for (uint32_t j = 0; j < i; j++) {
+            if (bufs[j] == buf) { dup = true; break; }
+        }
+        if (dup) continue;
+
+        D3D12_RESOURCE_STATES new_state = new_states[i];
+        ID3D12Resource* res = buf->resource.Get();
+
+        if (buf->state == new_state) {
+            // Same state — only emit UAV barrier if buffer was WRITTEN by prior dispatch
+            if (new_state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+                bool was_written = false;
+                for (auto* w : tracker->last_written) {
+                    if (w == res) { was_written = true; break; }
+                }
+                if (was_written) {
+                    barriers[n].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                    barriers[n].UAV.pResource = res;
+                    n++;
+                }
+            }
+        } else {
+            // State changed — emit transition barrier
+            barriers[n].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barriers[n].Transition.pResource = res;
+            barriers[n].Transition.StateBefore = buf->state;
+            barriers[n].Transition.StateAfter = new_state;
+            barriers[n].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            n++;
+            buf->state = new_state;
+            if (buf->parent) {
+                buf->parent->state = new_state;
+            }
+        }
+
+        // Track for next dispatch's hazard check
+        if (new_state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+            this_written.push_back(res);
+        } else {
+            this_read.push_back(res);
+        }
+    }
+
+    if (n > 0) {
+        auto* d3d_cmd = reinterpret_cast<ID3D12GraphicsCommandList10*>(cmd->d3d_list.Get());
+        d3d_cmd->ResourceBarrier(n, barriers);
+    }
+
+    tracker->last_written.swap(this_written);
+    tracker->last_read.swap(this_read);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Tensor Layout
 // ═══════════════════════════════════════════════════════════════════════════════
 

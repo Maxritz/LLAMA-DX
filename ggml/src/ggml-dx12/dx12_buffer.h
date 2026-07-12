@@ -142,6 +142,22 @@ void dx12_buffer_transition_batch(dx12_command_list* cmd,
                                    uint32_t count);
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Barrier Coalescing (removes redundant UAV barriers between dispatches)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+struct dx12_barrier_tracker {
+    std::vector<ID3D12Resource*> last_written;
+    std::vector<ID3D12Resource*> last_read;
+    void reset() { last_written.clear(); last_read.clear(); }
+};
+
+void dx12_barrier_pre_dispatch(dx12_command_list* cmd,
+                                dx12_barrier_tracker* tracker,
+                                dx12_buffer** bufs,
+                                const D3D12_RESOURCE_STATES* new_states,
+                                uint32_t count);
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Tensor Layout Helpers
 // ═══════════════════════════════════════════════════════════════════════════════
 

@@ -882,7 +882,7 @@ static struct ggml_backend_i ggml_backend_dx12_interface = {
     /* graph_compute     */ ggml_backend_dx12_graph_compute,
     /* event_record      */ nullptr,
     /* event_wait        */ nullptr,
-    /* graph_optimize    */ nullptr,
+    /* graph_optimize    */ dx12_graph_optimize,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
