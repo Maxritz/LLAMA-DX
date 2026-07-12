@@ -791,9 +791,10 @@ bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor
         case GGML_TYPE_F16:  shader_name = gemv ? "mv_f16"  : "mm_f16";  break;
         case GGML_TYPE_Q8_0: shader_name = gemv ? "mv_q8_0" : "mm_q8_0"; break;
         case GGML_TYPE_Q4_0: shader_name = gemv ? "mv_q4_0" : "mm_q4_0"; break;
-        case GGML_TYPE_Q4_K: shader_name = gemv ? "mv_kq" : "mm_kq"; kq_type = 4; break;
-        case GGML_TYPE_Q5_K: shader_name = gemv ? "mv_kq" : "mm_kq"; kq_type = 5; break;
-        case GGML_TYPE_Q6_K: shader_name = gemv ? "mv_kq" : "mm_kq"; kq_type = 6; break;
+        case GGML_TYPE_Q5_0: shader_name = gemv ? "mv_q5_0" : "mm_q5_0_prefill"; break;
+        case GGML_TYPE_Q4_K: shader_name = gemv ? "mv_kq" : "mm_q4_k_prefill"; kq_type = 4; break;
+        case GGML_TYPE_Q5_K: shader_name = gemv ? "mv_kq" : "mm_q5_k_prefill"; kq_type = 5; break;
+        case GGML_TYPE_Q6_K: shader_name = gemv ? "mv_kq" : "mm_q6_k_prefill"; kq_type = 6; break;
         default:
             dx12_log(DX12_LOG_ERROR, "MUL_MAT: unsupported weight type %s", ggml_type_name(a->type));
             return false;
@@ -853,6 +854,10 @@ bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor
         if (m_chunk == 0) m_chunk = 1;
     }
 
+    bool is_new_prefill = (strstr(shader_name, "_prefill") != nullptr);
+    uint32_t tile = is_new_prefill ? 32 : 16;
+    uint32_t tile_n = (N + tile - 1) / tile;
+
     D3D12_GPU_VIRTUAL_ADDRESS b_base = dispatch.srv_addr[1];
     D3D12_GPU_VIRTUAL_ADDRESS c_base = dispatch.uav_addr;
     for (uint32_t m0 = 0; m0 < M; m0 += m_chunk) {
@@ -860,8 +865,8 @@ bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor
         struct { uint32_t M, N, K, qtype; } params = { mc, N, K, kq_type };
         dispatch.srv_addr[1] = b_base + (uint64_t)m0 * K * 4;   // B rows are K f32
         dispatch.uav_addr    = c_base + (uint64_t)m0 * N * 4;   // C rows are N f32
-        dispatch.dispatch_x = (N + 15) / 16;
-        dispatch.dispatch_y = (mc + 15) / 16;
+        dispatch.dispatch_x = tile_n;
+        dispatch.dispatch_y = (mc + tile - 1) / tile;
         if (dev->gpu_timer && dx12_profile_enabled()) {
             char chunk_name[64];
             snprintf(chunk_name, sizeof(chunk_name), "%s.chunk.%u", shader_name, m0 / m_chunk);

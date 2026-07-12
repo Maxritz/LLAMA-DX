@@ -31,19 +31,11 @@ dx12_ring_context* dx12_ring_create(dx12_device* dev, uint32_t capacity) {
             return nullptr;
         }
 
-        // Create command list (opens automatically)
-        hr = dev->device->CreateCommandList(
-            0, list_type, slot.allocator.Get(), nullptr,
-            IID_PPV_ARGS(&slot.d3d_list));
-        if (FAILED(hr)) {
-            dx12_log(DX12_LOG_ERROR, "ring_create: cmd_list[%u] failed hr=0x%08X", i, hr);
-            for (uint32_t j = 0; j <= i; j++) {
-                ring->slots[j].d3d_list.Reset();
-                ring->slots[j].allocator.Reset();
-            }
-            delete ring;
-            return nullptr;
-        }
+        // Command lists are created lazily on first ring_acquire (see below).
+        // Pre-creating them at device init leaves stale command lists on some
+        // drivers (AMD RDNA4) that then fail Close() with E_INVALIDARG on the
+        // first submit. The upload path creates a fresh list at runtime and
+        // works, so we mirror that here.
 
         slot.fence_value = 0;
         slot.in_flight = false;
@@ -93,6 +85,29 @@ dx12_ring_slot* dx12_ring_acquire(dx12_ring_context* ring) {
 
     uint32_t head_idx = ring->head % ring->capacity;
     auto& slot = ring->slots[head_idx];
+
+    // First use: create a fresh command list + allocator at runtime, mirroring
+    // the working upload path. Pre-created init-time lists fail Close() with
+    // E_INVALIDARG on some drivers. We never Reset a fresh allocator (it returns
+    // E_FAIL on AMD RDNA4), just hand over the open list.
+    if (slot.first_use) {
+        D3D12_COMMAND_LIST_TYPE list_type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        HRESULT hr = ring->dev->device->CreateCommandAllocator(list_type, IID_PPV_ARGS(&slot.allocator));
+        if (FAILED(hr)) {
+            dx12_log(DX12_LOG_ERROR, "ring_acquire: first_create allocator failed hr=0x%08X", hr);
+            return nullptr;
+        }
+        hr = ring->dev->device->CreateCommandList(0, list_type, slot.allocator.Get(), nullptr, IID_PPV_ARGS(&slot.d3d_list));
+        if (FAILED(hr)) {
+            dx12_log(DX12_LOG_ERROR, "ring_acquire: first_create cmd_list failed hr=0x%08X", hr);
+            return nullptr;
+        }
+        slot.first_use = false;
+        slot.fence_value = 0;
+        slot.in_flight = false;
+        slot.cbv_used = 0;
+        return &slot;
+    }
 
     // Reset allocator + command list for reuse
     // Skip on first_use: CreateCommandList leaves the list open, and
