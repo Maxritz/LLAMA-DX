@@ -156,18 +156,21 @@ struct dx12_upload_batch {
         while (new_cap < needed) new_cap *= 2;
         flush();
         if (staging) dx12_buffer_destroy(staging);
-        staging = dx12_buffer_create(dev, new_cap, dx12_heap_type::upload);
+        dx12_heap_type heap_type = (dev && dev->caps.gpu_upload_heap)
+            ? dx12_heap_type::gpu_upload : dx12_heap_type::upload;
+        staging = dx12_buffer_create(dev, new_cap, heap_type);
         capacity = staging ? new_cap : 0;
         used = 0;
-        dx12_log(DX12_LOG_INFO, "upload_batch: grown to %zu MB", capacity / (1024 * 1024));
+        dx12_log(DX12_LOG_INFO, "upload_batch: grown to %zu MB (%s)",
+                 capacity / (1024 * 1024),
+                 heap_type == dx12_heap_type::gpu_upload ? "GPU_UPLOAD" : "UPLOAD");
     }
 
     void flush() {
         if (!pending || !cmd) return;
         dx12_cmd_list_close(cmd);
         dx12_cmd_list_submit_and_wait(cmd);
-        dx12_cmd_list_destroy(cmd);
-        cmd = nullptr;
+        dx12_cmd_list_reset(cmd);
         used = 0;
         pending = false;
     }
@@ -507,6 +510,38 @@ static void dx12_flush_uploads(dx12_device* dev) {
     }
 }
 
+struct dx12_readback_pool {
+    dx12_device*        dev = nullptr;
+    dx12_buffer*        buffer = nullptr;
+    dx12_command_list*  cmd = nullptr;
+    size_t              capacity = 0;
+
+    dx12_buffer* acquire(dx12_device* d, size_t size) {
+        if (dev != d) { destroy(); dev = d; }
+        if (capacity < size) {
+            if (buffer) dx12_buffer_destroy(buffer);
+            capacity = (size + 1024 * 1024 - 1) & ~(1024 * 1024 - 1);
+            buffer = dx12_buffer_create(dev, capacity, dx12_heap_type::readback);
+            if (!buffer) { capacity = 0; return nullptr; }
+        }
+        return buffer;
+    }
+
+    dx12_command_list* get_cmd() {
+        if (!cmd) cmd = dx12_cmd_list_create(dev);
+        else dx12_cmd_list_reset(cmd);
+        return cmd;
+    }
+
+    void destroy() {
+        if (cmd) { dx12_cmd_list_destroy(cmd); cmd = nullptr; }
+        if (buffer) { dx12_buffer_destroy(buffer); buffer = nullptr; }
+        capacity = 0; dev = nullptr;
+    }
+};
+
+static dx12_readback_pool g_readback_pool;
+
 static void dx12_buf_get_tensor(ggml_backend_buffer_t buf, const ggml_tensor* tensor,
                                  void* data, size_t offset, size_t size) {
     auto* ctx = (dx12_backend_buffer_context*)buf->context;
@@ -519,26 +554,23 @@ static void dx12_buf_get_tensor(ggml_backend_buffer_t buf, const ggml_tensor* te
         return;
     }
 
-    // DEFAULT heap: copy through a readback staging buffer
+    // DEFAULT heap: copy through pooled readback staging buffer
     size_t tensor_off = (size_t)((uintptr_t)tensor->data - 0x1000);
 
     dx12_flush_uploads(ctx->device);
 
-    dx12_buffer* staging = dx12_buffer_create(ctx->device, size, dx12_heap_type::readback);
+    dx12_buffer* staging = g_readback_pool.acquire(ctx->device, size);
     if (!staging) {
-        dx12_log(DX12_LOG_ERROR, "get_tensor: readback alloc failed (%zu bytes)", size);
+        dx12_log(DX12_LOG_ERROR, "get_tensor: readback pool alloc failed (%zu bytes)", size);
         return;
     }
 
-    dx12_command_list* cmd = dx12_cmd_list_create(ctx->device);
-    if (!cmd) {
-        dx12_buffer_destroy(staging);
-        return;
-    }
-    dx12_buffer_transition(cmd, ctx->gpu_buffer, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    dx12_buffer_copy(cmd, staging, 0, ctx->gpu_buffer, tensor_off + offset, size);
-    dx12_cmd_list_submit_and_wait(cmd);
-    dx12_cmd_list_destroy(cmd);
+    dx12_command_list* rcmd = g_readback_pool.get_cmd();
+    if (!rcmd) return;
+
+    dx12_buffer_transition(rcmd, ctx->gpu_buffer, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    dx12_buffer_copy(rcmd, staging, 0, ctx->gpu_buffer, tensor_off + offset, size);
+    dx12_cmd_list_submit_and_wait(rcmd);
 
     void* src = dx12_buffer_map(staging);
     if (src) {
@@ -546,7 +578,6 @@ static void dx12_buf_get_tensor(ggml_backend_buffer_t buf, const ggml_tensor* te
     } else {
         dx12_log(DX12_LOG_ERROR, "get_tensor: readback map failed: %s", tensor->name);
     }
-    dx12_buffer_destroy(staging);
 }
 
 static void dx12_buf_clear(ggml_backend_buffer_t buf, uint8_t value) {

@@ -320,3 +320,40 @@ In `dx12_graph_compute_end()`, removed `dx12_device_wait_for_fence()` after `dx1
 
 ### Q4_0 Wave Shader (also fixed)
 The Q4_0 wave shader had additional bugs: wrong column index (`gc=tc+lr` instead of `gc=tc+lc`), uninitialized matrices passed to MultiplyAccumulate, and a per-element store without bounds check. Rewritten to follow the Q8_0 pattern with groupshared dequantization.
+
+## Safe Optimizations (2026-07-12)
+
+### 1. pending_staging Memory Leak Fix
+**File**: `dx12_device.cpp:814-836` (wait_idle), `dx12_quantize.cpp:169`
+**Fix**: Drain `dev->pending_staging` in `dx12_device_wait_idle()` after GPU fence completes. Previously these upload buffers were pushed but never freed.
+**Risk**: LOW — GPU is idle when drain occurs.
+
+### 2. Ring Capacity 4→8
+**File**: `dx12_ring.h:21`
+**Fix**: `DX12_RING_CAPACITY = 4` → `8`. Each slot ~128KB, total +512KB VRAM. Deeper pipelining reduces ring-stall probability.
+**Risk**: LOW — no behavioral change, only reduces stall probability.
+
+### 3. Skip Redundant PSO/Root-Sig Sets
+**Files**: `dx12_command.h:31-32` (tracking fields), `dx12_command.cpp:140-149` (skip logic)
+**Fix**: Track `last_pso` / `last_root_sig` per command list. `dx12_cmd_list_set_pso` and `dx12_cmd_list_set_root_signature` compare pointers and skip the D3D12 API call if unchanged. Reset tracking on `dx12_cmd_list_create` / `dx12_cmd_list_reset`.
+**Risk**: LOW — worst case is a redundant set (no-op). No GPU hang risk.
+
+### 4. Batch ResourceBarrier Calls
+**Files**: `dx12_buffer.h` (declaration), `dx12_buffer.cpp` (implementation)
+**Fix**: Added `dx12_buffer_transition_batch()` that collects up to 8 transitions into a single `ResourceBarrier(N, ...)` call instead of N individual `ResourceBarrier(1, ...)` calls. Same barriers, fewer D3D12 API calls.
+**Risk**: LOW — same barriers, batched. No GPU execution change.
+
+### 5. GPU_UPLOAD Heap for Staging
+**File**: `ggml-backend-dx12.cpp:159`
+**Fix**: `dx12_upload_batch::ensure()` now checks `dev->caps.gpu_upload_heap` and uses `dx12_heap_type::gpu_upload` on ReBAR systems (RX 9070 XT). On ReBAR, this puts the staging buffer in VRAM, making `CopyBufferRegion` a GPU-internal copy (500-900 GB/s) instead of PCIe copy (~32 GB/s). Falls back to `dx12_heap_type::upload` if not supported.
+**Risk**: LOW — feature-detect gated, benchmark-verified in `test_gpu_upload_bench`.
+
+### 6. Upload Cmd List Reuse
+**File**: `ggml-backend-dx12.cpp:165-173`
+**Fix**: `dx12_upload_batch::flush()` now calls `dx12_cmd_list_reset(cmd)` instead of `dx12_cmd_list_destroy(cmd)` + lazy recreate on next use. Eliminates `CreateCommandAllocator` + `CreateCommandList` per flush cycle.
+**Risk**: LOW — `dx12_cmd_list_reset` waits for fence before resetting allocator.
+
+### 7. Readback Pool for get_tensor
+**File**: `ggml-backend-dx12.cpp:510-550` (get_tensor)
+**Fix**: Replaced per-call `CreateCommittedResource` + `CreateCommandList` with a persistent `dx12_readback_pool` (grows to max size needed, never shrinks). Eliminates create/destroy per logit read.
+**Risk**: LOW — same submit+wait pattern, just reused objects.

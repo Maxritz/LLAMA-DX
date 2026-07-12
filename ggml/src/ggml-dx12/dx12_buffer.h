@@ -131,6 +131,16 @@ void dx12_buffer_transition(dx12_command_list* cmd,
                             dx12_buffer* buf,
                             D3D12_RESOURCE_STATES new_state);
 
+/**
+ * dx12_buffer_transition_batch — Batch multiple resource barriers into one call
+ * More efficient than N individual dx12_buffer_transition calls.
+ * Skips non-transitionable heaps. Arrays must have 'count' valid entries.
+ */
+void dx12_buffer_transition_batch(dx12_command_list* cmd,
+                                   dx12_buffer** bufs,
+                                   const D3D12_RESOURCE_STATES* new_states,
+                                   uint32_t count);
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Tensor Layout Helpers
 // ═══════════════════════════════════════════════════════════════════════════════

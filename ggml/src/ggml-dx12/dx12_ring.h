@@ -18,7 +18,7 @@
 // This eliminates the ~400µs per-token blocking submit+fence-wait bottleneck
 // by pipelining N tokens ahead of the GPU.
 
-static constexpr uint32_t DX12_RING_CAPACITY = 4;
+static constexpr uint32_t DX12_RING_CAPACITY = 8;
 
 struct dx12_ring_slot {
     ComPtr<ID3D12CommandAllocator>      allocator;

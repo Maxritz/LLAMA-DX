@@ -60,6 +60,8 @@ dx12_command_list* dx12_cmd_list_create(dx12_device* dev) {
 
     cmd->is_recording = true;
     cmd->is_closed = false;
+    cmd->last_pso = nullptr;
+    cmd->last_root_sig = nullptr;
 
     return cmd;
 }
@@ -100,6 +102,8 @@ bool dx12_cmd_list_reset(dx12_command_list* cmd) {
 
     cmd->is_recording = true;
     cmd->is_closed = false;
+    cmd->last_pso = nullptr;
+    cmd->last_root_sig = nullptr;
     return true;
 }
 
@@ -139,13 +143,17 @@ void dx12_cmd_list_dispatch_1d(dx12_command_list* cmd, uint32_t threads) {
 
 void dx12_cmd_list_set_pso(dx12_command_list* cmd, ID3D12PipelineState* pso) {
     if (!cmd || !cmd->d3d_list || !pso) return;
+    if (cmd->last_pso == pso) return;
     cmd->d3d_list->SetPipelineState(pso);
+    cmd->last_pso = pso;
 }
 
 void dx12_cmd_list_set_root_signature(dx12_command_list* cmd,
                                        ID3D12RootSignature* root_sig) {
     if (!cmd || !cmd->d3d_list || !root_sig) return;
+    if (cmd->last_root_sig == root_sig) return;
     cmd->d3d_list->SetComputeRootSignature(root_sig);
+    cmd->last_root_sig = root_sig;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

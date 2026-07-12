@@ -259,6 +259,48 @@ void dx12_buffer_transition(dx12_command_list* cmd,
     buf->state = new_state;
 }
 
+void dx12_buffer_transition_batch(dx12_command_list* cmd,
+                                   dx12_buffer** bufs,
+                                   const D3D12_RESOURCE_STATES* new_states,
+                                   uint32_t count) {
+    if (!cmd || !cmd->d3d_list || !bufs || !new_states || count == 0) return;
+
+    D3D12_RESOURCE_BARRIER barriers[8];
+    uint32_t n = 0;
+
+    for (uint32_t i = 0; i < count && i < 8; i++) {
+        dx12_buffer* buf = bufs[i];
+        if (!buf) continue;
+        if (buf->heap == dx12_heap_type::upload ||
+            buf->heap == dx12_heap_type::gpu_upload ||
+            buf->heap == dx12_heap_type::readback) {
+            continue;
+        }
+        D3D12_RESOURCE_STATES new_state = new_states[i];
+
+        if (buf->state == new_state) {
+            if (new_state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+                barriers[n].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                barriers[n].UAV.pResource = buf->resource.Get();
+                n++;
+            }
+        } else {
+            barriers[n].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barriers[n].Transition.pResource = buf->resource.Get();
+            barriers[n].Transition.StateBefore = buf->state;
+            barriers[n].Transition.StateAfter = new_state;
+            barriers[n].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            n++;
+            buf->state = new_state;
+        }
+    }
+
+    if (n > 0) {
+        auto* d3d_cmd = reinterpret_cast<ID3D12GraphicsCommandList10*>(cmd->d3d_list.Get());
+        d3d_cmd->ResourceBarrier(n, barriers);
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Tensor Layout
 // ═══════════════════════════════════════════════════════════════════════════════

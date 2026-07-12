@@ -833,6 +833,13 @@ void dx12_device_wait_idle(dx12_device* dev) {
             dev->device_lost.store(true);
         }
     }
+
+    // Drain pending staging buffers: GPU is idle, all deferred upload
+    // buffers are safe to destroy.
+    for (auto* staging : dev->pending_staging) {
+        dx12_buffer_destroy(staging);
+    }
+    dev->pending_staging.clear();
 }
 
 void dx12_device_wait_for_fence(dx12_device* dev, uint64_t fence_value) {
