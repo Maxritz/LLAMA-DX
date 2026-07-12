@@ -68,6 +68,11 @@ void main(uint3 gid : SV_GroupID) {
         GroupMemoryBarrierWithGroupSync();
     }
 
-    uint c_offset = (tile_row * params.stride_c + tile_col) * sizeof(float);
-    acc.Store(result, c_offset, params.stride_c * sizeof(float), MatrixLayout::RowMajor);
+    for (uint i = WaveGetLaneIndex(); i < 256; i += 32) {
+        uint r = tile_row + i / 16;
+        uint c = tile_col + i % 16;
+        if (r < params.M && c < params.N) {
+            result.Store((r * params.stride_c + c) * 4, asuint(acc.Get(i)));
+        }
+    }
 }

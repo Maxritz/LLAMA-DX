@@ -298,13 +298,12 @@ void dx12_graph_compute_end(dx12_device* dev, dx12_command_list* cmd) {
     dx12_profile_scope sub(dev->gpu_timer, nullptr, "ring_submit");
     (void)sub;
 
-    // Submit via ring buffer, then wait for GPU completion.
-    // Per-split fence wait keeps GPU submissions serialized, avoiding
-    // ring-buffer stalls and ensuring sync correctness.
-    uint64_t fence = dx12_ring_submit(dev->ring);
-    if (fence > 0) {
-        dx12_device_wait_for_fence(dev, fence);
-    }
+    // Submit via ring buffer (no per-split fence wait).
+    // The ring has limited capacity (DX12_RING_CAPACITY=4) and
+    // dx12_ring_acquire stalls automatically when all slots are
+    // in-flight. This pipelines sub-graph submissions for better
+    // GPU utilization. Call synchronize() to drain all in-flight work.
+    dx12_ring_submit(dev->ring);
 
     // Destroy the wrapper (not the ring slot — ring owns the allocator)
     cmd->d3d_list.Reset();

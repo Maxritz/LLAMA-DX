@@ -31,8 +31,6 @@ void main(uint3 gid : SV_GroupID) {
 
     for (uint k = 0; k < params.K; k += TILE) {
         uint a_offset = (tile_row * params.stride_a + k) * 2;
-        // Transposed B: physical matrix is NxK row-major
-        // stride_b = K (elements per row of physical matrix)
         uint b_offset = (tile_col * params.stride_b + k) * 2;
 
         MatA a_tile = MatA::Load(matrix_a, a_offset, params.stride_a * 2, MatrixLayout::RowMajor);
@@ -40,6 +38,11 @@ void main(uint3 gid : SV_GroupID) {
         acc.MultiplyAccumulate(a_tile, b_tile);
     }
 
-    uint c_offset = (tile_row * params.stride_c + tile_col) * 4;
-    acc.Store(result, c_offset, params.stride_c * 4, MatrixLayout::RowMajor);
+    for (uint i = WaveGetLaneIndex(); i < 256; i += 32) {
+        uint r = tile_row + i / 16;
+        uint c = tile_col + i % 16;
+        if (r < params.M && c < params.N) {
+            result.Store((r * params.stride_c + c) * 4, asuint(acc.Get(i)));
+        }
+    }
 }

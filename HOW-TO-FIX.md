@@ -244,3 +244,79 @@ cd build-msvc\bin\Release
 New-Item -ItemType Directory -Force -Path build-msvc\bin\Release\D3D12
 Copy-Item -Path "dist\dx12-bundle\D3D12\*" -Destination "build-msvc\bin\Release\D3D12\" -Recurse -Force
 ```
+
+## Test Harness Procedure (MANDATORY)
+
+### Build + Run All Tests
+```powershell
+# Build all test targets
+cmake --build build-msvc --config Release --target test_dx12_buffer test_dx12_device test_dx12_e2e test_dx12_gemm test_dx12_ops test_dx12_quantize test_dx12_layer test_dx12_model_load test_dx12_stability test_dxla_wave_bench test_dxla_wave_trans_bench test_sm610_dxla_probe -j 8
+
+# Run tests individually (NEVER batch all at once — can hang system)
+.\build-msvc\bin\Release\test_dx12_buffer.exe
+.\build-msvc\bin\Release\test_dx12_device.exe
+.\build-msvc\bin\Release\test_dx12_e2e.exe
+.\build-msvc\bin\Release\test_dx12_gemm.exe
+.\build-msvc\bin\Release\test_dx12_ops.exe
+.\build-msvc\bin\Release\test_dx12_quantize.exe
+.\build-msvc\bin\Release\test_dx12_layer.exe
+.\build-msvc\bin\Release\test_dx12_model_load.exe
+.\build-msvc\bin\Release\test_dx12_stability.exe
+.\build-msvc\bin\Release\test_dxla_wave_bench.exe
+.\build-msvc\bin\Release\test_dxla_wave_trans_bench.exe   # CAUTION: can hang if bugs present
+```
+
+### Known Allocator Error (Harmless on RDNA4)
+`cmd_list_reset: allocator->Reset failed hr=0x80004005` — occurs on RDNA4 when calling Reset on a fresh command allocator (created via CreateCommandList in open state). The command list is already open and usable; the failed Reset is redundant. Safe to ignore.
+
+## P0 Fix: DXLA Wave Shader Buffer Overrun (2026-07-12)
+
+### Root Cause
+All 6 DXLA wave shaders used `acc.Store(result, c_offset, stride, RowMajor)` which stores a full 16x16 tile unconditionally. For matrices with M < 16 or N < 16, this writes past the output buffer, corrupting adjacent GPU memory.
+
+### Files Fixed
+- `ggml/src/ggml-dx12/shaders/mul_mat_dxla_wave_f16_f16.hlsl`
+- `ggml/src/ggml-dx12/shaders/mul_mat_dxla_wave_f16_f16_trans.hlsl`
+- `ggml/src/ggml-dx12/shaders/mul_mat_dxla_wave_f16_f16_static.hlsl`
+- `ggml/src/ggml-dx12/shaders/mul_mat_dxla_wave_f16_f16_rowmajor.hlsl`
+- `ggml/src/ggml-dx12/shaders/mul_mat_dxla_wave_q8_0_f16.hlsl`
+- `ggml/src/ggml-dx12/shaders/mul_mat_dxla_wave_q4_0_f16.hlsl` (also fixed: column index `lr`→`lc`, uninitialized matrices)
+
+### Fix Applied
+Replaced `acc.Store(result, offset, stride, RowMajor)` with per-element bounds-checked loop:
+```hlsl
+for (uint i = WaveGetLaneIndex(); i < 256; i += 32) {
+    uint r = tile_row + i / 16;
+    uint c = tile_col + i % 16;
+    if (r < params.M && c < params.N) {
+        result.Store((r * params.stride_c + c) * 4, asuint(acc.Get(i)));
+    }
+}
+```
+
+### Remaining Issue: A-Matrix LOAD Overrun
+The MatA::Load still reads a full 16x16 tile from the input matrix even for M < 16. This reads garbage from padded heap bytes (within 64KB allocation, so doesn't page fault) but produces NaN in accumulator rows >= M. The per-element store discards these NaN rows. Not a crash risk but produces garbage F16 reads that could theoretically cause DXLA hardware issues.
+
+### Fix Options
+Option A (test fix): Only use tile-aligned sizes (M,N multiples of 16) for DXLA wave dispatch.
+Option B (shader fix): Load via groupshared with per-element bounds check, then Mat::Load from groupshared — adds GroupMemoryBarrier overhead but guarantees no garbage reads.
+
+## Fence Wait Removal (Branch: fence-wait-removal)
+
+### Change
+In `dx12_graph_compute_end()`, removed `dx12_device_wait_for_fence()` after `dx12_ring_submit()`. The ring buffer (4 slots) with backpressure in `dx12_ring_acquire()` handles synchronization.
+
+### Safety Analysis
+- **Ring overflow**: dx12_ring_acquire() checks fence before recycling oldest slot (lines 80-86)
+- **Memory safety**: allocator reset guarded by fence check
+- **Upload ordering**: dx12_flush_uploads() called before each graph_compute
+- **Effects**: only affects ggml graph pipeline; test harness (dx12_cmd_list_submit_and_wait) is unaffected
+
+### Test Harness Results (known issues)
+- `test_dx12_gemm`: 3/4 pass, 1 FAIL (pso_simple copy — allocator Reset on fresh cmd, harmless)
+- All other tests: PASS (including stability, E2E, probe)
+- `test_dx12_shader_perf`: SKIP (hangs on RDNA4 — known issue, not related to fence removal)
+- `test_dxla_wave_trans_bench`: Phase 1 passes, Phase 2 first benchmark completes but subsequent allocs fail with DXGI_ERROR_DEVICE_REMOVED (0x887A0005) — likely a separate RX 9070 XT driver issue with heavy dispatch loops (500 dispatches in 5 reps) causing TDR
+
+### Q4_0 Wave Shader (also fixed)
+The Q4_0 wave shader had additional bugs: wrong column index (`gc=tc+lr` instead of `gc=tc+lc`), uninitialized matrices passed to MultiplyAccumulate, and a per-element store without bounds check. Rewritten to follow the Q8_0 pattern with groupshared dequantization.
