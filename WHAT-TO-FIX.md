@@ -2,7 +2,7 @@
 
 Session date: 2026-07-12. GPU: AMD RX 9070 XT (RDNA4, 644 GB/s peak DRAM BW).
 Everything below is **local-only, uncommitted** (per standing no-commit rule).
-Pre-session source backup: `backup-ggml-dx12-2026-07-12-pre-gemv-opt/` (459 files).
+Pre-session state is in git: `da24311` (before) → `f636a58` (all fixes, verified).
 Detailed truth tables / traces: `ggml/src/ggml-dx12/TRACE-gemv-direct-path-opt.md`.
 
 ---
