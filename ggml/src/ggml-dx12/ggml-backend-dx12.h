@@ -80,7 +80,7 @@ typedef struct {
 
     // Performance hints
     uint32_t optimal_gemm_tile;      // Recommended GEMM tile size
-    bool     prefers_wave64;         // True for AMD, false for NVIDIA
+    bool     prefers_wave64;         // True if wave64 is supported and not forced
 } dx12_device_caps;
 
 /* ═══════════════════════════════════════════════════════════════════════════ */

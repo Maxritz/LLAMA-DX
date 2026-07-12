@@ -275,17 +275,14 @@ dx12_command_list* dx12_graph_compute_begin(dx12_device* dev) {
     dx12_profile_scope acq(dev->gpu_timer, nullptr, "ring_acquire");
     (void)acq;
 
-    // Acquire a slot from the ring buffer (pre-allocated, fence-polling)
     dx12_ring_slot* slot = dx12_ring_acquire(dev->ring);
     if (!slot) return nullptr;
 
-    // Wrap the ring slot's d3d_list in a lightweight dx12_command_list
-    // that the dispatch functions can use. We don't own the allocator —
-    // the ring does. Reset is handled by the ring on next acquire.
     auto* cmd = new dx12_command_list();
     cmd->d3d_list = slot->d3d_list;
     cmd->device = dev;
-    cmd->allocator = nullptr;  // owned by ring, don't touch
+    cmd->ring_slot = slot;
+    cmd->allocator = nullptr;
     cmd->fence_value = 0;
     cmd->is_recording = true;
     cmd->is_closed = false;
@@ -589,46 +586,10 @@ bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor
         params.stride_c = N;
         return dx12_gemm_dispatch_dxla_wave(dev, cmd, buf_a, buf_b, buf_c, &params);
     }
-    // DXLA Wave path for Q4_0 prefill (M > 1)
-    else if (a->type == GGML_TYPE_Q4_0 && dev->caps.dxla_wave && M > 1) {
-        dx12_buffer* buf_a = dx12_backend_buffer_from_tensor(a);
-        dx12_buffer* buf_b = dx12_backend_buffer_from_tensor(b);
-        dx12_buffer* buf_c = dx12_backend_buffer_from_tensor(dst);
-        if (!buf_a || !buf_b || !buf_c) return false;
-        dx12_gemm_params params{};
-        params.M = M;
-        params.N = N;
-        params.K = K;
-        params.quant_a = DX12_QUANT_Q4_0;
-        params.quant_b = DX12_QUANT_F16;
-        params.alpha = 1.0f;
-        params.batch_count = 1;
-        params.transposed_b = false;
-        params.stride_a = K;
-        params.stride_b = K;
-        params.stride_c = N;
-        return dx12_gemm_dispatch_dxla_wave(dev, cmd, buf_a, buf_b, buf_c, &params);
-    }
-    // DXLA Wave path for Q8_0 prefill (M > 1)
-    else if (a->type == GGML_TYPE_Q8_0 && dev->caps.dxla_wave && M > 1) {
-        dx12_buffer* buf_a = dx12_backend_buffer_from_tensor(a);
-        dx12_buffer* buf_b = dx12_backend_buffer_from_tensor(b);
-        dx12_buffer* buf_c = dx12_backend_buffer_from_tensor(dst);
-        if (!buf_a || !buf_b || !buf_c) return false;
-        dx12_gemm_params params{};
-        params.M = M;
-        params.N = N;
-        params.K = K;
-        params.quant_a = DX12_QUANT_Q8_0;
-        params.quant_b = DX12_QUANT_F16;
-        params.alpha = 1.0f;
-        params.batch_count = 1;
-        params.transposed_b = false;
-        params.stride_a = K;
-        params.stride_b = K;
-        params.stride_c = N;
-        return dx12_gemm_dispatch_dxla_wave(dev, cmd, buf_a, buf_b, buf_c, &params);
-    }
+    // Quantized DXLA wave paths (Q4_0/Q8_0/Q4_K) removed: those shaders read
+    // ByteAddressBuffer with byte-address/4 and fill only 32/256 of the A tile
+    // — garbage output and DEVICE_HUNG on -p 128 (see TRACE-gemv-direct-path-opt.md).
+    // Quant prefill falls through to the correct mm_* tiled shaders below.
     // K-quants share one shader pair; the quant selector rides in the CBV pad
     uint32_t kq_type = 0;
     const char* shader_name = nullptr;
@@ -685,11 +646,11 @@ bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor
         return dx12_shader_dispatch(dev, cmd, dispatch, &params, sizeof(params), srvs, 2, buf_c);
     }
 
-    // Prefill: one dispatch cannot be preempted, so a large M*N*K (K-quant 7B
-    // prefill is ~35G MACs) exceeds the ~2s TDR. Chunk along M into separate
-    // dispatches; chunks write disjoint C rows, so no barrier is needed
-    // between them.
-    const uint64_t max_macs = kq_type ? 500ull * 1000 * 1000 : 2000ull * 1000 * 1000;
+    // Chunk large GEMMs along M to avoid exceeding the TDR limit (~2s).
+    // RX 9070 XT at 30 TFLOPS processes ~60T MACs in 2s — far above any
+    // single GEMM in practice. Old limits (500M K-quant, 2000M other) were
+    // conservative for slower GPUs; raised 4x to reduce dispatch overhead.
+    const uint64_t max_macs = kq_type ? 2000ull * 1000 * 1000 : 8000ull * 1000 * 1000;
     uint32_t m_chunk = M;
     uint64_t macs = (uint64_t)M * N * K;
     if (macs > max_macs) {

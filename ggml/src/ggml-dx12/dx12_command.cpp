@@ -104,14 +104,27 @@ bool dx12_cmd_list_reset(dx12_command_list* cmd) {
 
     HRESULT hr = cmd->allocator->Reset();
     if (FAILED(hr)) {
-        dx12_log(DX12_LOG_ERROR, "cmd_list_reset: allocator->Reset failed hr=0x%08X", hr);
-        return false;
-    }
-
-    hr = cmd->d3d_list->Reset(cmd->allocator.Get(), nullptr);
-    if (FAILED(hr)) {
-        dx12_log(DX12_LOG_ERROR, "cmd_list_reset: cmd_list->Reset failed hr=0x%08X", hr);
-        return false;
+        // RDNA4 workaround: allocator->Reset() returns E_FAIL even after the
+        // allocator has been used and GPU work has completed. Recreate the
+        // allocator and command list from scratch instead.
+        D3D12_COMMAND_LIST_TYPE list_type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        hr = cmd->device->device->CreateCommandAllocator(list_type, IID_PPV_ARGS(&cmd->allocator));
+        if (FAILED(hr)) {
+            dx12_log(DX12_LOG_ERROR, "cmd_list_reset: CreateCommandAllocator failed hr=0x%08X", hr);
+            return false;
+        }
+        hr = cmd->device->device->CreateCommandList(0, list_type, cmd->allocator.Get(), nullptr, IID_PPV_ARGS(&cmd->d3d_list));
+        if (FAILED(hr)) {
+            dx12_log(DX12_LOG_ERROR, "cmd_list_reset: CreateCommandList failed hr=0x%08X", hr);
+            return false;
+        }
+        cmd->first_use = true; // fresh allocator: skip Reset again on next call
+    } else {
+        hr = cmd->d3d_list->Reset(cmd->allocator.Get(), nullptr);
+        if (FAILED(hr)) {
+            dx12_log(DX12_LOG_ERROR, "cmd_list_reset: cmd_list->Reset failed hr=0x%08X", hr);
+            return false;
+        }
     }
 
     cmd->is_recording = true;
@@ -132,6 +145,7 @@ bool dx12_cmd_list_close(dx12_command_list* cmd) {
 
     cmd->is_recording = false;
     cmd->is_closed = true;
+    cmd->first_use = false; // list has been closed: next Reset must reopen it
     return true;
 }
 

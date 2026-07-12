@@ -106,6 +106,7 @@ $Shaders = @(
     @{Name="flash_attn"; Threads=@{X=64;Y=1;Z=1}},
     # FFN
     @{Name="ffn_fused"; Threads=@{X=256;Y=1;Z=1}},
+    @{Name="fused_ffn_q4k"; Threads=@{X=16;Y=16;Z=1}},
     # Misc
     @{Name="get_rows"; Threads=@{X=256;Y=1;Z=1}},
     @{Name="permute"; Threads=@{X=256;Y=1;Z=1}},

@@ -26,6 +26,8 @@ struct dx12_ring_slot {
     uint64_t                            fence_value = 0;
     bool                                in_flight = false;
     bool                                first_use = true;
+    uint32_t                            cbv_offset = 0;   // base offset in CBV ring
+    uint32_t                            cbv_used = 0;     // bytes consumed this recording
 };
 
 struct dx12_ring_context {

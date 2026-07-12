@@ -35,6 +35,7 @@ using MatA = Matrix<ComponentType::F16, TILE, TILE, MatrixUse::A, MatrixScope::W
 using MatB = Matrix<ComponentType::F16, TILE, TILE, MatrixUse::B, MatrixScope::Wave>;
 using MatC = Matrix<ComponentType::F32, TILE, TILE, MatrixUse::Accumulator, MatrixScope::Wave>;
 
+[WaveSize(32)]
 [numthreads(32, 1, 1)]
 void main(uint3 gid : SV_GroupID) {
     uint tile_row = gid.y * TILE;

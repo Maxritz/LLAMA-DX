@@ -89,7 +89,7 @@ struct DXLAWave {
     bool dispatch(dx12_command_list* cmd, dx12_buffer* a, dx12_buffer* b, dx12_buffer* c,
                   uint32_t M, uint32_t N, uint32_t K) {
         uint32_t p[16] = {M,N,K, K,K,N, 0,32};
-        D3D12_GPU_VIRTUAL_ADDRESS cbv = dx12_device_allocate_cbv(dev, p, sizeof(p));
+        D3D12_GPU_VIRTUAL_ADDRESS cbv = dx12_device_allocate_cbv(dev, nullptr, p, sizeof(p));
         if (!cbv) return false;
         dx12_buffer_transition(cmd, a, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         dx12_buffer_transition(cmd, b, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);

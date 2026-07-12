@@ -154,10 +154,15 @@ struct dx12_upload_batch {
         if (capacity >= needed) return;
         size_t new_cap = capacity ? capacity * 2 : 64 * 1024 * 1024;
         while (new_cap < needed) new_cap *= 2;
-        flush();
+        if (!flush()) {
+            // Flush failed (Close error). Staging buffer still has old data
+            // and capacity is still valid, so the next set_tensor will retry.
+            return;
+        }
         if (staging) dx12_buffer_destroy(staging);
-        dx12_heap_type heap_type = (dev && dev->caps.gpu_upload_heap)
-            ? dx12_heap_type::gpu_upload : dx12_heap_type::upload;
+        // RDNA4 workaround: GPU_UPLOAD + CopyBufferRegion can cause Close
+        // failures. Use regular UPLOAD heap for staging until verified stable.
+        dx12_heap_type heap_type = dx12_heap_type::upload;
         staging = dx12_buffer_create(dev, new_cap, heap_type);
         capacity = staging ? new_cap : 0;
         used = 0;
@@ -166,13 +171,24 @@ struct dx12_upload_batch {
                  heap_type == dx12_heap_type::gpu_upload ? "GPU_UPLOAD" : "UPLOAD");
     }
 
-    void flush() {
-        if (!pending || !cmd) return;
-        dx12_cmd_list_close(cmd);
-        dx12_cmd_list_submit_and_wait(cmd);
+    bool flush(bool wait = true) {
+        if (!pending || !cmd) return true;
+        if (!dx12_cmd_list_close(cmd)) {
+            // Close failure: recreate cmd list and keep data for retry.
+            // The staging buffer still holds the accumulated data.
+            dx12_cmd_list_destroy(cmd);
+            cmd = dx12_cmd_list_create(dev);
+            return false;
+        }
+        if (wait) {
+            dx12_cmd_list_submit_and_wait(cmd);
+        } else {
+            dx12_cmd_list_submit(cmd);
+        }
         dx12_cmd_list_reset(cmd);
         used = 0;
         pending = false;
+        return true;
     }
 
     void destroy() {
@@ -318,6 +334,17 @@ static size_t dx12_buft_get_max_size(ggml_backend_buffer_type_t buft) {
 
 static size_t dx12_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor* tensor) {
     (void)buft;
+    // K-quants: allocate F16-sized buffer when dequant-to-F16 is enabled.
+    static bool s_dequant_f16 = []() {
+        const char* env = getenv("DX12_DEQUANT_TO_F16");
+        return env && env[0] == '1';
+    }();
+    if (s_dequant_f16 &&
+        (tensor->type == GGML_TYPE_Q4_K ||
+         tensor->type == GGML_TYPE_Q5_K ||
+         tensor->type == GGML_TYPE_Q6_K)) {
+        return (size_t)ggml_nelements(tensor) * sizeof(ggml_fp16_t);
+    }
     return ggml_nbytes(tensor);
 }
 
@@ -387,7 +414,7 @@ static enum ggml_status dx12_buf_init_tensor(ggml_backend_buffer_t buf, ggml_ten
     return GGML_STATUS_SUCCESS;
 }
 
-static void dx12_flush_uploads(dx12_device* dev);
+static void dx12_flush_uploads(dx12_device* dev, bool wait = true);
 
 static void dx12_buf_memset_tensor(ggml_backend_buffer_t buf, ggml_tensor* tensor,
                                     uint8_t value, size_t offset, size_t size) {
@@ -423,6 +450,38 @@ static void dx12_buf_set_tensor(ggml_backend_buffer_t buf, ggml_tensor* tensor,
         return;
     }
 
+    // K-quant weight tensors: optionally dequantize to F16 on load (opt-in via
+    // DX12_DEQUANT_TO_F16=1). This routes through the fast DXLA F16 GEMM path
+    // instead of the slow scalar mm_kq shader, at the cost of 3.5x VRAM.
+    static bool s_dequant_f16 = []() {
+        const char* env = getenv("DX12_DEQUANT_TO_F16");
+        return env && env[0] == '1';
+    }();
+    bool is_kquant = s_dequant_f16 &&
+        (tensor->type == GGML_TYPE_Q4_K ||
+         tensor->type == GGML_TYPE_Q5_K ||
+         tensor->type == GGML_TYPE_Q6_K);
+    ggml_fp16_t* f16_buf = nullptr;
+    size_t f16_size = 0;
+    if (is_kquant && offset == 0) {
+        int64_t ne = ggml_nelements(tensor);
+        f16_size = (size_t)ne * sizeof(ggml_fp16_t);
+        float* tmp = (float*)malloc((size_t)ne * sizeof(float));
+        f16_buf = (ggml_fp16_t*)malloc(f16_size);
+        // Dequant via type traits (works for any quant format, no direct dep)
+        const struct ggml_type_traits* tt = ggml_get_type_traits(tensor->type);
+        if (tt->to_float) {
+            tt->to_float(data, tmp, ne);
+        }
+        ggml_fp32_to_fp16_row(tmp, f16_buf, ne);
+        free(tmp);
+        data = f16_buf;
+        size = f16_size;
+        // NOTE: tensor->type stays Q4_K — GGML uses it for stride computation.
+        // The F16 data is only in the GPU buffer; dispatch routing must check
+        // the buffer allocation size (F16 == 3.5x quantized) to select the path.
+    }
+
     void* mapped = dx12_buffer_map(ctx->gpu_buffer);
     size_t tensor_off = mapped
         ? (size_t)((const char*)tensor->data - (const char*)mapped)
@@ -430,6 +489,7 @@ static void dx12_buf_set_tensor(ggml_backend_buffer_t buf, ggml_tensor* tensor,
 
     if (mapped) {
         bool ok = dx12_buffer_upload(ctx->gpu_buffer, data, size, tensor_off + offset);
+        if (f16_buf) free(f16_buf);
         if (!ok) dx12_log(DX12_LOG_ERROR, "upload FAILED: %s", tensor->name);
         return;
     }
@@ -484,6 +544,8 @@ static void dx12_buf_set_tensor(ggml_backend_buffer_t buf, ggml_tensor* tensor,
 
     // Record GPU copy
     auto* d3d_cmd = reinterpret_cast<ID3D12GraphicsCommandList10*>(batch.cmd->d3d_list.Get());
+    dx12_log(DX12_LOG_INFO, "upload: copy size=%zu staging_off=%zu dst_off=%llu",
+             size, batch.used, (unsigned long long)(tensor_off + offset));
     d3d_cmd->CopyBufferRegion(
         gpu_buf->resource.Get(), tensor_off + offset,
         batch.staging->resource.Get(), batch.used,
@@ -497,16 +559,20 @@ static void dx12_buf_set_tensor(ggml_backend_buffer_t buf, ggml_tensor* tensor,
     // the staging buffer, so the caller's pointer may be freed immediately.
     // (The historical per-tensor flush was a workaround for the wait_idle
     // fence double-signal bug, fixed in dx12_device.cpp.)
+    if (f16_buf) free(f16_buf);
 }
 
-// Flush all pending upload batches (called from synchronize or graph_compute)
-static void dx12_flush_uploads(dx12_device* dev) {
+// Flush all pending upload batches.
+// Called from synchronize (wait=true) and graph_compute (wait=false).
+// When wait=false, the upload copy is submitted without blocking, relying on
+// queue ordering to ensure uploads complete before the subsequent compute.
+static void dx12_flush_uploads(dx12_device* dev, bool wait) {
     if (!dev) return;
 
     std::lock_guard<std::mutex> lk(g_upload_batch_mutex);
     auto it = g_upload_batches.find(dev);
     if (it != g_upload_batches.end()) {
-        it->second.flush();
+        it->second.flush(wait);
     }
 }
 
@@ -743,8 +809,11 @@ static ggml_status ggml_backend_dx12_graph_compute(ggml_backend_t backend,
         return GGML_STATUS_FAILED;
     }
 
-    // Flush any pending staging uploads
-    dx12_flush_uploads(ctx->device);
+    // Flush pending uploads asynchronously (no wait). Upload and compute use
+    // the same DIRECT queue, so the CopyBufferRegion completes before any
+    // subsequent compute dispatch on the ring. The ring's fence backpressure
+    // in synchronize() drains all work.
+    dx12_flush_uploads(ctx->device, false);
 
     if (!cgraph || cgraph->n_nodes == 0) return GGML_STATUS_SUCCESS;
 

@@ -100,21 +100,33 @@ dx12_ring_slot* dx12_ring_acquire(dx12_ring_context* ring) {
     if (!slot.first_use) {
         HRESULT hr = slot.allocator->Reset();
         if (FAILED(hr)) {
-            dx12_log(DX12_LOG_ERROR, "ring_acquire: allocator->Reset failed hr=0x%08X", hr);
-            return nullptr;
-        }
-
-        hr = slot.d3d_list->Reset(slot.allocator.Get(), nullptr);
-        if (FAILED(hr)) {
-            dx12_log(DX12_LOG_ERROR, "ring_acquire: cmd_list->Reset failed hr=0x%08X", hr);
-            return nullptr;
+            // RDNA4 workaround: allocator->Reset() may fail even after
+            // use. Recreate allocator and command list from scratch.
+            D3D12_COMMAND_LIST_TYPE list_type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            hr = ring->dev->device->CreateCommandAllocator(list_type, IID_PPV_ARGS(&slot.allocator));
+            if (FAILED(hr)) {
+                dx12_log(DX12_LOG_ERROR, "ring_acquire: CreateCommandAllocator failed hr=0x%08X", hr);
+                return nullptr;
+            }
+            hr = ring->dev->device->CreateCommandList(0, list_type, slot.allocator.Get(), nullptr, IID_PPV_ARGS(&slot.d3d_list));
+            if (FAILED(hr)) {
+                dx12_log(DX12_LOG_ERROR, "ring_acquire: CreateCommandList failed hr=0x%08X", hr);
+                return nullptr;
+            }
+            slot.first_use = true; // fresh allocator: skip Reset on next acquire
+        } else {
+            hr = slot.d3d_list->Reset(slot.allocator.Get(), nullptr);
+            if (FAILED(hr)) {
+                dx12_log(DX12_LOG_ERROR, "ring_acquire: cmd_list->Reset failed hr=0x%08X", hr);
+                return nullptr;
+            }
         }
     }
 
     slot.first_use = false;
     slot.fence_value = 0;
     slot.in_flight = false;
-
+    slot.cbv_used = 0;
     return &slot;
 }
 

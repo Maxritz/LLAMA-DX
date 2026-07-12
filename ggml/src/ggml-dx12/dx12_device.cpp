@@ -460,29 +460,24 @@ void dx12_detect_device_caps(dx12_device* dev) {
         case DX12_ARCH_RDNA4:
         case DX12_ARCH_RDNA3:
             c.optimal_gemm_tile = 32;
-            c.prefers_wave64 = true;
             break;
         case DX12_ARCH_RDNA2:
             c.optimal_gemm_tile = 32; // No WMMA, use standard tile GEMM
-            c.prefers_wave64 = true;
             break;
         case DX12_ARCH_ADA:
             c.optimal_gemm_tile = 64;
-            c.prefers_wave64 = false;
             break;
         case DX12_ARCH_AMPERE:
             c.optimal_gemm_tile = 64;
-            c.prefers_wave64 = false;
             break;
         case DX12_ARCH_ALCHEMIST:
         case DX12_ARCH_BMG:
             c.optimal_gemm_tile = 32;
-            c.prefers_wave64 = false;
             break;
         default:
             c.optimal_gemm_tile = 32;
-            c.prefers_wave64 = true;
     }
+    c.prefers_wave64 = (c.wave_lane_count_max >= 64) && (c.wave_lane_count_max > c.wave_lane_count_min);
 
     dx12_log(DX12_LOG_INFO, "Device caps: WaveOps=%s WaveSize=%u-%u Native16bit=%s",
         c.wave_ops ? "YES" : "NO",
@@ -645,21 +640,11 @@ dx12_result dx12_device_create(int32_t adapter_index, dx12_device** out_device) 
 
     // Create CBV ring buffer (upload heap, 256-byte aligned).
     //
-    // Sized generously (4MB = 16384 dispatch-constant slots) because
-    // dx12_device_allocate_cbv wraps this ring with NO synchronization: a
-    // whole graph_compute call records every node's dispatch into a single
-    // command list and only submits+waits once at the end, so every
-    // dispatch's constants get memcpy'd into this ring before the GPU
-    // executes any of them. A too-small ring (previously 64KB = 256 slots)
-    // wraps mid-graph for any real model (Llama-3.2-1B alone needs ~300+
-    // dispatches per token), silently overwriting earlier dispatches'
-    // constants with later ones' before the GPU ever reads them — the GPU
-    // then executes with garbage M/N/K/stride values, which can turn a
-    // shader's `for (k = 0; k < params.K; k++)` into a near-infinite loop
-    // and hang the device (DXGI_ERROR_DEVICE_HUNG). This is a real fix only
-    // insofar as it makes wraparound unlikely for current graph sizes; the
-    // ring is still unsynchronized, so a model/context large enough to
-    // exceed this many dispatches per compute call would reproduce the bug.
+    // Partitioned into DX12_RING_CAPACITY regions, one per ring slot.
+    // Each slot writes only to its own region; slot reuse is fence-
+    // protected by dx12_ring_acquire(), so no cross-slot sync needed.
+    // Region size = 4MB / 8 = 512KB = 2048 CBV slots per region, which
+    // covers the largest graphs without per-region wraparound.
     {
         D3D12_HEAP_PROPERTIES heap_props = {};
         heap_props.Type = D3D12_HEAP_TYPE_UPLOAD;
@@ -705,14 +690,22 @@ dx12_result dx12_device_create(int32_t adapter_index, dx12_device** out_device) 
         dev->cbv_ring_gpu_address =
             dev->cbv_ring_buffer->GetGPUVirtualAddress();
         dev->cbv_ring_size = (uint32_t)CBV_RING_BUFFER_SIZE;
-        dev->cbv_ring_offset = 0;
+        dev->cbv_region_size = (uint32_t)CBV_RING_BUFFER_SIZE / DX12_RING_CAPACITY;
 
-        dx12_log(DX12_LOG_INFO, "CBV ring buffer created: %uMB",
-                 (unsigned)(CBV_RING_BUFFER_SIZE / (1024 * 1024)));
+        dx12_log(DX12_LOG_INFO, "CBV ring buffer created: %uMB (%u regions x %uKB)",
+                 (unsigned)(CBV_RING_BUFFER_SIZE / (1024 * 1024)),
+                 DX12_RING_CAPACITY,
+                 (unsigned)(dev->cbv_region_size / 1024));
     }
 
     // Create ring-buffer command submission (pre-allocated, fence-polling)
     dev->ring = dx12_ring_create(dev, DX12_RING_CAPACITY);
+    if (dev->ring) {
+        // Assign each ring slot its own CBV region (no cross-slot sync needed)
+        for (uint32_t i = 0; i < DX12_RING_CAPACITY && i < dev->ring->slots.size(); i++) {
+            dev->ring->slots[i].cbv_offset = i * dev->cbv_region_size;
+        }
+    }
     if (!dev->ring) {
         dx12_log(DX12_LOG_ERROR, "Failed to create ring buffer");
         delete dev;
@@ -867,6 +860,7 @@ uint64_t dx12_device_signal_fence(dx12_device* dev) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 D3D12_GPU_VIRTUAL_ADDRESS dx12_device_allocate_cbv(dx12_device* dev,
+                                                     dx12_ring_slot* slot,
                                                      const void* data,
                                                      uint32_t size) {
     if (!dev || !dev->cbv_ring_buffer || !data || size == 0) return 0;
@@ -874,33 +868,32 @@ D3D12_GPU_VIRTUAL_ADDRESS dx12_device_allocate_cbv(dx12_device* dev,
     // Align size to 256 bytes (D3D12 constant buffer requirement)
     uint32_t aligned_size = (size + 255) & ~255;
 
-    // Simple ring buffer allocation (no synchronization for now)
-    uint32_t offset = dev->cbv_ring_offset;
-
-    // Ensure offset is 256-byte aligned
-    offset = (offset + 255) & ~255;
-
-    if (offset + aligned_size > dev->cbv_ring_size) {
-        offset = 0;  // Wrap around (must also be 256-byte aligned, which 0 is)
+    uint32_t offset;
+    if (slot) {
+        // Per-slot region: slot reuse is fence-protected by ring_acquire,
+        // so the GPU always finishes reading before this region is recycled.
+        offset = slot->cbv_offset + slot->cbv_used;
+        if (offset + aligned_size > dev->cbv_ring_size) {
+            // Region wrap: drain GPU, reset slot's region
+            dx12_device_wait_idle(dev);
+            offset = slot->cbv_offset;
+            slot->cbv_used = 0;
+        }
+        slot->cbv_used += aligned_size;
+    } else {
+        // Fallback (tests, standalone cmd lists): unsynchronized flat offset.
+        // Uses the last region to avoid colliding with ring-slot regions.
+        uint32_t fallback_base = dev->cbv_ring_size - dev->cbv_region_size;
+        static uint32_t fallback_offset = 0;
+        offset = fallback_base + fallback_offset;
+        if (offset + aligned_size > dev->cbv_ring_size) {
+            dx12_device_wait_idle(dev);
+            offset = fallback_base;
+            fallback_offset = 0;
+        }
+        fallback_offset = offset + aligned_size - fallback_base;
     }
 
-    // Copy data to ring buffer
     memcpy(dev->cbv_ring_cpu_address + offset, data, size);
-
-    // Calculate GPU virtual address
-    D3D12_GPU_VIRTUAL_ADDRESS gpu_address =
-        dev->cbv_ring_gpu_address + offset;
-
-    {
-        const uint32_t* src = (const uint32_t*)data;
-        dx12_log(DX12_LOG_VERBOSE,
-                 "CBV write: gpu=%llx M=%u N=%u K=%u",
-                 (unsigned long long)gpu_address,
-                 src[0], src[1], src[2]);
-    }
-
-    // Update offset (256-byte aligned)
-    dev->cbv_ring_offset = offset + aligned_size;
-
-    return gpu_address;
+    return dev->cbv_ring_gpu_address + offset;
 }

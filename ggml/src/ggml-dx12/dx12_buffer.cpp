@@ -257,6 +257,11 @@ void dx12_buffer_transition(dx12_command_list* cmd,
     d3d_cmd->ResourceBarrier(1, &barrier);
 
     buf->state = new_state;
+    // Keep parent block state in sync with sub-allocation (they share the
+    // same ID3D12Resource — barriers must reflect the same actual state).
+    if (buf->parent) {
+        buf->parent->state = new_state;
+    }
 }
 
 void dx12_buffer_transition_batch(dx12_command_list* cmd,
@@ -292,6 +297,9 @@ void dx12_buffer_transition_batch(dx12_command_list* cmd,
             barriers[n].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
             n++;
             buf->state = new_state;
+            if (buf->parent) {
+                buf->parent->state = new_state;
+            }
         }
     }
 

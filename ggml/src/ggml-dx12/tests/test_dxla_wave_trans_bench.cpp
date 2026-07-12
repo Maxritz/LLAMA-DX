@@ -111,7 +111,7 @@ struct DXLAWaveTrans {
         //   {M, N, K, stride_a, stride_b, stride_c, transposed_b, wave_size, reserved[9]}
         // stride_a = K (Q is MxK row-major), stride_b = K (B is NxK row-major), stride_c = N
         uint32_t p[16] = {M, N, K, K, K, N, 1, 32};
-        D3D12_GPU_VIRTUAL_ADDRESS cbv = dx12_device_allocate_cbv(dev, p, sizeof(p));
+        D3D12_GPU_VIRTUAL_ADDRESS cbv = dx12_device_allocate_cbv(dev, nullptr, p, sizeof(p));
         if (!cbv) return false;
         dx12_buffer_transition(cmd, a, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         dx12_buffer_transition(cmd, b, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);

@@ -197,6 +197,7 @@ set(DX12_SHADERS_DXLA
     mul_mat_dxla_wave_f16_f16
     mul_mat_dxla_wave_f16_f16_trans
     mul_mat_dxla_wave_q4_0_f16
+    mul_mat_dxla_wave_q4_k_f16
     mul_mat_dxla_wave_q8_0_f16
     mul_mat_dxla_tg_f16_f16
     attn_qk_dxla

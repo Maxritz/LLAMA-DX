@@ -108,7 +108,7 @@ bool dx12_shader_dispatch(dx12_device* dev,
         const void* cbv_data = (constants && constants_size > 0) ? constants : zero_cbv;
         uint32_t cbv_size = (constants && constants_size > 0) ? (uint32_t)constants_size : (uint32_t)sizeof(zero_cbv);
         D3D12_GPU_VIRTUAL_ADDRESS cbv_address =
-            dx12_device_allocate_cbv(dev, cbv_data, cbv_size);
+            dx12_device_allocate_cbv(dev, cmd->ring_slot, cbv_data, cbv_size);
         if (cbv_address) {
             cmd->d3d_list->SetComputeRootConstantBufferView(0, cbv_address);
         } else {

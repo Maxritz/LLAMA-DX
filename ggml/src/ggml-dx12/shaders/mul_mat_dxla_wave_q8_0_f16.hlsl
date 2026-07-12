@@ -37,6 +37,7 @@ float dequant_q8_0_elem(uint blk, uint lane) {
     return d * (float)qs;
 }
 
+[WaveSize(32)]
 [numthreads(32, 1, 1)]
 void main(uint3 gid : SV_GroupID) {
     uint tile_row = gid.y * TILE;
