@@ -12,6 +12,7 @@
  */
 
 #include "ggml-backend-dx12.h"
+#include "ggml-backend-impl.h"
 #include "dx12_device.h"
 #include "dx12_buffer.h"
 #include "dx12_command.h"
@@ -1289,3 +1290,5 @@ ggml_backend_reg_t ggml_backend_dx12_reg(void) {
 
     return &g_dx12_reg;
 }
+
+GGML_BACKEND_DL_IMPL(ggml_backend_dx12_reg)

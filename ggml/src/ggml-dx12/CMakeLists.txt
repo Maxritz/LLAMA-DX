@@ -20,11 +20,26 @@ message(STATUS "Using Agility SDK from: ${AGILITY_SDK_DIR}")
 # DXC Compiler Detection
 # ═══════════════════════════════════════════════════════════════════════════════
 # DXC can come from: (1) Windows SDK, (2) Agility SDK, (3) Standalone
-set(DXC_EXECUTABLE "C:/Users/rr/Desktop/Notllama-loc/new-DXMLDXAL/dxc-1.10.2605.2/bin/x64/dxc.exe" CACHE FILEPATH "DXC compiler" FORCE)
-
-if(NOT DXC_EXECUTABLE)
-    message(FATAL_ERROR "dxc.exe not found. Install Windows SDK 22621+ or DXC standalone.")
+set(_DXC_CANDIDATES
+    "E:/DXllama/dxc-1.10.2605.2/bin/x64/dxc.exe"
+    "C:/Users/rr/Desktop/Notllama-loc/new-DXMLDXAL/dxc-1.10.2605.2/bin/x64/dxc.exe"
+)
+if(NOT DXC_EXECUTABLE OR NOT EXISTS "${DXC_EXECUTABLE}")
+    unset(DXC_EXECUTABLE CACHE)
+    foreach(_cand IN LISTS _DXC_CANDIDATES)
+        if(EXISTS "${_cand}")
+            set(DXC_EXECUTABLE "${_cand}" CACHE FILEPATH "DXC compiler")
+            break()
+        endif()
+    endforeach()
 endif()
+
+if(NOT DXC_EXECUTABLE OR NOT EXISTS "${DXC_EXECUTABLE}")
+    message(FATAL_ERROR "dxc.exe not found. Install Windows SDK 22621+ or DXC standalone, or pass -DDXC_EXECUTABLE=<path>.")
+endif()
+
+get_filename_component(_DXC_BIN_DIR "${DXC_EXECUTABLE}" DIRECTORY)
+get_filename_component(DXC_INCLUDE_DIR "${_DXC_BIN_DIR}/../../inc/hlsl" ABSOLUTE)
 message(STATUS "DXC compiler: ${DXC_EXECUTABLE}")
 
 # Verify DXC supports SM 6.10
@@ -74,9 +89,9 @@ set(DX12_HEADERS
 # ═══════════════════════════════════════════════════════════════════════════════
 # Library Target
 # ═══════════════════════════════════════════════════════════════════════════════
-add_library(ggml-backend-dx12 STATIC ${DX12_SOURCES} ${DX12_HEADERS})
+add_library(ggml-dx12 ${DX12_SOURCES} ${DX12_HEADERS})
 
-target_include_directories(ggml-backend-dx12
+target_include_directories(ggml-dx12
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}
     PRIVATE
@@ -86,18 +101,38 @@ target_include_directories(ggml-backend-dx12
 )
 
 # Link DirectX libraries
-target_link_libraries(ggml-backend-dx12
+target_link_libraries(ggml-dx12
     PUBLIC
         d3d12.lib
         dxgi.lib
         dxcompiler.lib
 )
 
+# Handle GGML_BACKEND_DL for proper library type and registration
+if(GGML_BACKEND_DL)
+    # Dynamic backend - MODULE library
+    set_target_properties(ggml-dx12 PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
+        PREFIX ""
+    )
+    target_compile_definitions(ggml-dx12 PRIVATE GGML_BACKEND_DL GGML_BACKEND_BUILD GGML_BACKEND_SHARED)
+    add_dependencies(ggml ggml-dx12)
+    # Ensure versioning for DLL suffix
+    set_target_properties(ggml-dx12 PROPERTIES
+        VERSION ${GGML_VERSION}
+        SOVERSION ${GGML_VERSION_MAJOR}
+    )
+else()
+    # Static backend - link into ggml
+    target_link_libraries(ggml PUBLIC ggml-dx12)
+    target_compile_definitions(ggml PUBLIC GGML_USE_DX12)
+endif()
+
 # Diagnostic toggles (set via cmake -D)
 option(DX12_FORCE_COMPUTE_LIST "Use D3D12_COMMAND_LIST_TYPE_COMPUTE instead of DIRECT (diagnostic)" OFF)
 
 # Shader Model 6.10 compile flags
-target_compile_definitions(ggml-backend-dx12
+target_compile_definitions(ggml-dx12
     PRIVATE
         DX12_AGILITY_SDK_VERSION=${DX12_AGILITY_SDK_VERSION}
         $<$<CONFIG:Debug>:DX12_DEBUG_LAYER>
@@ -108,10 +143,9 @@ target_compile_definitions(ggml-backend-dx12
 )
 
 # C++20 required for designated initializers and concepts
-target_compile_features(ggml-backend-dx12 PRIVATE cxx_std_20)
+target_compile_features(ggml-dx12 PRIVATE cxx_std_20)
 
-target_link_libraries(ggml-backend-dx12 PRIVATE ggml-base)
-target_link_libraries(ggml PUBLIC ggml-backend-dx12)
+target_link_libraries(ggml-dx12 PUBLIC ggml-base)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Shader Compilation
@@ -120,7 +154,7 @@ set(DX12_SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/shaders)
 set(DX12_CSO_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders)
 file(MAKE_DIRECTORY ${DX12_CSO_DIR})
 
-# List of all HLSL shaders
+# Shader list (just names, used for compilation loop)
 set(DX12_SHADERS
     dequant_q4_0
     dequant_q8_0
@@ -161,7 +195,6 @@ set(DX12_SHADERS
     rope_f32
     set_rows_gen
     # DXLA shaders — SM 6.10 (dx::linalg cooperative matrix)
-    # Compiled separately with cs_6_10 target below
     mul_mat_dxla_wave_f16_f16
     mul_mat_dxla_wave_q4_0_f16
     mul_mat_dxla_tg_f16_f16
@@ -185,6 +218,75 @@ set(DX12_SHADERS
     get_rows
     permute
     copy
+)
+
+# Thread group sizes: SHADER_NAME TG_X TG_Y TG_Z
+# Must match [numthreads(X,Y,Z)] in each .hlsl file
+set(DX12_SHADER_THREAD_GROUPS
+    dequant_q4_0,256,1,1
+    dequant_q8_0,256,1,1
+    dequant_q6_k,64,1,1
+    dequant_q4_k,64,1,1
+    dequant_q5_k,64,1,1
+    cast_f16_f32,256,1,1
+    cast_bf16_f16,256,1,1
+    mul_mat_f16_f16,32,32,1
+    mul_mat_f16_f32,16,16,1
+    mul_mat_q4_0_f16,16,16,1
+    mul_mat_q8_0_f16,16,16,1
+    mul_mat_batched,8,8,4
+    mul_mat_strided,16,16,1
+    mm_f32,16,16,1
+    mm_f32_tiled,16,16,1
+    mm_f16,16,16,1
+    mm_f16_tiled,16,16,1
+    mm_q8_0,16,16,1
+    mm_q4_0,16,16,1
+    mms_f32,16,16,1
+    mms_f16,16,16,1
+    mv_f32,256,1,1
+    mv_f16,256,1,1
+    mv_q8_0,256,1,1
+    mv_q4_0,256,1,1
+    mv_kq,256,1,1
+    mm_kq,16,16,1
+    ew_bin,256,1,1
+    ew_scale,256,1,1
+    ew_unary,256,1,1
+    ew_glu,256,1,1
+    pad_f32,256,1,1
+    rms_norm_row,256,1,1
+    soft_max_row,256,1,1
+    get_rows_x,256,1,1
+    cpy_gen,256,1,1
+    rope_f32,64,1,1
+    set_rows_gen,256,1,1
+    mul_mat_dxla_wave_f16_f16,32,1,1
+    mul_mat_dxla_wave_f16_f16_trans,32,1,1
+    mul_mat_dxla_wave_q4_0_f16,32,1,1
+    mul_mat_dxla_wave_q4_k_f16,32,1,1
+    mul_mat_dxla_wave_q8_0_f16,32,1,1
+    mul_mat_dxla_tg_f16_f16,256,1,1
+    attn_qk_dxla,256,1,1
+    attn_ov_dxla,256,1,1
+    soft_max,256,1,1
+    silu,256,1,1
+    gelu,256,1,1
+    add,256,1,1
+    mul,256,1,1
+    scale,256,1,1
+    rms_norm,256,1,1
+    layer_norm,256,1,1
+    rope,256,1,1
+    diag_mask_inf,256,1,1
+    flash_attn,64,1,1
+    mm_fused_act,32,32,1
+    ffn_fused,256,1,1
+    set_rows,256,1,1
+    write_const,256,1,1
+    get_rows,256,1,1
+    permute,256,1,1
+    copy,256,1,1
 )
 
 # Compile each .hlsl -> .cso
@@ -221,7 +323,7 @@ foreach(SHADER_NAME ${DX12_SHADERS})
             -Qembed_debug
             -HV 2021
             -I "${DX12_SHADER_DIR}"
-            -I "C:/Users/rr/Desktop/Notllama-loc/new-DXMLDXAL/dxc-1.10.2605.2/inc/hlsl"
+            -I "${DXC_INCLUDE_DIR}"
             -Fo ${CSO_FILE}
             ${HLSL_FILE}
         DEPENDS ${HLSL_FILE} ${DX12_SHADER_DIR}/common.hlsli ${DX12_SHADER_DIR}/kquants.hlsli
@@ -253,7 +355,7 @@ foreach(SHADER_NAME ${DX12_SHADERS_DXLA})
             -Qembed_debug
             -HV 2021
             -I "${DX12_SHADER_DIR}"
-            -I "C:/Users/rr/Desktop/Notllama-loc/new-DXMLDXAL/dxc-1.10.2605.2/inc/hlsl"
+            -I "${DXC_INCLUDE_DIR}"
             -Fo ${CSO_FILE}
             ${HLSL_FILE}
         DEPENDS ${HLSL_FILE} ${DX12_SHADER_DIR}/common.hlsli ${DX12_SHADER_DIR}/kquants.hlsli
@@ -272,22 +374,31 @@ endforeach()
 set(REGISTRY_CPP ${CMAKE_CURRENT_BINARY_DIR}/dx12_shader_registry.cpp)
 set(REGISTRY_H ${CMAKE_CURRENT_BINARY_DIR}/dx12_shader_registry.h)
 
+# Write thread groups to a file for the script to consume (done at configure time)
+set(TG_JSON ${CMAKE_CURRENT_BINARY_DIR}/thread_groups.txt)
+set(TG_CONTENT "")
+foreach(TG_ENTRY ${DX12_SHADER_THREAD_GROUPS})
+    string(APPEND TG_CONTENT "${TG_ENTRY}\n")
+endforeach()
+file(WRITE "${TG_JSON}" "${TG_CONTENT}")
+
 add_custom_command(
-    OUTPUT ${REGISTRY_CPP} ${REGISTRY_H}
+    OUTPUT ${REGISTRY_H}
     COMMAND ${CMAKE_COMMAND}
         -DINPUT_DIR=${DX12_CSO_DIR}
         -DOUTPUT_CPP=${REGISTRY_CPP}
         -DOUTPUT_H=${REGISTRY_H}
+        -DTG_JSON=${TG_JSON}
         -P ${CMAKE_CURRENT_SOURCE_DIR}/shaders/generate_registry.cmake
-    DEPENDS ${DX12_CSO_FILES}
+    DEPENDS ${DX12_CSO_FILES} ${TG_JSON}
     COMMENT "Generating shader registry"
 )
 
 add_custom_target(dx12_shaders ALL DEPENDS ${DX12_CSO_FILES} ${REGISTRY_CPP} ${REGISTRY_H})
-add_dependencies(ggml-backend-dx12 dx12_shaders)
+add_dependencies(ggml-dx12 dx12_shaders)
 
-target_sources(ggml-backend-dx12 PRIVATE ${REGISTRY_CPP})
-target_include_directories(ggml-backend-dx12 PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+target_sources(ggml-dx12 PRIVATE ${REGISTRY_CPP})
+target_include_directories(ggml-dx12 PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Copy Agility SDK DLLs to output directory
