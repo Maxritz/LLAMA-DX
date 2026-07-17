@@ -175,6 +175,13 @@ set(DX12_SHADERS
     mm_f16_tiled
     mm_q8_0
     mm_q4_0
+    mm_q5_0
+    mm_q4_0_prefill
+    mm_q5_0_prefill
+    mm_q8_0_prefill
+    mm_q4_k_prefill
+    mm_q5_k_prefill
+    mm_q6_k_prefill
     mms_f32
     mms_f16
     mv_f32

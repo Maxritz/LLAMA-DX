@@ -22,8 +22,8 @@ using MatA=Matrix<ComponentType::F16,32,32,MatrixUse::A,MatrixScope::ThreadGroup
 using MatB=Matrix<ComponentType::F16,32,32,MatrixUse::B,MatrixScope::ThreadGroup>;
 using MatC=Matrix<ComponentType::F32,32,32,MatrixUse::Accumulator,MatrixScope::ThreadGroup>;
 
-groupshared half s_a[32*32];
-groupshared half s_b[32*32];
+groupshared half s_a[32*33];
+groupshared half s_b[32*33];
 
 [numthreads(8,16,1)]
 void main(uint3 tid:SV_DispatchThreadID,uint3 gid:SV_GroupID,uint3 lid:SV_GroupThreadID){
@@ -37,13 +37,14 @@ void main(uint3 tid:SV_DispatchThreadID,uint3 gid:SV_GroupID,uint3 lid:SV_GroupT
         for(uint i=0;i<4;i++){
             uint a_idx=(tr+lr)*params.stride_a+k+lc*4+i;
             uint b_idx=(k+lr)*params.stride_b+tc+lc*4+i;
-            if(a_idx<(params.M*params.K))s_a[lr*32+lc*4+i]=load_a(a_idx);
-            if(b_idx<(params.K*params.N))s_b[lr*32+lc*4+i]=load_b(b_idx);
+            if(a_idx<(params.M*params.K))s_a[lr*33+lc*4+i]=load_a(a_idx);
+            if(b_idx<(params.K*params.N))s_b[lr*33+lc*4+i]=load_b(b_idx);
         }
         GroupMemoryBarrierWithGroupSync();
 
-        // Build matrices from shared memory
-        MatA ma; MatB mb;
+        // Load matrices from shared memory
+        MatA ma = MatA::Load(s_a, 0, 33 * sizeof(half), MatrixLayout::RowMajor);
+        MatB mb = MatB::Load(s_b, 0, 33 * sizeof(half), MatrixLayout::RowMajor);
         acc.MultiplyAccumulate(ma,mb);
         GroupMemoryBarrierWithGroupSync();
     }
