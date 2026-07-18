@@ -60,6 +60,41 @@ DONE:
     dispatch; naive mm_*/mms_* still referenced for small-M — delete only
     what a grep proves unreferenced).
 
+## PROGRESS UPDATE 3 (2026-07-18 session 4): decode structural + GEMM verdict
+
+DECODE STRUCTURAL — DONE (dx12_buffer.h/.cpp, dx12_graph.cpp):
+- Range-based hazard tracking replaces the last-dispatch-only heuristic:
+  dirty read/write GPU-VA ranges per resource; UAV barrier only on real
+  RAW/WAW/WAR overlap; a barrier or transition fences the whole resource and
+  drops its entries. This BOTH removes redundant barriers (pooled tensors
+  share one resource, so resource-granularity forced a barrier between
+  nearly every dispatch pair) AND closes two latent races the old heuristic
+  had: hazards separated by one unrelated dispatch, and cross-sub-graph
+  ordering (fixed with one global null-UAV barrier per sub-graph).
+- Chunked submission: graphs submit every 48 nodes (DX12_SUBMIT_CHUNK env,
+  0 disables) so the GPU executes while the CPU records the rest. Trap found
+  by the debug layer and fixed: the cmd wrapper's redundant-set cache
+  (last_pso/last_root_sig) MUST be invalidated on list rotation or
+  dispatches record with no root signature -> device removal.
+- Verified: full suite 1681/0, debug-layer run clean, 256-token generation
+  coherent, ppl 8.4844 unchanged.
+- Perf (DX12-only): tg128 1B 191 -> 208 (+9%), E4B 55.5 -> 64.2 (+16%),
+  7B 65.8 -> 69.4 (+5%); pp512 5303 / 842 / 468 (unchanged-or-up).
+  Vulkan tg gap on 1B narrowed 1.77x -> 1.62x; remainder is the per-token
+  fence waits + raw dispatch count (FLASH_ATTN would cut both).
+
+STRUCTURAL GEMM — ATTEMPTED, NEGATIVE RESULT (kept v2):
+- v3 (128x128 tile, 8x8 accs, TILE_K 16): correct but 5239 -> 4567 pp512 on
+  1B; doubled barrier rate + doubled block-header decodes + register
+  pressure ate the LDS win.
+- v4 (64x128 tile, 4x8 accs, TILE_K 32): correct but 4789 / 7B 270 —
+  K-quants regressed hard (heavier per-thread B loads imbalance the barrier).
+- Verdict: v2's 64x64/4x4 balance is the local optimum for this LDS-tiled
+  scalar-FMA design. Do NOT retry bigger register tiles; the next real
+  prefill lever is packed-f16 math (float16_t2, -enable-16bit-types is
+  already on) or double-buffered LDS, and the honest endgame vs Vulkan
+  coopmat needs DXLA (blocked on this driver).
+
 ## STILL OPEN
 
 - FIX 1 step 5: structural GEMM (8x8 register tile / 128x128, TILE_K 64,
@@ -243,6 +278,15 @@ PART 2 — DO NOT TOUCH (load-bearing; regressions here cost days)
 15. **src/llama-model-loader.cpp and all core llama/ggml files stay clean**
     of DX12-specific code. The backend integrates only through the standard
     ggml backend interface + ggml-backend-reg.cpp + ggml-dx12.h.
+16. **Hazard tracking is range-based** (dx12_barrier_pre_dispatch): any NEW
+    dispatch path must pass per-binding GPU-VA ranges + write_mask, or omit
+    them for whole-resource/all-write (maximally conservative, always safe).
+    Never reintroduce a "check only the previous dispatch" shortcut.
+17. **Command-list rotation must invalidate cmd->last_pso and
+    cmd->last_root_sig** — the redundant-set cache is per-wrapper, not
+    per-list; a fresh list with a stale cache records dispatches with no
+    root signature (device removal). Same applies to any new place that
+    swaps cmd->d3d_list.
 
 ═══════════════════════════════════════════════════════════════════════════════
 PART 3 — VERIFICATION CHEAT SHEET (run before calling anything done)

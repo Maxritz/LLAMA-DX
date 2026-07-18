@@ -524,8 +524,49 @@ bool dx12_graph_compute(dx12_device* dev, dx12_command_list* cmd, ggml_cgraph* g
     dx12_barrier_tracker barrier_tracker{};
     cmd->barrier_tracker = &barrier_tracker;
 
+    // Cross-graph fence: the tracker starts empty each sub-graph, but the
+    // previous sub-graph's writes are NOT implicitly ordered against this
+    // one (ExecuteCommandLists preserves submission order, not completion).
+    // One global UAV barrier (null resource = all UAV accesses) closes that
+    // race for the cost of a single barrier per sub-graph.
+    {
+        D3D12_RESOURCE_BARRIER gb = {};
+        gb.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        gb.UAV.pResource = nullptr;
+        cmd->d3d_list->ResourceBarrier(1, &gb);
+    }
+
+    // Submit in chunks so the GPU starts executing while the CPU is still
+    // recording the rest of the graph (decode graphs are ~200 dispatches;
+    // serial record-then-submit leaves the GPU idle for the whole record).
+    // Barriers order across lists on the same queue, so the hazard tracker
+    // state remains valid across a rotation.
+    static const int submit_chunk = []() {
+        const char* env = getenv("DX12_SUBMIT_CHUNK");
+        int v = env ? atoi(env) : 48;
+        return v > 0 ? v : 1 << 30; // 0 disables chunked submission
+    }();
+    int nodes_since_submit = 0;
+
     // Execute each node in topological order
     for (int i = 0; i < graph->n_nodes; i++) {
+        if (nodes_since_submit >= submit_chunk && i < graph->n_nodes - 1) {
+            dx12_ring_submit(dev->ring);
+            dx12_ring_slot* slot = dx12_ring_acquire(dev->ring);
+            if (!slot) {
+                dx12_log(DX12_LOG_ERROR, "graph_compute: chunk rotation acquire failed");
+                return false;
+            }
+            cmd->d3d_list = slot->d3d_list;
+            cmd->ring_slot = slot;
+            // Fresh list has no pipeline state: invalidate the wrapper's
+            // redundant-set cache or dispatches record with no root
+            // signature (device removal).
+            cmd->last_pso = nullptr;
+            cmd->last_root_sig = nullptr;
+            nodes_since_submit = 0;
+        }
+        nodes_since_submit++;
         ggml_tensor* node = graph->nodes[i];
         bool ok = false;
         bool dispatched = true;
@@ -678,14 +719,23 @@ static bool dx12_run_mm(dx12_device* dev, dx12_command_list* cmd,
     }
     bufs[nsrc] = buf_d;
 
-    // Coalesced barriers: batch all transitions + skip redundant UAV barriers
+    // Coalesced barriers: batch all transitions + skip redundant UAV barriers.
+    // Per-binding GPU VA ranges: srcs are reads, dst is the only write.
     D3D12_RESOURCE_STATES mm_states[4] = {
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS
     };
-    dx12_barrier_pre_dispatch(cmd, cmd->barrier_tracker, bufs, mm_states, nsrc + 1);
+    uint64_t rlo[4], rhi[4];
+    for (uint32_t i = 0; i < nsrc; i++) {
+        rlo[i] = dispatch.srv_addr[i];
+        rhi[i] = rlo[i] + ggml_nbytes(srcs[i]);
+    }
+    rlo[nsrc] = dispatch.uav_addr;
+    rhi[nsrc] = rlo[nsrc] + ggml_nbytes(dst);
+    dx12_barrier_pre_dispatch(cmd, cmd->barrier_tracker, bufs, mm_states, nsrc + 1,
+                              rlo, rhi, 1u << nsrc);
 
     dispatch.shader_name = shader;
     dispatch.sig_type = dx12_root_signature_type::mm;
@@ -869,15 +919,6 @@ bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor
         return false;
     }
 
-    // Coalesced barriers: batch all transitions + skip redundant UAV barriers
-    dx12_buffer* mm_bufs[3] = { buf_a, buf_b, buf_c };
-    D3D12_RESOURCE_STATES mm_states[3] = {
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS
-    };
-    dx12_barrier_pre_dispatch(cmd, cmd->barrier_tracker, mm_bufs, mm_states, 3);
-
     struct dx12_shader_dispatch dispatch{};
     dispatch.shader_name = shader_name;
     dispatch.sig_type = dx12_root_signature_type::mm;
@@ -887,6 +928,22 @@ bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor
     dispatch.srv_addr[0] = dx12_backend_tensor_gpu_addr(a);
     dispatch.srv_addr[1] = dx12_backend_tensor_gpu_addr(b);
     dispatch.uav_addr    = dx12_backend_tensor_gpu_addr(dst);
+
+    // Coalesced barriers with per-binding VA ranges (a/b read, dst written).
+    // Full dst range once, covering all M-chunks of the loop below.
+    {
+        dx12_buffer* mm_bufs[3] = { buf_a, buf_b, buf_c };
+        D3D12_RESOURCE_STATES mm_states[3] = {
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+        };
+        uint64_t rlo[3] = { dispatch.srv_addr[0], dispatch.srv_addr[1], dispatch.uav_addr };
+        uint64_t rhi[3] = { rlo[0] + ggml_nbytes(a), rlo[1] + ggml_nbytes(b),
+                            rlo[2] + ggml_nbytes(dst) };
+        dx12_barrier_pre_dispatch(cmd, cmd->barrier_tracker, mm_bufs, mm_states, 3,
+                                  rlo, rhi, 1u << 2);
+    }
 
     if (!dispatch.srv_addr[0] || !dispatch.srv_addr[1] || !dispatch.uav_addr) {
         dx12_log(DX12_LOG_ERROR, "MUL_MAT: missing tensor GPU address");
