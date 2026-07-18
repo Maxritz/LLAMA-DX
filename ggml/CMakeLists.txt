@@ -304,14 +304,15 @@ add_subdirectory(src)
 # tests and examples
 #
 
-if (GGML_BUILD_TESTS)
-    enable_testing()
-    add_subdirectory(tests)
-endif ()
+# tests and examples disabled - project is fork without those directories
+# if (GGML_BUILD_TESTS)
+#     enable_testing()
+#     add_subdirectory(tests)
+# endif ()
 
-if (GGML_BUILD_EXAMPLES)
-    add_subdirectory(examples)
-endif ()
+#if (GGML_BUILD_EXAMPLES)
+#    add_subdirectory(examples)
+#endif ()
 
 #
 # install

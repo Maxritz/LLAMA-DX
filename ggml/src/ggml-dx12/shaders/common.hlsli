@@ -157,15 +157,27 @@ float wave_max(float val) {
 // Packed F16 Store Helper (atomic, avoids RMW race on shared 32-bit words)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-void store_packed_f16(RWByteAddressBuffer buf, uint idx, half val) {
+// Store F16 to byte address
+void store_f16(RWByteAddressBuffer buf, uint idx, half val) {
     uint addr = idx * 2;
-    uint h = (uint)f32_to_f16((float)val);
+    uint16_t h = f32_to_f16((float)val);
+    uint existing = buf.Load(addr & ~2);
+    uint new_val;
     if (addr & 2) {
-        buf.InterlockedOr(addr & ~2, h << 16);
+        new_val = (existing & 0xFFFF) | ((uint)h << 16);
     } else {
-        buf.InterlockedOr(addr & ~2, h);
+        new_val = (existing & 0xFFFF0000) | h;
     }
+    buf.Store(addr & ~2, new_val);
 }
+
+void store_packed_f16(RWByteAddressBuffer buf, uint idx, half val) {
+    store_f16(buf, idx, val);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Root Constant Buffer Layouts (match root signatures in dx12_descriptor.cpp)
+// ═══════════════════════════════════════════════════════════════════════════════
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Root Constant Buffer Layouts (match root signatures in dx12_descriptor.cpp)
