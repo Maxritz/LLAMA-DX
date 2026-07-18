@@ -160,7 +160,7 @@ bool dx12_shader_dispatch(dx12_device* dev,
         dx12_cmd_list_set_compute_root_unordered_access_view(cmd, uav_slot, dst_addr);
         if (dispatch.sig_type == dx12_root_signature_type::mm) {
             // Fill spare UAV params so no root descriptor is left unset
-            for (uint32_t p = uav_slot + 1; p <= 4; p++) {
+            for (uint32_t p = uav_slot + 1; p <= 5; p++) {
                 dx12_cmd_list_set_compute_root_unordered_access_view(cmd, p, dst_addr);
             }
         }

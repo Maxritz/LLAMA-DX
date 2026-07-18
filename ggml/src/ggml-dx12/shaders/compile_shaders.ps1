@@ -135,6 +135,7 @@ $Shaders = @(
     @{Name="mv_q4_0"; Threads=@{X=256;Y=1;Z=1}},
     @{Name="mv_kq"; Threads=@{X=256;Y=1;Z=1}},
     @{Name="mv_id"; Threads=@{X=256;Y=1;Z=1}},
+    @{Name="flash_attn_ext"; Threads=@{X=256;Y=1;Z=1}},
     # GEMM (tile-based prefill, M>1)
     @{Name="mm_f32"; Threads=@{X=16;Y=16;Z=1}},
     @{Name="mm_f16"; Threads=@{X=16;Y=16;Z=1}},

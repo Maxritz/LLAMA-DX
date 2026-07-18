@@ -143,7 +143,7 @@ static ComPtr<ID3D12RootSignature> dx12_build_root_signature(dx12_device* dev,
 
         case dx12_root_signature_type::mm: {
             // Param 0: root 32-bit constants — max 48 DWORDs to stay
-            // within 64-DWORD root sig limit (48 + 4*2 root UAVs = 56).
+            // within 64-DWORD root sig limit (48 + 5*2 root UAVs = 58).
             // Covers all shader CB sizes: GEMV=4, softmax~20, rope~30.
             CD3DX12_ROOT_PARAMETER1 root_const;
             root_const.InitAsConstants(
@@ -151,11 +151,12 @@ static ComPtr<ID3D12RootSignature> dx12_build_root_signature(dx12_device* dev,
                 D3D12_SHADER_VISIBILITY_ALL);
             params.push_back(root_const);
 
-            // Params 1-4: root UAVs u0..u3. Sources bind at u0..u<n-1>, dst at
-            // u<n> (n = source count). All buffers bound as UAVs: sources often
+            // Params 1-5: root UAVs u0..u4. Sources bind at u0..u<n-1>, dst at
+            // u<n> (n = source count; up to 4 sources — FLASH_ATTN_EXT binds
+            // q,k,v,mask). All buffers bound as UAVs: sources often
             // alias the destination's resource, and a root SRV bound to a
             // UAV-state resource is invalid (hangs this driver).
-            for (uint32_t i = 0; i < 4; i++) {
+            for (uint32_t i = 0; i < 5; i++) {
                 CD3DX12_ROOT_PARAMETER1 uav_param;
                 uav_param.InitAsUnorderedAccessView(
                     i, 0,

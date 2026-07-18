@@ -95,6 +95,50 @@ bool dx12_op_supported(const ggml_tensor* node) {
                    dx12_dims_fit_u32(node);
         }
 
+        case GGML_OP_FLASH_ATTN_EXT: {
+            // Fused attention (flash_attn_ext.hlsl). v1 scope: F32 q, F16
+            // k/v with contiguous rows, optional F16 mask (ne2==1), no
+            // sinks, no ALiBi (max_bias), no logit softcap, head dims <= 256.
+            const ggml_tensor* q    = node->src[0];
+            const ggml_tensor* k    = node->src[1];
+            const ggml_tensor* v    = node->src[2];
+            const ggml_tensor* mask = node->src[3];
+            if (!q || !k || !v) return false;
+            if (node->src[4]) return false; // attention sinks
+            if (dx12_op_disabled("flashattn")) return false;
+            // OPT-IN for now (DX12_ENABLE_FA=1): the kernel passes all 553
+            // claimed test-backend-ops cases, but the v1 single-group-per-
+            // query design underfills the GPU at decode (n_q=1 -> n_head
+            // groups only: tg64@d4096 = 38 t/s vs 98 t/s on the mms path).
+            // Claiming the op would make "-fa auto" pick the slower path by
+            // default. v2 needs split-KV partials + a combine pass.
+            static const bool fa_enabled = getenv("DX12_ENABLE_FA") != nullptr;
+            if (!fa_enabled) return false;
+            float max_bias, logit_softcap;
+            memcpy(&max_bias,      (const char*)node->op_params + 4, sizeof(float));
+            memcpy(&logit_softcap, (const char*)node->op_params + 8, sizeof(float));
+            if (max_bias != 0.0f || logit_softcap != 0.0f) return false;
+            if (q->type != GGML_TYPE_F32 || q->nb[0] != 4) return false;
+            if (k->type != GGML_TYPE_F16 || k->nb[0] != 2) return false;
+            if (v->type != GGML_TYPE_F16 || v->nb[0] != 2) return false;
+            if (node->type != GGML_TYPE_F32 || node->nb[0] != 4) return false;
+            if (mask) {
+                if (mask->type != GGML_TYPE_F16 || mask->nb[0] != 2) return false;
+                if (mask->ne[2] != 1) return false;
+                if (mask->ne[3] != 1 && mask->ne[3] != q->ne[3]) return false;
+            }
+            if (q->ne[0] != k->ne[0]) return false;          // dk
+            if (q->ne[0] > 256 || v->ne[0] > 256) return false;
+            if (k->ne[1] != v->ne[1]) return false;          // n_kv
+            if (k->ne[2] != v->ne[2]) return false;          // kv heads
+            if (q->ne[2] % k->ne[2] != 0) return false;      // GQA
+            if (q->ne[3] != k->ne[3] || q->ne[3] != v->ne[3]) return false;
+            if (q->ne[1] > DX12_MAX_GROUPS || q->ne[2] > DX12_MAX_GROUPS ||
+                q->ne[3] > DX12_MAX_GROUPS) return false;
+            return dx12_dims_fit_u32(q) && dx12_dims_fit_u32(k) &&
+                   dx12_dims_fit_u32(v) && dx12_dims_fit_u32(node);
+        }
+
         case GGML_OP_ADD:
         case GGML_OP_MUL: {
             if (dx12_op_disabled("ewbin")) return false;
@@ -615,6 +659,7 @@ bool dx12_graph_compute(dx12_device* dev, dx12_command_list* cmd, ggml_cgraph* g
             switch (node->op) {
                 case GGML_OP_MUL_MAT:       ok = dx12_dispatch_mul_mat(dev, cmd, node); break;
                 case GGML_OP_MUL_MAT_ID:    ok = dx12_dispatch_mul_mat_id(dev, cmd, node); break;
+                case GGML_OP_FLASH_ATTN_EXT: ok = dx12_dispatch_flash_attn_ext(dev, cmd, node); break;
             case GGML_OP_ADD:           ok = dx12_dispatch_add(dev, cmd, node); break;
             case GGML_OP_MUL:           ok = dx12_dispatch_mul(dev, cmd, node); break;
             case GGML_OP_SCALE:         ok = dx12_dispatch_scale(dev, cmd, node); break;
@@ -686,23 +731,24 @@ static uint32_t tensor_nelements(const ggml_tensor* t) {
     return (uint32_t)(t->ne[0] * t->ne[1] * t->ne[2] * t->ne[3]);
 }
 
-// Run one mm-signature dispatch: up to 3 source tensors + dst, all bound as
+// Run one mm-signature dispatch: up to 4 source tensors + dst, all bound as
 // root UAVs with explicit per-tensor GPU VAs (tensors may share one buffer).
 static bool dx12_run_mm(dx12_device* dev, dx12_command_list* cmd,
                         const char* shader, const void* cbv, size_t cbv_size,
                         const ggml_tensor* s0, const ggml_tensor* s1, const ggml_tensor* s2,
-                        ggml_tensor* dst, uint32_t dx, uint32_t dy, uint32_t dz) {
+                        ggml_tensor* dst, uint32_t dx, uint32_t dy, uint32_t dz,
+                        const ggml_tensor* s3 = nullptr) {
     // Empty tensors (e.g. zero-row views) produce zero-group dispatches,
     // which this driver does not tolerate — legal no-op instead.
     if (dx == 0 || dy == 0 || dz == 0) return true;
 
-    const ggml_tensor* srcs[3] = { s0, s1, s2 };
-    dx12_buffer* bufs[4] = {};
-    dx12_buffer* srv_bufs[3] = {};
+    const ggml_tensor* srcs[4] = { s0, s1, s2, s3 };
+    dx12_buffer* bufs[5] = {};
+    dx12_buffer* srv_bufs[4] = {};
     uint32_t nsrc = 0;
 
     struct dx12_shader_dispatch dispatch{};
-    for (uint32_t i = 0; i < 3 && srcs[i]; i++) {
+    for (uint32_t i = 0; i < 4 && srcs[i]; i++) {
         srv_bufs[i] = dx12_backend_buffer_from_tensor(srcs[i]);
         dispatch.srv_addr[i] = dx12_backend_tensor_gpu_addr(srcs[i]);
         if (!srv_bufs[i] || !dispatch.srv_addr[i]) {
@@ -721,13 +767,14 @@ static bool dx12_run_mm(dx12_device* dev, dx12_command_list* cmd,
 
     // Coalesced barriers: batch all transitions + skip redundant UAV barriers.
     // Per-binding GPU VA ranges: srcs are reads, dst is the only write.
-    D3D12_RESOURCE_STATES mm_states[4] = {
+    D3D12_RESOURCE_STATES mm_states[5] = {
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS
     };
-    uint64_t rlo[4], rhi[4];
+    uint64_t rlo[5], rhi[5];
     for (uint32_t i = 0; i < nsrc; i++) {
         rlo[i] = dispatch.srv_addr[i];
         rhi[i] = rlo[i] + ggml_nbytes(srcs[i]);
@@ -1231,6 +1278,50 @@ bool dx12_dispatch_mul_mat_id(dx12_device* dev, dx12_command_list* cmd, ggml_ten
     return dx12_run_mm(dev, cmd, "mv_id", &p, sizeof(p),
                        as, b, ids, dst,
                        (p.N + 7) / 8, 1, n_slots);
+}
+
+// FLASH_ATTN_EXT: fused attention with online softmax (flash_attn_ext.hlsl).
+// One group per (query, head, batch). Shapes/types guaranteed by
+// dx12_op_supported. When there is no mask, q is bound in the mask slot so
+// the shader's register layout (u0..u4) stays fixed; has_mask=0 gates reads.
+bool dx12_dispatch_flash_attn_ext(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
+    const ggml_tensor* q    = dst->src[0];
+    const ggml_tensor* k    = dst->src[1];
+    const ggml_tensor* v    = dst->src[2];
+    const ggml_tensor* mask = dst->src[3];
+
+    float scale;
+    memcpy(&scale, (const char*)dst->op_params, sizeof(float));
+
+    struct {
+        uint32_t dk, dv, n_q, n_kv;
+        uint32_t n_head, gqa, has_mask, pad0;
+        float    scale;
+        uint32_t qnb1, qnb2, qnb3;
+        uint32_t knb1, knb2, knb3;
+        uint32_t vnb1, vnb2, vnb3;
+        uint32_t mnb1, mnb3;
+        uint32_t dnb1, dnb2, dnb3;
+    } p{};
+    p.dk       = (uint32_t)q->ne[0];
+    p.dv       = (uint32_t)v->ne[0];
+    p.n_q      = (uint32_t)q->ne[1];
+    p.n_kv     = (uint32_t)k->ne[1];
+    p.n_head   = (uint32_t)q->ne[2];
+    p.gqa      = (uint32_t)(q->ne[2] / k->ne[2]);
+    p.has_mask = mask ? 1u : 0u;
+    p.scale    = scale;
+    p.qnb1 = (uint32_t)q->nb[1]; p.qnb2 = (uint32_t)q->nb[2]; p.qnb3 = (uint32_t)q->nb[3];
+    p.knb1 = (uint32_t)k->nb[1]; p.knb2 = (uint32_t)k->nb[2]; p.knb3 = (uint32_t)k->nb[3];
+    p.vnb1 = (uint32_t)v->nb[1]; p.vnb2 = (uint32_t)v->nb[2]; p.vnb3 = (uint32_t)v->nb[3];
+    p.mnb1 = mask ? (uint32_t)mask->nb[1] : 0;
+    p.mnb3 = (mask && mask->ne[3] > 1) ? (uint32_t)mask->nb[3] : 0;
+    p.dnb1 = (uint32_t)dst->nb[1]; p.dnb2 = (uint32_t)dst->nb[2]; p.dnb3 = (uint32_t)dst->nb[3];
+
+    return dx12_run_mm(dev, cmd, "flash_attn_ext", &p, sizeof(p),
+                       q, k, v, dst,
+                       (uint32_t)q->ne[1], (uint32_t)q->ne[2], (uint32_t)q->ne[3],
+                       mask ? mask : q);
 }
 
 // Can RMS_NORM at graph->nodes[i] fuse with the MUL at i+1?

@@ -199,6 +199,7 @@ set(DX12_SHADERS
     mv_q4_0
     mv_kq
     mv_id
+    flash_attn_ext
     mm_kq
     ew_bin
     ew_scale
@@ -269,6 +270,7 @@ set(DX12_SHADER_THREAD_GROUPS
     mv_q4_0,256,1,1
     mv_kq,256,1,1
     mv_id,256,1,1
+    flash_attn_ext,256,1,1
     mm_kq,16,16,1
     mm_tiled,16,16,1
     ew_bin,256,1,1

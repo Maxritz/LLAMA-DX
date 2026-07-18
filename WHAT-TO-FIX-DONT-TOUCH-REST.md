@@ -95,6 +95,37 @@ STRUCTURAL GEMM — ATTEMPTED, NEGATIVE RESULT (kept v2):
   already on) or double-buffered LDS, and the honest endgame vs Vulkan
   coopmat needs DXLA (blocked on this driver).
 
+## PROGRESS UPDATE 4 (2026-07-18 session 5): FLASH_ATTN_EXT v1
+
+IMPLEMENTED AND CORRECT, GATED OPT-IN (DX12_ENABLE_FA=1):
+- shaders/flash_attn_ext.hlsl: fused attention with online softmax. One
+  256-thread group per (query, head, batch); 8 Wave32 subwaves score 8 KV
+  rows per iteration; dv-length accumulator in LDS; NaN-safe running max
+  (finite init, -inf mask weights collapse to 0). Supports F32 q + F16 k/v
+  (contiguous rows), optional F16 mask, GQA, differing dk/dv, head dims
+  <= 256. Rejected (CPU fallback): sinks, ALiBi max_bias, logit_softcap,
+  quantized/BF16 KV, permuted layouts, MLA hs 576.
+- Plumbing: mm root signature widened to 5 root UAVs (q,k,v,mask,dst);
+  dx12_run_mm takes an optional 4th source; when mask is absent q is bound
+  in the mask slot so shader register layout stays fixed.
+- Gates: test-backend-ops FLASH_ATTN_EXT 553/553 claimed cases pass; full
+  suite 2233 OK / 0 FAIL with FA on, 1681/0 with it off; defaults unchanged
+  (pp512 5378 / tg128 210 on 1B).
+
+WHY IT IS GATED: perf is not there yet, and llama.cpp "-fa auto" would
+auto-select FA the moment the op is claimed:
+- pp512 1B: 3282 (FA) vs 5324 (mms path) — one group per query row has no
+  KV reuse across queries.
+- tg64 @ d4096: 38 (FA) vs 98 (mms path) — decode spawns only n_head=32
+  groups on a 64-CU GPU; most of the chip idles while each group serially
+  streams 4096 KV rows, and the update phase only keeps dv(=64) of 256
+  threads busy.
+FA v2 design (the actual win): split-KV — dispatch (head, kv_chunk) groups
+writing (m, l, o_partial) to a scratch buffer, then a small combine pass;
+prefill additionally wants multi-query tiles (process 8-16 q rows per group
+so K/V loads amortize). Needs a backend scratch allocation sized
+n_head * n_splits * (dv + 2) floats.
+
 ## STILL OPEN
 
 - FIX 1 step 5: structural GEMM (8x8 register tile / 128x128, TILE_K 64,
