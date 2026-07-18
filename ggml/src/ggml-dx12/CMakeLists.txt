@@ -69,6 +69,7 @@ set(DX12_SOURCES
     dx12_graph.cpp
     dx12_shader_cache.cpp
     dx12_profiler.cpp
+    dx12_ds.cpp
 )
 
 set(DX12_HEADERS
@@ -84,6 +85,7 @@ set(DX12_HEADERS
     dx12_graph.h
     dx12_shader_cache.h
     dx12_profiler.h
+    dx12_ds.h
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -98,6 +100,7 @@ target_include_directories(ggml-dx12
         ${AGILITY_SDK_DIR}/build/native/include
         ${CMAKE_CURRENT_SOURCE_DIR}/shaders
         ${CMAKE_CURRENT_SOURCE_DIR}/../  # ggml/src/ for ggml-impl.h, ggml-backend-impl.h
+        E:/DXllama/ds14/native/include  # DirectStorage SDK
 )
 
 # Link DirectX libraries
@@ -106,6 +109,7 @@ target_link_libraries(ggml-dx12
         d3d12.lib
         dxgi.lib
         dxcompiler.lib
+        dstorage.lib
 )
 
 # Handle GGML_BACKEND_DL for proper library type and registration
@@ -146,6 +150,9 @@ target_compile_definitions(ggml-dx12
 target_compile_features(ggml-dx12 PRIVATE cxx_std_20)
 
 target_link_libraries(ggml-dx12 PUBLIC ggml-base)
+
+# Link DirectStorage library from ds14 SDK
+target_link_directories(ggml-dx12 PRIVATE E:/DXllama/ds14/native/lib/x64)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Shader Compilation
@@ -435,6 +442,27 @@ if(DX12_COPY_DLLS_COMMANDS)
         ${DX12_COPY_DLLS_COMMANDS}
         DEPENDS ggml
         COMMENT "Copying Agility SDK DLLs to runtime output"
+    )
+endif()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Copy DirectStorage DLLs to output directory
+# ═══════════════════════════════════════════════════════════════════════════════
+set(DSTORAGE_DLL ${AGILITY_SDK_DIR}/../ds14/native/bin/x64/dstorage.dll)
+set(DSTORAGE_CORE_DLL ${AGILITY_SDK_DIR}/../ds14/native/bin/x64/dstoragecore.dll)
+
+if(EXISTS ${DSTORAGE_DLL})
+    list(APPEND DX12_COPY_DLLS_COMMANDS
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${DSTORAGE_DLL}
+            "$<TARGET_FILE_DIR:ggml>"
+    )
+endif()
+if(EXISTS ${DSTORAGE_CORE_DLL})
+    list(APPEND DX12_COPY_DLLS_COMMANDS
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${DSTORAGE_CORE_DLL}
+            "$<TARGET_FILE_DIR:ggml>"
     )
 endif()
 

@@ -23,12 +23,13 @@
 #include "dx12_graph.h"
 #include "dx12_profiler.h"
 #include "dx12_ring.h"
-
+#include "dx12_ds.h"
+ 
 #include <ggml.h>
 #include <ggml-backend.h>
 #include <ggml-backend-impl.h>
 #include <ggml-impl.h>
-
+ 
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
@@ -278,6 +279,57 @@ static const char* dx12_buft_get_name(ggml_backend_buffer_type_t buft) {
     (void)buft;
     return "DX12";
 }
+
+static void dx12_buf_set_tensor(ggml_backend_buffer_t buf, ggml_tensor* tensor,
+                                 const void* data, size_t offset, size_t size);
+ 
+ // Tensor extra context for storing file offset info (used by DirectStorage)
+ struct dx12_tensor_extra {
+     uint64_t file_offset;
+     bool has_file_offset;
+ };
+ 
+ static void dx12_set_tensor_async(ggml_backend_t backend, ggml_tensor* tensor,
+                                        const void* data, size_t offset, size_t size) {
+     if (!backend || !backend->context || !tensor || !tensor->buffer) return;
+ 
+     auto* ctx = (ggml_backend_dx12_context*)backend->context;
+     auto* buft = ggml_backend_buffer_get_type(tensor->buffer);
+     auto* dev = ggml_backend_buft_get_device(buft);
+     if (!dev || !ctx->device) {
+         dx12_buf_set_tensor(tensor->buffer, tensor, data, offset, size);
+         return;
+     }
+ 
+     // Try DirectStorage read: file -> GPU buffer directly
+     if (ctx->device->ds_ctx) {
+         dx12_buffer* gpu_buf = dx12_backend_get_gpu_buffer(tensor);
+         if (gpu_buf) {
+             // Calculate tensor offset in buffer
+             size_t dst_offset = 0;
+             void* mapped = dx12_buffer_map(gpu_buf);
+             if (mapped) {
+                 dst_offset = (size_t)((const char*)tensor->data - (const char*)mapped);
+             } else if (gpu_buf->heap == dx12_heap_type::default_) {
+                 dst_offset = (size_t)((uintptr_t)tensor->data - 0x1000);
+             }
+ 
+             // Check if caller provided file offset (encoded via tensor extra or data pointer)
+             // For now, data pointer could be the file offset when DS is active
+             uint64_t file_off = (uint64_t)(uintptr_t)data;
+             
+             // Validate file offset is reasonable (not a small pointer, indicates intentional encoding)
+             // File offsets are typically large (> 1MB for tensors)
+             if (file_off > 1024 * 1024) {
+                 dx12_ds_read_tensor_async(ctx->device->ds_ctx, gpu_buf, file_off, size, dst_offset + offset);
+                 return;
+             }
+         }
+     }
+ 
+     // Fall back to standard async upload (staging buffer -> GPU)
+     dx12_buf_set_tensor(tensor->buffer, tensor, data, offset, size);
+ }
 
 static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     auto* btctx = (dx12_backend_buffer_type_context*)buft->context;
@@ -870,7 +922,7 @@ static bool ggml_backend_dx12_supports_buft(ggml_backend_t backend,
 static struct ggml_backend_i ggml_backend_dx12_interface = {
     /* get_name          */ ggml_backend_dx12_name,
     /* free              */ ggml_backend_dx12_free,
-    /* set_tensor_async  */ nullptr,
+    /* set_tensor_async  */ dx12_set_tensor_async,
     /* get_tensor_async  */ nullptr,
     /* set_tensor_2d_async */ nullptr,
     /* get_tensor_2d_async */ nullptr,
@@ -1028,10 +1080,10 @@ void ggml_backend_dx12_set_n_gpu_layers(ggml_backend_t backend, int32_t n_layers
 }
 
 void ggml_backend_dx12_get_vram_usage(ggml_backend_t backend,
-                                       uint64_t* total_bytes,
-                                       uint64_t* used_bytes,
-                                       uint64_t* model_bytes,
-                                       uint64_t* kv_cache_bytes) {
+                                        uint64_t* total_bytes,
+                                        uint64_t* used_bytes,
+                                        uint64_t* model_bytes,
+                                        uint64_t* kv_cache_bytes) {
     if (!backend) return;
     auto* ctx = (ggml_backend_dx12_context*)backend->context;
     if (!ctx || !ctx->device) return;
@@ -1040,6 +1092,67 @@ void ggml_backend_dx12_get_vram_usage(ggml_backend_t backend,
     if (used_bytes)      *used_bytes      = ctx->vram_used;
     if (model_bytes)     *model_bytes     = ctx->vram_model;
     if (kv_cache_bytes)  *kv_cache_bytes  = ctx->vram_kv_cache;
+}
+
+bool ggml_backend_dx12_set_model_file(ggml_backend_t backend, const char* path) {
+    if (!backend) return false;
+    auto* ctx = (ggml_backend_dx12_context*)backend->context;
+    if (!ctx || !ctx->device) return false;
+
+    // Initialize DirectStorage if not already done
+    if (!ctx->device->ds_ctx) {
+        ctx->device->ds_ctx = dx12_ds_init(ctx->device);
+    }
+
+    if (!ctx->device->ds_ctx) {
+        dx12_log(DX12_LOG_INFO, "DirectStorage not available - will use staging buffer uploads");
+        return false;
+    }
+
+    // Convert UTF-8 path to wide string
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, path, -1, nullptr, 0);
+    if (wlen <= 0) return false;
+    
+    wchar_t* wpath = new wchar_t[wlen];
+    MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, wlen);
+    
+    HRESULT hr = dx12_ds_open_file(ctx->device->ds_ctx, wpath);
+    delete[] wpath;
+    
+    if (FAILED(hr)) {
+        dx12_log(DX12_LOG_INFO, "DirectStorage file open failed: 0x%08X", hr);
+        return false;
+    }
+    
+    dx12_log(DX12_LOG_INFO, "DirectStorage ready for model file async loading");
+    return true;
+}
+
+bool ggml_backend_dx12_load_tensor_async(ggml_backend_t backend,
+                                           struct ggml_tensor* tensor,
+                                           uint64_t file_offset,
+                                           uint64_t dst_offset,
+                                           size_t size) {
+    if (!backend || !tensor || !backend->context) return false;
+    
+    auto* ctx = (ggml_backend_dx12_context*)backend->context;
+    if (!ctx->device || !ctx->device->ds_ctx) return false;
+
+    dx12_buffer* gpu_buf = dx12_backend_buffer_from_tensor(tensor);
+    if (!gpu_buf) return false;
+
+    return dx12_ds_read_tensor_async(ctx->device->ds_ctx, gpu_buf, 
+                                        file_offset, size, dst_offset);
+}
+
+void ggml_backend_dx12_flush_and_wait(ggml_backend_t backend) {
+    if (!backend || !backend->context) return;
+    
+    auto* ctx = (ggml_backend_dx12_context*)backend->context;
+    if (ctx->device && ctx->device->ds_ctx) {
+        dx12_ds_flush_pending(ctx->device->ds_ctx, true);
+    }
+    ggml_backend_synchronize(backend);
 }
 
 // ---------------------------------------------------------------------------
@@ -1263,7 +1376,16 @@ static ggml_backend_dev_t dx12_reg_get_device(ggml_backend_reg_t reg, size_t ind
 }
 
 static void * dx12_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
-    (void)reg; (void)name;
+    (void)reg;
+    if (strcmp(name, "ggml_backend_dx12_load_tensor_async") == 0) {
+        return (void*)ggml_backend_dx12_load_tensor_async;
+    }
+    if (strcmp(name, "ggml_backend_dx12_flush_and_wait") == 0) {
+        return (void*)ggml_backend_dx12_flush_and_wait;
+    }
+    if (strcmp(name, "ggml_backend_dx12_set_model_file") == 0) {
+        return (void*)ggml_backend_dx12_set_model_file;
+    }
     return nullptr;
 }
 

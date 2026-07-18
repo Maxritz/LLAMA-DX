@@ -44,7 +44,7 @@ constexpr uint64_t DX12_BUFFER_ALIGNMENT = 256;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Forward Declarations
-// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════
 
 struct dx12_buffer;
 struct dx12_command_list;
@@ -53,6 +53,7 @@ struct dx12_gpu_timer;
 struct dx12_pso;
 struct dx12_ring_context;
 struct dx12_ring_slot;
+struct dx12_ds_context;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // dx12_device: D3D12 Device Manager
@@ -111,6 +112,9 @@ struct dx12_device {
 
     // GPU timestamp profiler (per-dispatch timing)
     dx12_gpu_timer*                 gpu_timer = nullptr;
+
+    // DirectStorage context (for async model file loading)
+    dx12_ds_context*                ds_ctx = nullptr;
 
     // Deferred staging buffers: upload buffers kept alive until GPU queue is idle,
     // then destroyed. Prevents RDNA4 compute-queue driver crash (HOW-TO-FIX #10).

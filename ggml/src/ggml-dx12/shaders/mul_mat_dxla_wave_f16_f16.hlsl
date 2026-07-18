@@ -1,3 +1,12 @@
+/*
+ * mul_mat_dxla_wave_f16_f16.hlsl
+ * PURPOSE: DXLA Wave GEMM: C = A x B^T using hardware matrix ops
+ *
+ * Tile size: 16x16 per wave
+ * Uses dx::linalg cooperative matrices with wave-scope operations
+ * Hardware MMA units on RDNA4 provide maximum performance
+ */
+
 #include "common.hlsli"
 #include <dx/linalg.h>
 using namespace dx::linalg;

@@ -68,6 +68,7 @@ static std::string llama_format_win_err(DWORD err) {
 struct llama_file::impl {
 #if defined(_WIN32)
     HANDLE fp_win32;
+    std::string fname;
     std::string GetErrorMessageWin32(DWORD error_code) const {
         std::string ret;
         LPSTR lpMsgBuf = NULL;
@@ -83,7 +84,7 @@ struct llama_file::impl {
         return ret;
     }
 
-    impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) {
+    impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) : fname(fname) {
         fp = ggml_fopen(fname, mode);
         if (fp == NULL) {
             throw std::runtime_error(format("failed to open %s: %s", fname, strerror(errno)));
@@ -94,7 +95,7 @@ struct llama_file::impl {
         seek(0, SEEK_SET);
     }
 
-    impl(FILE * file) : owns_fp(false) {
+    impl(FILE * file) : owns_fp(false), fname("(file*)") {
         fp = file;
         fp_win32 = (HANDLE) _get_osfhandle(_fileno(fp));
         seek(0, SEEK_END);
@@ -173,6 +174,8 @@ struct llama_file::impl {
     bool has_direct_io() const {
         return true;
     }
+
+    const char * path() const { return fname.c_str(); }
 
     ~impl() {
         if (fp && owns_fp) {
@@ -379,10 +382,10 @@ struct llama_file::impl {
         } else if (owns_fp) {
             std::fclose(fp);
         }
-    }
+}
     int fd = -1;
     std::string fname;
-#endif
+ #endif
 
     size_t read_alignment() const {
         return alignment;
@@ -407,6 +410,8 @@ size_t llama_file::size() const { return pimpl->size; }
 
 size_t llama_file::read_alignment() const { return pimpl->read_alignment(); }
 bool llama_file::has_direct_io() const { return pimpl->has_direct_io(); }
+
+const char * llama_file::path() const { return pimpl->path(); }
 
 int llama_file::file_id() const {
 #ifdef _WIN32
