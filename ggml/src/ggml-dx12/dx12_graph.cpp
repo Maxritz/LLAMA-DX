@@ -17,6 +17,9 @@
 
 // Forward declarations
 static bool dx12_dispatch_mul_mat_fused_act(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst, uint32_t act_op);
+static bool dx12_can_fuse_rms_mul(ggml_cgraph* graph, int i);
+static bool dx12_dispatch_rms_norm_mul(dx12_device* dev, dx12_command_list* cmd,
+                                       ggml_tensor* rms, ggml_tensor* mul);
 
 static void apply_tensor_offset(dx12_buffer* buf, const ggml_tensor* t) {
     if (!buf || !t) return;
@@ -68,6 +71,28 @@ bool dx12_op_supported(const ggml_tensor* node) {
             // Strided/batched path: F32/F16 sources with arbitrary strides
             if (dx12_op_disabled("mms")) return false;
             return a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16;
+        }
+
+        case GGML_OP_MUL_MAT_ID: {
+            // MoE expert routing: as [K,N,n_expert] x b [K,b_ne1,n_tok]
+            // with ids [n_used,n_tok] -> dst [N,n_used,n_tok] (mv_id.hlsl)
+            const ggml_tensor* as  = node->src[0];
+            const ggml_tensor* b   = node->src[1];
+            const ggml_tensor* ids = node->src[2];
+            if (!as || !b || !ids) return false;
+            if (dx12_op_disabled("mulmatid")) return false;
+            if (as->type != GGML_TYPE_F32 && as->type != GGML_TYPE_F16 &&
+                as->type != GGML_TYPE_Q8_0 && as->type != GGML_TYPE_Q4_0 &&
+                as->type != GGML_TYPE_Q4_K && as->type != GGML_TYPE_Q5_K &&
+                as->type != GGML_TYPE_Q6_K) return false;
+            if (!ggml_is_contiguous(as)) return false;
+            if (b->type != GGML_TYPE_F32 || b->nb[0] != 4) return false;
+            if (ids->type != GGML_TYPE_I32 || ids->nb[0] != 4) return false;
+            if (node->type != GGML_TYPE_F32 || node->nb[0] != 4) return false;
+            if ((as->ne[1] + 7) / 8 > DX12_MAX_GROUPS) return false;
+            if (node->ne[1] * node->ne[2] > DX12_MAX_GROUPS) return false;
+            return dx12_dims_fit_u32(as) && dx12_dims_fit_u32(b) &&
+                   dx12_dims_fit_u32(node);
         }
 
         case GGML_OP_ADD:
@@ -271,6 +296,13 @@ bool dx12_graph_validate(dx12_device* dev, ggml_cgraph* graph,
 
 void dx12_graph_optimize(struct ggml_backend* backend, struct ggml_cgraph* graph) {
     (void)backend;
+    // DISABLED (BUG 3 investigation, see WHAT-WE-ARE-FIXING.md): this reorder
+    // pulls a node forward past intervening nodes while only checking direct
+    // src adjacency — it can move a node before one of its other producers.
+    // The fusions it enables never fire on real graphs anyway (they require
+    // F16 activations; llama.cpp feeds F32). Re-enable only with a full
+    // dependency check.
+    if (getenv("DX12_ENABLE_GRAPH_REORDER") == nullptr) return;
     if (!graph || graph->n_nodes < 2) return;
 
     auto is_view = [](ggml_tensor* node) -> bool {
@@ -522,11 +554,26 @@ bool dx12_graph_compute(dx12_device* dev, dx12_command_list* cmd, ggml_cgraph* g
             if (record_timing) dev->gpu_timer->end(cmd);
         }
 
+        // ── Fusion: RMS_NORM + MUL (row-broadcast norm weight) ─────────────
+        // One dispatch + one barrier instead of two of each; ~1 per layer.
+        if (!is_fused && node->op == GGML_OP_RMS_NORM &&
+            dx12_can_fuse_rms_mul(graph, i)) {
+            if (record_timing) dev->gpu_timer->begin(cmd, "rms_mul_fused");
+            bool fok = dx12_dispatch_rms_norm_mul(dev, cmd, node, graph->nodes[i + 1]);
+            if (record_timing) dev->gpu_timer->end(cmd);
+            if (fok) {
+                i++; // skip the MUL — consumed by the fused dispatch
+                ok = true;
+                is_fused = true;
+            }
+        }
+
         if (!is_fused) {
             if (record_timing) dev->gpu_timer->begin(cmd, ggml_op_name(node->op));
 
             switch (node->op) {
                 case GGML_OP_MUL_MAT:       ok = dx12_dispatch_mul_mat(dev, cmd, node); break;
+                case GGML_OP_MUL_MAT_ID:    ok = dx12_dispatch_mul_mat_id(dev, cmd, node); break;
             case GGML_OP_ADD:           ok = dx12_dispatch_add(dev, cmd, node); break;
             case GGML_OP_MUL:           ok = dx12_dispatch_mul(dev, cmd, node); break;
             case GGML_OP_SCALE:         ok = dx12_dispatch_scale(dev, cmd, node); break;
@@ -729,6 +776,15 @@ static bool dx12_dispatch_mul_mat_strided(dx12_device* dev, dx12_command_list* c
     p.dnb0 = (uint32_t)dst->nb[0]; p.dnb1 = (uint32_t)dst->nb[1];
     p.dnb2 = (uint32_t)dst->nb[2]; p.dnb3 = (uint32_t)dst->nb[3];
 
+    // Prefill-sized batches use the LDS-tiled kernel (64x reuse of A/B
+    // elements); small M keeps the per-element kernels (tile mostly empty).
+    if (p.M >= 16) {
+        p.pad0 = (a->type == GGML_TYPE_F16) ? 1u : 0u; // a_f16 flag
+        return dx12_run_mm(dev, cmd, "mms_tiled", &p, sizeof(p),
+                           a, b, nullptr, dst,
+                           (p.N + 63) / 64, (p.M + 63) / 64,
+                           (uint32_t)(dst->ne[2] * dst->ne[3]));
+    }
     const char* shader = (a->type == GGML_TYPE_F16) ? "mms_f16" : "mms_f32";
     return dx12_run_mm(dev, cmd, shader, &p, sizeof(p),
                        a, b, nullptr, dst,
@@ -784,17 +840,21 @@ bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor
     // — garbage output and DEVICE_HUNG on -p 128 (see TRACE-gemv-direct-path-opt.md).
     // Quant prefill falls through to the correct mm_* tiled shaders below.
     // K-quants share one shader pair; the quant selector rides in the CBV pad
+    // Prefill (M > 1) runs the LDS-tiled GEMM (mm_tiled.hlsl) for every
+    // weight type; the qtype selector in the CBV picks the dequant.
+    // GEMV (M == 1) keeps the per-type wave kernels. The old naive mm_*
+    // per-output-element shaders and the broken mm_q*_k_prefill kernels are
+    // no longer referenced (see WHAT-WE-ARE-FIXING.md).
     uint32_t kq_type = 0;
     const char* shader_name = nullptr;
     switch (a->type) {
-        case GGML_TYPE_F32:  shader_name = gemv ? "mv_f32"  : "mm_f32";  break;
-        case GGML_TYPE_F16:  shader_name = gemv ? "mv_f16"  : "mm_f16";  break;
-        case GGML_TYPE_Q8_0: shader_name = gemv ? "mv_q8_0" : "mm_q8_0"; break;
-        case GGML_TYPE_Q4_0: shader_name = gemv ? "mv_q4_0" : "mm_q4_0"; break;
-        case GGML_TYPE_Q5_0: shader_name = gemv ? "mv_q5_0" : "mm_q5_0_prefill"; break;
-        case GGML_TYPE_Q4_K: shader_name = gemv ? "mv_kq" : "mm_q4_k_prefill"; kq_type = 4; break;
-        case GGML_TYPE_Q5_K: shader_name = gemv ? "mv_kq" : "mm_q5_k_prefill"; kq_type = 5; break;
-        case GGML_TYPE_Q6_K: shader_name = gemv ? "mv_kq" : "mm_q6_k_prefill"; kq_type = 6; break;
+        case GGML_TYPE_F32:  shader_name = gemv ? "mv_f32"  : "mm_tiled"; kq_type = 0; break;
+        case GGML_TYPE_F16:  shader_name = gemv ? "mv_f16"  : "mm_tiled"; kq_type = 1; break;
+        case GGML_TYPE_Q8_0: shader_name = gemv ? "mv_q8_0" : "mm_tiled"; kq_type = 2; break;
+        case GGML_TYPE_Q4_0: shader_name = gemv ? "mv_q4_0" : "mm_tiled"; kq_type = 3; break;
+        case GGML_TYPE_Q4_K: shader_name = gemv ? "mv_kq" : "mm_tiled"; kq_type = 4; break;
+        case GGML_TYPE_Q5_K: shader_name = gemv ? "mv_kq" : "mm_tiled"; kq_type = 5; break;
+        case GGML_TYPE_Q6_K: shader_name = gemv ? "mv_kq" : "mm_tiled"; kq_type = 6; break;
         default:
             dx12_log(DX12_LOG_ERROR, "MUL_MAT: unsupported weight type %s", ggml_type_name(a->type));
             return false;
@@ -854,8 +914,8 @@ bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor
         if (m_chunk == 0) m_chunk = 1;
     }
 
-    bool is_new_prefill = (strstr(shader_name, "_prefill") != nullptr);
-    uint32_t tile = is_new_prefill ? 32 : 16;
+    // mm_tiled: 64x64 C tile per 16x16 group; mm_kq (unused fallback): 16
+    uint32_t tile = (strcmp(shader_name, "mm_tiled") == 0) ? 64 : 16;
     uint32_t tile_n = (N + tile - 1) / tile;
 
     D3D12_GPU_VIRTUAL_ADDRESS b_base = dispatch.srv_addr[1];
@@ -1071,6 +1131,99 @@ bool dx12_dispatch_soft_max(dx12_device* dev, dx12_command_list* cmd, ggml_tenso
 }
 
 // RMS_NORM: F32, eps from op_params, one group per row
+// MUL_MAT_ID: MoE expert routing via mv_id.hlsl (one slot per dispatch z,
+// 8 output rows per group). Shapes/types guaranteed by dx12_op_supported.
+bool dx12_dispatch_mul_mat_id(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
+    const ggml_tensor* as  = dst->src[0];
+    const ggml_tensor* b   = dst->src[1];
+    const ggml_tensor* ids = dst->src[2];
+
+    uint32_t qtype;
+    switch (as->type) {
+        case GGML_TYPE_F32:  qtype = 0; break;
+        case GGML_TYPE_F16:  qtype = 1; break;
+        case GGML_TYPE_Q8_0: qtype = 2; break;
+        case GGML_TYPE_Q4_0: qtype = 3; break;
+        case GGML_TYPE_Q4_K: qtype = 4; break;
+        case GGML_TYPE_Q5_K: qtype = 5; break;
+        case GGML_TYPE_Q6_K: qtype = 6; break;
+        default:
+            dx12_log(DX12_LOG_ERROR, "MUL_MAT_ID: unsupported weight type %s",
+                     ggml_type_name(as->type));
+            return false;
+    }
+
+    struct {
+        uint32_t N, K, qtype, n_used;
+        uint32_t b_ne1, b_nb1, b_nb2, ids_nb1;
+        uint32_t d_nb1, d_nb2, w_nb2, pad;
+    } p{};
+    p.N       = (uint32_t)as->ne[1];
+    p.K       = (uint32_t)as->ne[0];
+    p.qtype   = qtype;
+    p.n_used  = (uint32_t)ids->ne[0];
+    p.b_ne1   = (uint32_t)b->ne[1];
+    p.b_nb1   = (uint32_t)b->nb[1];
+    p.b_nb2   = (uint32_t)b->nb[2];
+    p.ids_nb1 = (uint32_t)ids->nb[1];
+    p.d_nb1   = (uint32_t)dst->nb[1];
+    p.d_nb2   = (uint32_t)dst->nb[2];
+    p.w_nb2   = (uint32_t)as->nb[2];
+
+    uint32_t n_slots = (uint32_t)(dst->ne[1] * dst->ne[2]);
+    return dx12_run_mm(dev, cmd, "mv_id", &p, sizeof(p),
+                       as, b, ids, dst,
+                       (p.N + 7) / 8, 1, n_slots);
+}
+
+// Can RMS_NORM at graph->nodes[i] fuse with the MUL at i+1?
+// Requirements: MUL consumes the RMS result, its other source is a contiguous
+// F32 [ne0] row vector (llama norm-weight pattern), shapes match, and nothing
+// else in the graph reads the intermediate RMS result.
+static bool dx12_can_fuse_rms_mul(ggml_cgraph* graph, int i) {
+    if (i + 1 >= graph->n_nodes) return false;
+    ggml_tensor* rms = graph->nodes[i];
+    ggml_tensor* mul = graph->nodes[i + 1];
+    if (rms->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL) return false;
+    const ggml_tensor* w = nullptr;
+    if (mul->src[0] == rms)      w = mul->src[1];
+    else if (mul->src[1] == rms) w = mul->src[0];
+    if (!w) return false;
+    if (w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w)) return false;
+    if (w->ne[0] != rms->ne[0] || w->ne[1] != 1 || w->ne[2] != 1 || w->ne[3] != 1) return false;
+    if (!ggml_are_same_shape(mul, rms)) return false;
+    if (rms->flags & GGML_TENSOR_FLAG_OUTPUT) return false;
+    for (int k = i + 2; k < graph->n_nodes; k++) {
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            if (graph->nodes[k]->src[s] == rms) return false;
+        }
+    }
+    return true;
+}
+
+// Fused RMS_NORM + MUL: one dispatch + one barrier instead of two of each.
+// Preconditions checked by dx12_can_fuse_rms_mul.
+static bool dx12_dispatch_rms_norm_mul(dx12_device* dev, dx12_command_list* cmd,
+                                       ggml_tensor* rms, ggml_tensor* mul) {
+    const ggml_tensor* a = rms->src[0];
+    const ggml_tensor* w = (mul->src[0] == rms) ? mul->src[1] : mul->src[0];
+    float eps;
+    memcpy(&eps, (const char*)rms->op_params, sizeof(float));
+
+    struct {
+        uint32_t ne0; float eps;
+        uint32_t nb01, nb02, nb03, dnb1, dnb2, dnb3;
+    } p{};
+    p.ne0 = (uint32_t)a->ne[0];
+    p.eps = eps;
+    p.nb01 = (uint32_t)a->nb[1]; p.nb02 = (uint32_t)a->nb[2]; p.nb03 = (uint32_t)a->nb[3];
+    p.dnb1 = (uint32_t)mul->nb[1]; p.dnb2 = (uint32_t)mul->nb[2]; p.dnb3 = (uint32_t)mul->nb[3];
+
+    return dx12_run_mm(dev, cmd, "rms_norm_mul_row", &p, sizeof(p),
+                       a, w, nullptr, mul,
+                       (uint32_t)a->ne[1], (uint32_t)a->ne[2], (uint32_t)a->ne[3]);
+}
+
 bool dx12_dispatch_rms_norm(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
     const ggml_tensor* a = dst->src[0];
     float eps;

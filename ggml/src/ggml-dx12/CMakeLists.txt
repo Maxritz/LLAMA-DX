@@ -189,13 +189,16 @@ set(DX12_SHADERS
     mm_q4_k_prefill
     mm_q5_k_prefill
     mm_q6_k_prefill
+    mm_tiled
     mms_f32
     mms_f16
+    mms_tiled
     mv_f32
     mv_f16
     mv_q8_0
     mv_q4_0
     mv_kq
+    mv_id
     mm_kq
     ew_bin
     ew_scale
@@ -203,6 +206,7 @@ set(DX12_SHADERS
     ew_glu
     pad_f32
     rms_norm_row
+    rms_norm_mul_row
     soft_max_row
     get_rows_x
     cpy_gen
@@ -258,18 +262,22 @@ set(DX12_SHADER_THREAD_GROUPS
     mm_q4_0,16,16,1
     mms_f32,16,16,1
     mms_f16,16,16,1
+    mms_tiled,16,16,1
     mv_f32,256,1,1
     mv_f16,256,1,1
     mv_q8_0,256,1,1
     mv_q4_0,256,1,1
     mv_kq,256,1,1
+    mv_id,256,1,1
     mm_kq,16,16,1
+    mm_tiled,16,16,1
     ew_bin,256,1,1
     ew_scale,256,1,1
     ew_unary,256,1,1
     ew_glu,256,1,1
     pad_f32,256,1,1
     rms_norm_row,256,1,1
+    rms_norm_mul_row,256,1,1
     soft_max_row,256,1,1
     get_rows_x,256,1,1
     cpy_gen,256,1,1

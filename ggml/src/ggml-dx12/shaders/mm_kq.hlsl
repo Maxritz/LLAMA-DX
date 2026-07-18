@@ -126,10 +126,16 @@ void dequant_block_q4_k(uint base, uint out_row) {
 }
 
 [numthreads(16, 16, 1)]
-void main(uint3 tid : SV_DispatchThreadID) {
-    uint o = tid.x;
-    uint t = tid.y;
-    if (o >= params.N || t >= params.M) return;
+void main(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID) {
+    uint o = tid.x;   // global output row (N dim)
+    uint t = tid.y;   // global activation row (M dim)
+    // No early return: every thread must reach both barriers (uniform control
+    // flow), and threads with t >= M still cooperate in the LDS dequant.
+    // LDS is indexed with GROUP-LOCAL ids: gtid.x picks the LDS row slot and
+    // gtid.y picks the 16-element slice — using global tid here breaks every
+    // group beyond (0,0): slices land out of [0,256) and rows out of [0,16).
+    bool row_valid = (o < params.N);
+    bool valid = row_valid && (t < params.M);
 
     uint blk_sz = kq_block_size(params.qtype);
     uint row_bytes = (params.K >> 8) * blk_sz;
@@ -139,44 +145,46 @@ void main(uint3 tid : SV_DispatchThreadID) {
 
     [loop]
     for (uint blk = 0; blk < num_blocks; blk++) {
-        // Phase 1: Cooperative block dequant — one thread per output row loads
-        // its row's block header, all 16 M-threads in the row help dequantize
-        // 16 elements each = 256 elements per row.
+        // Phase 1: Cooperative block dequant — the 16 gtid.y threads of each
+        // gtid.x column dequantize 16 elements each = 256 elements per row.
+        // Skip rows past N (their A reads would be out of bounds; no thread
+        // reads their LDS slot either).
         uint base = o * row_bytes + blk * blk_sz;
-        if (params.qtype == 6u) {
-            // Q6_K: all 16 threads in this row's M-dim cooperate
-            for (uint e = 0; e < 16; e++) {
-                uint elem = t * 16 + e;
-                if (elem >= 256) break;
-                lds_w[o * 256 + elem] = dequant_q6_K(A, base, elem);
-            }
-        } else if (params.qtype == 5u) {
-            for (uint e = 0; e < 16; e++) {
-                uint elem = t * 16 + e;
-                if (elem >= 256) break;
-                lds_w[o * 256 + elem] = dequant_q5_K(A, base, elem);
-            }
-        } else {
-            for (uint e = 0; e < 16; e++) {
-                uint elem = t * 16 + e;
-                if (elem >= 256) break;
-                lds_w[o * 256 + elem] = dequant_q4_K(A, base, elem);
+        if (row_valid) {
+            uint lds_row = gtid.x * 256;
+            uint e0 = gtid.y * 16;
+            if (params.qtype == 6u) {
+                for (uint e = 0; e < 16; e++) {
+                    lds_w[lds_row + e0 + e] = dequant_q6_K(A, base, e0 + e);
+                }
+            } else if (params.qtype == 5u) {
+                for (uint e = 0; e < 16; e++) {
+                    lds_w[lds_row + e0 + e] = dequant_q5_K(A, base, e0 + e);
+                }
+            } else {
+                for (uint e = 0; e < 16; e++) {
+                    lds_w[lds_row + e0 + e] = dequant_q4_K(A, base, e0 + e);
+                }
             }
         }
         GroupMemoryBarrierWithGroupSync();
 
-        // Phase 2: Dot product from LDS — each thread reads 256 elements
+        // Phase 2: Dot product from LDS — each valid thread reads 256 elements
         // from its row's dequantized block in LDS
-        float sum = 0.0f;
-        uint a_off = o * 256;
-        uint b_blk_off = blk * 256;
-        for (uint k = 0; k < 256; k++) {
-            sum += lds_w[a_off + k] *
-                   asfloat(B.Load((t * params.K + b_blk_off + k) * 4));
+        if (valid) {
+            float sum = 0.0f;
+            uint a_off = gtid.x * 256;
+            uint b_blk_off = blk * 256;
+            for (uint k = 0; k < 256; k++) {
+                sum += lds_w[a_off + k] *
+                       asfloat(B.Load((t * params.K + b_blk_off + k) * 4));
+            }
+            acc += sum;
         }
-        acc += sum;
         GroupMemoryBarrierWithGroupSync();
     }
 
-    C.Store((t * params.N + o) * 4, asuint(acc));
+    if (valid) {
+        C.Store((t * params.N + o) * 4, asuint(acc));
+    }
 }

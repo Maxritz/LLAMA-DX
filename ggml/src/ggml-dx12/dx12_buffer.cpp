@@ -320,7 +320,10 @@ void dx12_barrier_pre_dispatch(dx12_command_list* cmd,
                                 uint32_t count) {
     if (!cmd || !cmd->d3d_list || !tracker || !bufs || !new_states || count == 0) return;
 
-    D3D12_RESOURCE_BARRIER barriers[16];
+    // Zero-init is load-bearing: the UAV path sets only Type + pResource, and
+    // stale stack bytes in Flags (BEGIN_ONLY/END_ONLY) make the recorded
+    // barrier invalid -> Close() fails with E_INVALIDARG (debug layer id 533).
+    D3D12_RESOURCE_BARRIER barriers[16] = {};
     uint32_t n = 0;
 
     std::vector<ID3D12Resource*> this_written;

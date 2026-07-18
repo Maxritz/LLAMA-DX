@@ -355,7 +355,7 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
         return nullptr;
     }
 
-    dx12_log(DX12_LOG_INFO, "buft_alloc: idx=%u size=%zu heap=%s DONE", adapter_idx, size,
+    dx12_log(DX12_LOG_VERBOSE, "buft_alloc: idx=%u size=%zu heap=%s DONE", adapter_idx, size,
              heap == dx12_heap_type::upload ? "upload" : "default");
 
     auto* ctx = new dx12_backend_buffer_context();
@@ -597,7 +597,7 @@ static void dx12_buf_set_tensor(ggml_backend_buffer_t buf, ggml_tensor* tensor,
 
     // Record GPU copy
     auto* d3d_cmd = reinterpret_cast<ID3D12GraphicsCommandList10*>(batch.cmd->d3d_list.Get());
-    dx12_log(DX12_LOG_INFO, "upload: copy size=%zu staging_off=%zu dst_off=%llu",
+    dx12_log(DX12_LOG_VERBOSE, "upload: copy size=%zu staging_off=%zu dst_off=%llu",
              size, batch.used, (unsigned long long)(tensor_off + offset));
     d3d_cmd->CopyBufferRegion(
         gpu_buf->resource.Get(), tensor_off + offset,
@@ -783,9 +783,12 @@ static void ggml_backend_dx12_free(ggml_backend_t backend) {
 
     dx12_log(DX12_LOG_INFO, "Freeing DX12 backend");
 
-    // Flush any pending uploads before teardown
+    // Drain this backend's outstanding GPU work before freeing its objects
     if (ctx->device) {
         dx12_flush_uploads(ctx->device);
+        if (ctx->device->ring) {
+            dx12_ring_wait_idle(ctx->device->ring);
+        }
     }
 
     delete ctx->pso_cache;
@@ -794,19 +797,15 @@ static void ggml_backend_dx12_free(ggml_backend_t backend) {
     delete ctx->descriptor_heap;
     delete ctx->cmd_pool;
 
-    if (ctx->device) {
-        // Remove from device cache before destroying
-        {
-            std::lock_guard<std::mutex> lk(g_dx12_device_cache_mutex);
-            auto it = g_dx12_device_cache.find(ctx->device->adapter_index);
-            if (it != g_dx12_device_cache.end() && it->second == ctx->device) {
-                g_dx12_device_cache.erase(it);
-                dx12_log(DX12_LOG_INFO, "Removed device idx=%u from cache on teardown",
-                    ctx->device->adapter_index);
-            }
-        }
-        dx12_device_destroy(ctx->device);
-    }
+    // Do NOT destroy the shared dx12_device here. The device is a
+    // process-lifetime singleton (g_dx12_device_cache): model weight buffers
+    // and other backend instances outlive any one backend — llama.cpp frees
+    // per-context backends while weight buffers persist, and llama-bench
+    // creates a second context against the same device. Destroying the device
+    // here caused use-after-free / AV on the next context (BUG 4, see
+    // WHAT-WE-ARE-FIXING.md). The OS reclaims the device at process exit;
+    // the stale-device path in dx12_get_or_create_device handles recreation
+    // after a real device removal.
 
     delete ctx;
     backend->context = nullptr;
@@ -1188,10 +1187,36 @@ static const char * dx12_dev_get_description(ggml_backend_dev_t dev) {
     return info ? info->name : "DirectX 12 GPU";
 }
 
+// Live VRAM budget via the cached device's own DXGI adapter (never a raw
+// adapter index — DXGI indices are not contiguous). Falls back to the
+// static estimate when no device exists yet or the query fails.
+static bool dx12_query_vram_free(ggml_backend_dev_t dev, size_t* free_out) {
+    uint32_t adapter_idx = (uint32_t)(uintptr_t)dev->context;
+    dx12_device* d = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_dx12_device_cache_mutex);
+        auto it = g_dx12_device_cache.find(adapter_idx);
+        if (it != g_dx12_device_cache.end()) d = it->second;
+    }
+    if (!d || !d->adapter) return false;
+
+    DXGI_QUERY_VIDEO_MEMORY_INFO mi{};
+    if (FAILED(d->adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mi))) return false;
+    *free_out = (mi.Budget > mi.CurrentUsage) ? (size_t)(mi.Budget - mi.CurrentUsage) : 0;
+    return true;
+}
+
 static void dx12_dev_get_memory(ggml_backend_dev_t dev, size_t *free, size_t *total) {
     auto* info = dx12_dev_get_adapter_info(dev);
     if (total) *total = info ? info->dedicated_vram : 0;
-    if (free)  *free  = info ? info->dedicated_vram / 2 : 0; // estimate
+    if (free) {
+        size_t f = 0;
+        if (dx12_query_vram_free(dev, &f)) {
+            *free = f;
+        } else {
+            *free = info ? info->dedicated_vram / 2 : 0; // pre-device estimate
+        }
+    }
 }
 
 static enum ggml_backend_dev_type dx12_dev_get_type(ggml_backend_dev_t dev) {
@@ -1204,7 +1229,11 @@ static void dx12_dev_get_props(ggml_backend_dev_t dev, struct ggml_backend_dev_p
     auto* info = dx12_dev_get_adapter_info(dev);
     props->name = info ? info->name : "DX12 GPU";
     props->description = info ? info->name : "DirectX 12 GPU";
-    props->memory_free = info ? info->dedicated_vram / 2 : 0;
+    {
+        size_t f = 0;
+        props->memory_free = dx12_query_vram_free(dev, &f)
+            ? f : (info ? info->dedicated_vram / 2 : 0);
+    }
     props->memory_total = info ? info->dedicated_vram : 0;
     props->type = GGML_BACKEND_DEVICE_TYPE_GPU;
     props->device_id = nullptr;

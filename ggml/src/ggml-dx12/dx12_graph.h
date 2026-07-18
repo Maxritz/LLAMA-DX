@@ -79,6 +79,7 @@ void dx12_graph_optimize(struct ggml_backend* backend, struct ggml_cgraph* graph
 bool dx12_dispatch_add       (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
 bool dx12_dispatch_mul       (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
 bool dx12_dispatch_mul_mat   (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
+bool dx12_dispatch_mul_mat_id(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
 bool dx12_dispatch_scale     (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
 bool dx12_dispatch_silu      (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
 bool dx12_dispatch_gelu      (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);

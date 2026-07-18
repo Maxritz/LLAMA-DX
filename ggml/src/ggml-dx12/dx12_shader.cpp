@@ -8,6 +8,8 @@
 #include "dx12_buffer.h"
 #include <cstring>
 #include <algorithm>
+#include <mutex>
+#include <unordered_map>
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Global Shader Database
@@ -71,18 +73,28 @@ bool dx12_shader_dispatch(dx12_device* dev,
         return false;
     }
 
-    // Get or create PSO. Use a function-local static cache so the PSO and its
-    // root signature stay alive until the command list is submitted and executed
-    // (a local cache would be destroyed on return, deleting the root signature
-    // while the command list still references it -> OBJECT_DELETED_WHILE_STILL_IN_USE).
-    static dx12_pso_cache pso_cache(dev);
+    // Get or create PSO. Caches are per-device and process-lifetime so PSOs
+    // and root signatures stay alive while command lists reference them
+    // (OBJECT_DELETED_WHILE_STILL_IN_USE otherwise). A function-local static
+    // bound the FIRST device forever — wrong after device recreation.
+    static std::mutex g_pso_cache_mutex;
+    static std::unordered_map<dx12_device*, dx12_pso_cache*> g_pso_caches;
+    dx12_pso_cache* cache;
+    {
+        std::lock_guard<std::mutex> lk(g_pso_cache_mutex);
+        auto it = g_pso_caches.find(dev);
+        if (it == g_pso_caches.end()) {
+            it = g_pso_caches.emplace(dev, new dx12_pso_cache(dev)).first;
+        }
+        cache = it->second;
+    }
     std::array<uint32_t, 3> tg_size = {
         dispatch.thread_group_x ? dispatch.thread_group_x : entry->thread_group_x,
         dispatch.thread_group_y ? dispatch.thread_group_y : entry->thread_group_y,
         dispatch.thread_group_z ? dispatch.thread_group_z : entry->thread_group_z
     };
 
-    dx12_pso* pso = pso_cache.get_or_create(
+    dx12_pso* pso = cache->get_or_create(
         dispatch.shader_name,
         entry->cso_data, entry->cso_size,
         dispatch.sig_type,

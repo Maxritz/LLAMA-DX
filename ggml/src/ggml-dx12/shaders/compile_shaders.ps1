@@ -119,6 +119,7 @@ $Shaders = @(
     # Normalization (dx12_graph dispatch)
     @{Name="soft_max_row"; Threads=@{X=256;Y=1;Z=1}},
     @{Name="rms_norm_row"; Threads=@{X=256;Y=1;Z=1}},
+    @{Name="rms_norm_mul_row"; Threads=@{X=256;Y=1;Z=1}},
     @{Name="rope_f32"; Threads=@{X=64;Y=1;Z=1}},
     @{Name="pad_f32"; Threads=@{X=256;Y=1;Z=1}},
     # Copy / scatter / gather (dx12_graph dispatch)
@@ -133,16 +134,19 @@ $Shaders = @(
     @{Name="mv_q8_0"; Threads=@{X=256;Y=1;Z=1}},
     @{Name="mv_q4_0"; Threads=@{X=256;Y=1;Z=1}},
     @{Name="mv_kq"; Threads=@{X=256;Y=1;Z=1}},
+    @{Name="mv_id"; Threads=@{X=256;Y=1;Z=1}},
     # GEMM (tile-based prefill, M>1)
     @{Name="mm_f32"; Threads=@{X=16;Y=16;Z=1}},
     @{Name="mm_f16"; Threads=@{X=16;Y=16;Z=1}},
     @{Name="mm_q4_0"; Threads=@{X=16;Y=16;Z=1}},
     @{Name="mm_q8_0"; Threads=@{X=16;Y=16;Z=1}},
     @{Name="mm_kq"; Threads=@{X=16;Y=16;Z=1}},
+    @{Name="mm_tiled"; Threads=@{X=16;Y=16;Z=1}},
     @{Name="mm_fused_act"; Threads=@{X=32;Y=32;Z=1}},
     # Strided mul_mat (attention QK/V)
     @{Name="mms_f32"; Threads=@{X=16;Y=16;Z=1}},
-    @{Name="mms_f16"; Threads=@{X=16;Y=16;Z=1}}
+    @{Name="mms_f16"; Threads=@{X=16;Y=16;Z=1}},
+    @{Name="mms_tiled"; Threads=@{X=16;Y=16;Z=1}}
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
