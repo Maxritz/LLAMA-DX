@@ -17,6 +17,7 @@ set(TEST_SOURCES
     test_dx12_e2e.cpp
     test_dx12_stability.cpp
     test_dx12_shader_perf.cpp
+    test_dx12_ds.cpp
     test_sm610_dxla_probe.cpp
     test_dxla_wave_bench.cpp
     test_dxla_wave_trans_bench.cpp
@@ -42,6 +43,7 @@ foreach(TEST_SRC ${TEST_SOURCES})
             ${CMAKE_CURRENT_SOURCE_DIR}/../dx12_graph.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/../dx12_shader_cache.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/../dx12_profiler.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/../dx12_ds.cpp
             ${CMAKE_CURRENT_BINARY_DIR}/../dx12_shader_registry.cpp
         )
         target_compile_definitions(${TEST_NAME} PRIVATE GGML_BACKEND_DL GGML_BACKEND_BUILD GGML_BACKEND_SHARED)
@@ -49,8 +51,9 @@ foreach(TEST_SRC ${TEST_SOURCES})
             ${CMAKE_CURRENT_SOURCE_DIR}/..
             ${CMAKE_CURRENT_SOURCE_DIR}/../..
             ${CMAKE_CURRENT_BINARY_DIR}/..
+            E:/DXllama/ds14/native/include
         )
-        target_link_libraries(${TEST_NAME} PRIVATE ggml-base d3d12.lib dxgi.lib dxcompiler.lib d3dcompiler.lib)
+        target_link_libraries(${TEST_NAME} PRIVATE ggml-base d3d12.lib dxgi.lib dxcompiler.lib d3dcompiler.lib dstorage.lib)
         add_dependencies(${TEST_NAME} dx12_shaders)
     else()
         target_link_libraries(${TEST_NAME} PRIVATE ggml-dx12 d3dcompiler.lib)
@@ -61,5 +64,6 @@ foreach(TEST_SRC ${TEST_SOURCES})
         ${CMAKE_SOURCE_DIR}/shaders
         ${AGILITY_SDK_DIR}/build/native/include
     )
+    target_link_directories(${TEST_NAME} PRIVATE E:/DXllama/ds14/native/lib/x64)
     add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
 endforeach()
