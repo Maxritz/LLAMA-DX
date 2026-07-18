@@ -317,7 +317,9 @@ void dx12_barrier_pre_dispatch(dx12_command_list* cmd,
                                 dx12_barrier_tracker* tracker,
                                 dx12_buffer** bufs,
                                 const D3D12_RESOURCE_STATES* new_states,
-                                uint32_t count) {
+                                uint32_t count,
+                                const uint64_t* lo, const uint64_t* hi,
+                                uint32_t write_mask) {
     if (!cmd || !cmd->d3d_list || !tracker || !bufs || !new_states || count == 0) return;
 
     // Zero-init is load-bearing: the UAV path sets only Type + pResource, and
@@ -326,43 +328,31 @@ void dx12_barrier_pre_dispatch(dx12_command_list* cmd,
     D3D12_RESOURCE_BARRIER barriers[16] = {};
     uint32_t n = 0;
 
-    std::vector<ID3D12Resource*> this_written;
-    std::vector<ID3D12Resource*> this_read;
+    // Resources fenced by this call (UAV barrier or transition): all their
+    // dirty entries are dropped afterwards — the barrier orders every prior
+    // access to the resource, not just the overlapping range.
+    ID3D12Resource* fenced[16];
+    uint32_t n_fenced = 0;
 
     for (uint32_t i = 0; i < count && i < 16; i++) {
         dx12_buffer* buf = bufs[i];
-        if (!buf) continue;
-        if (!buf->resource) continue;
-        // Non-DEFAULT heaps have fixed states — cannot transition
+        if (!buf || !buf->resource) continue;
+        // Non-DEFAULT heaps have fixed states — cannot transition, and their
+        // access is ordered by the copy/upload path
         if (buf->heap == dx12_heap_type::upload ||
             buf->heap == dx12_heap_type::gpu_upload ||
             buf->heap == dx12_heap_type::readback) continue;
 
-        // Skip duplicate buffer entries (aliased tensors)
-        bool dup = false;
-        for (uint32_t j = 0; j < i; j++) {
-            if (bufs[j] == buf) { dup = true; break; }
-        }
-        if (dup) continue;
-
         D3D12_RESOURCE_STATES new_state = new_states[i];
         ID3D12Resource* res = buf->resource.Get();
 
-        if (buf->state == new_state) {
-            // Same state — only emit UAV barrier if buffer was WRITTEN by prior dispatch
-            if (new_state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
-                bool was_written = false;
-                for (auto* w : tracker->last_written) {
-                    if (w == res) { was_written = true; break; }
-                }
-                if (was_written) {
-                    barriers[n].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-                    barriers[n].UAV.pResource = res;
-                    n++;
-                }
-            }
-        } else {
-            // State changed — emit transition barrier
+        bool already_fenced = false;
+        for (uint32_t f = 0; f < n_fenced; f++) {
+            if (fenced[f] == res) { already_fenced = true; break; }
+        }
+
+        if (buf->state != new_state) {
+            // State change — transition barrier (also a full fence for res)
             barriers[n].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             barriers[n].Transition.pResource = res;
             barriers[n].Transition.StateBefore = buf->state;
@@ -370,16 +360,32 @@ void dx12_barrier_pre_dispatch(dx12_command_list* cmd,
             barriers[n].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
             n++;
             buf->state = new_state;
-            if (buf->parent) {
-                buf->parent->state = new_state;
-            }
+            if (buf->parent) buf->parent->state = new_state;
+            if (!already_fenced) fenced[n_fenced++] = res;
+            continue;
         }
 
-        // Track for next dispatch's hazard check
-        if (new_state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
-            this_written.push_back(res);
-        } else {
-            this_read.push_back(res);
+        if (new_state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS || already_fenced) continue;
+
+        // Range-based hazard check against unfenced prior accesses
+        uint64_t rlo = lo ? lo[i] : 0;
+        uint64_t rhi = hi ? hi[i] : ~0ull;
+        bool is_write = (write_mask >> i) & 1u;
+
+        bool hazard = false;
+        for (const auto& e : tracker->dirty_writes) {          // RAW / WAW
+            if (e.res == res && e.lo < rhi && rlo < e.hi) { hazard = true; break; }
+        }
+        if (!hazard && is_write) {
+            for (const auto& e : tracker->dirty_reads) {       // WAR
+                if (e.res == res && e.lo < rhi && rlo < e.hi) { hazard = true; break; }
+            }
+        }
+        if (hazard) {
+            barriers[n].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            barriers[n].UAV.pResource = res;
+            n++;
+            fenced[n_fenced++] = res;
         }
     }
 
@@ -388,8 +394,37 @@ void dx12_barrier_pre_dispatch(dx12_command_list* cmd,
         d3d_cmd->ResourceBarrier(n, barriers);
     }
 
-    tracker->last_written.swap(this_written);
-    tracker->last_read.swap(this_read);
+    // Drop dirty entries for fenced resources
+    if (n_fenced > 0) {
+        auto is_fenced = [&](const dx12_hazard_range& e) {
+            for (uint32_t f = 0; f < n_fenced; f++) {
+                if (fenced[f] == e.res) return true;
+            }
+            return false;
+        };
+        auto& w = tracker->dirty_writes;
+        w.erase(std::remove_if(w.begin(), w.end(), is_fenced), w.end());
+        auto& r = tracker->dirty_reads;
+        r.erase(std::remove_if(r.begin(), r.end(), is_fenced), r.end());
+    }
+
+    // Record this dispatch's accesses for later hazard checks
+    for (uint32_t i = 0; i < count && i < 16; i++) {
+        dx12_buffer* buf = bufs[i];
+        if (!buf || !buf->resource) continue;
+        if (buf->heap == dx12_heap_type::upload ||
+            buf->heap == dx12_heap_type::gpu_upload ||
+            buf->heap == dx12_heap_type::readback) continue;
+        if (new_states[i] != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) continue;
+        ID3D12Resource* res = buf->resource.Get();
+        uint64_t rlo = lo ? lo[i] : 0;
+        uint64_t rhi = hi ? hi[i] : ~0ull;
+        if ((write_mask >> i) & 1u) {
+            tracker->dirty_writes.push_back({ res, rlo, rhi });
+        } else {
+            tracker->dirty_reads.push_back({ res, rlo, rhi });
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

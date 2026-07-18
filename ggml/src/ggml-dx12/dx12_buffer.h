@@ -145,17 +145,36 @@ void dx12_buffer_transition_batch(dx12_command_list* cmd,
 // Barrier Coalescing (removes redundant UAV barriers between dispatches)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-struct dx12_barrier_tracker {
-    std::vector<ID3D12Resource*> last_written;
-    std::vector<ID3D12Resource*> last_read;
-    void reset() { last_written.clear(); last_read.clear(); }
+// A GPU-VA range accessed since the last fence on its resource. Pool
+// sub-allocations share one ID3D12Resource, so hazard tracking must be at
+// range granularity — resource granularity forces a barrier between every
+// pair of dispatches touching the pool.
+struct dx12_hazard_range {
+    ID3D12Resource* res;
+    uint64_t lo, hi;   // [lo, hi)
 };
 
+struct dx12_barrier_tracker {
+    std::vector<dx12_hazard_range> dirty_writes; // written, not yet fenced
+    std::vector<dx12_hazard_range> dirty_reads;  // read, not yet fenced
+    void reset() { dirty_writes.clear(); dirty_reads.clear(); }
+};
+
+// Emit the minimal barriers needed before a dispatch.
+// lo/hi: per-binding GPU VA ranges actually touched (nullptr = whole
+// resource, maximally conservative). write_mask bit i = binding i is
+// written. Hazard rules: barrier a resource iff a binding range overlaps an
+// unfenced WRITE (RAW/WAW), or a written binding overlaps an unfenced READ
+// (WAR). A UAV or transition barrier fences ALL prior accesses to that
+// resource, so its dirty entries are dropped afterwards.
 void dx12_barrier_pre_dispatch(dx12_command_list* cmd,
                                 dx12_barrier_tracker* tracker,
                                 dx12_buffer** bufs,
                                 const D3D12_RESOURCE_STATES* new_states,
-                                uint32_t count);
+                                uint32_t count,
+                                const uint64_t* lo = nullptr,
+                                const uint64_t* hi = nullptr,
+                                uint32_t write_mask = 0xFFFFFFFFu);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Tensor Layout Helpers
