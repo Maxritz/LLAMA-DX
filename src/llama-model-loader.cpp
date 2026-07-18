@@ -1525,30 +1525,6 @@ bool llama_model_loader::load_all_data(
             ggml_backend_name(upload_backend));
     }
 
-    bool use_ds = false;
-    using fn_set_model_file_t = bool (*)(ggml_backend_t backend, const char * path);
-    using fn_load_tensor_async_t = bool (*)(ggml_backend_t backend, ggml_tensor * tensor, uint64_t file_offset, uint64_t dst_offset, size_t size);
-    using fn_flush_and_wait_t = void (*)(ggml_backend_t backend);
-
-    fn_set_model_file_t fn_set_model_file = nullptr;
-    fn_load_tensor_async_t fn_load_tensor_async = nullptr;
-    fn_flush_and_wait_t fn_flush_and_wait = nullptr;
-
-    if (upload_backend) {
-        auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(upload_backend));
-        fn_set_model_file = (fn_set_model_file_t)ggml_backend_reg_get_proc_address(reg, "ggml_backend_dx12_set_model_file");
-        fn_load_tensor_async = (fn_load_tensor_async_t)ggml_backend_reg_get_proc_address(reg, "ggml_backend_dx12_load_tensor_async");
-        fn_flush_and_wait = (fn_flush_and_wait_t)ggml_backend_reg_get_proc_address(reg, "ggml_backend_dx12_flush_and_wait");
-
-        if (fn_set_model_file && !files.empty()) {
-            const char * model_path = files.at(0)->path();
-            if (model_path && fn_set_model_file(upload_backend, model_path)) {
-                LLAMA_LOG_DEBUG("%s: DirectStorage enabled for model file: %s\n", __func__, model_path);
-                use_ds = true;
-            }
-        }
-    }
-
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
@@ -1603,68 +1579,59 @@ bool llama_model_loader::load_all_data(
                         return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
                     }));
                 }
-} else {
+            } else {
                 // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
                 if (upload_backend) {
-                    if (use_ds && fn_load_tensor_async) {
-                        // DirectStorage path: file -> GPU directly
-                        if (!fn_load_tensor_async(upload_backend, cur, weight->offs, 0, n_size)) {
-                            // DS returned false, fall back to pinned memory path - but this shouldn't happen if DS was enabled
-                            LLAMA_LOG_DEBUG("%s: DS fallback for tensor '%s'\n", __func__, ggml_get_name(cur));
+                    size_t offset = weight->offs;
+                    alignment = file->read_alignment();
+                    size_t aligned_offset = offset & ~(alignment - 1);
+                    size_t offset_from_alignment = offset - aligned_offset;
+                    file->seek(aligned_offset, SEEK_SET);
+
+                    // Calculate aligned read boundaries
+                    size_t read_start = aligned_offset;
+                    size_t read_end = (offset + n_size + alignment - 1) & ~(alignment - 1);
+
+                    size_t bytes_read = 0;
+                    size_t data_read = 0;  // Actual tensor data copied (excluding padding)
+
+                    while (bytes_read < read_end - read_start) {
+                        size_t read_size = std::min<size_t>(buffer_size, read_end - read_start - bytes_read);
+
+                        // Align the destination pointer within the pinned buffer
+                        uintptr_t ptr_dest_aligned = (reinterpret_cast<uintptr_t>(host_ptrs[buffer_idx]) + alignment - 1) & ~(alignment - 1);
+
+                        // Wait for previous upload to complete before reusing buffer
+                        ggml_backend_event_synchronize(events[buffer_idx]);
+
+                        // Read aligned chunk from file
+                        file->read_raw_unsafe(reinterpret_cast<void *>(ptr_dest_aligned), read_size);
+
+                        // Calculate actual data portion (excluding alignment padding)
+                        uintptr_t ptr_data = ptr_dest_aligned;
+                        size_t data_to_copy = read_size;
+
+                        // Skip alignment padding at start of first chunk
+                        if (bytes_read == 0) {
+                            ptr_data += offset_from_alignment;
+                            data_to_copy -= offset_from_alignment;
                         }
-                    } else {
-                        // Standard pinned memory path
-                        size_t offset = weight->offs;
-                        alignment = file->read_alignment();
-                        size_t aligned_offset = offset & ~(alignment - 1);
-                        size_t offset_from_alignment = offset - aligned_offset;
-                        file->seek(aligned_offset, SEEK_SET);
 
-                        // Calculate aligned read boundaries
-                        size_t read_start = aligned_offset;
-                        size_t read_end = (offset + n_size + alignment - 1) & ~(alignment - 1);
-
-                        size_t bytes_read = 0;
-                        size_t data_read = 0;  // Actual tensor data copied (excluding padding)
-
-                        while (bytes_read < read_end - read_start) {
-                            size_t read_size = std::min<size_t>(buffer_size, read_end - read_start - bytes_read);
-
-                            // Align the destination pointer within the pinned buffer
-                            uintptr_t ptr_dest_aligned = (reinterpret_cast<uintptr_t>(host_ptrs[buffer_idx]) + alignment - 1) & ~(alignment - 1);
-
-                            // Wait for previous upload to complete before reusing buffer
-                            ggml_backend_event_synchronize(events[buffer_idx]);
-
-                            // Read aligned chunk from file
-                            file->read_raw_unsafe(reinterpret_cast<void *>(ptr_dest_aligned), read_size);
-
-                            // Calculate actual data portion (excluding alignment padding)
-                            uintptr_t ptr_data = ptr_dest_aligned;
-                            size_t data_to_copy = read_size;
-
-                            // Skip alignment padding at start of first chunk
-                            if (bytes_read == 0) {
-                                ptr_data += offset_from_alignment;
-                                data_to_copy -= offset_from_alignment;
-                            }
-
-                            // Trim alignment padding at end of last chunk
-                            if (aligned_offset + bytes_read + read_size > offset + n_size) {
-                                data_to_copy -= (read_end - (offset + n_size));
-                            }
-
-                            // Async upload actual data to GPU
-                            ggml_backend_tensor_set_async(upload_backend, cur,
-                                                        reinterpret_cast<void *>(ptr_data), data_read, data_to_copy);
-                            ggml_backend_event_record(events[buffer_idx], upload_backend);
-
-                            data_read += data_to_copy;
-                            bytes_read += read_size;
-
-                            ++buffer_idx;
-                            buffer_idx %= n_buffers;
+                        // Trim alignment padding at end of last chunk
+                        if (aligned_offset + bytes_read + read_size > offset + n_size) {
+                            data_to_copy -= (read_end - (offset + n_size));
                         }
+
+                        // Async upload actual data to GPU
+                        ggml_backend_tensor_set_async(upload_backend, cur,
+                                                    reinterpret_cast<void *>(ptr_data), data_read, data_to_copy);
+                        ggml_backend_event_record(events[buffer_idx], upload_backend);
+
+                        data_read += data_to_copy;
+                        bytes_read += read_size;
+
+                        ++buffer_idx;
+                        buffer_idx %= n_buffers;
                     }
                 } else {
                     read_buf.resize(n_size);
@@ -1682,9 +1649,6 @@ bool llama_model_loader::load_all_data(
     }
 
     // free temporary resources used for async uploads
-    if (use_ds && fn_flush_and_wait) {
-        fn_flush_and_wait(upload_backend);
-    }
     for (auto * event : events) {
         ggml_backend_event_synchronize(event);
         ggml_backend_event_free(event);
