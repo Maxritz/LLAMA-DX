@@ -60,6 +60,9 @@ dx12_command_list* dx12_cmd_list_create(dx12_device* dev) {
 
     cmd->is_recording = true;
     cmd->is_closed = false;
+    cmd->first_use = true;
+    cmd->last_pso = nullptr;
+    cmd->last_root_sig = nullptr;
 
     return cmd;
 }
@@ -78,6 +81,19 @@ void dx12_cmd_list_destroy(dx12_command_list* cmd) {
 bool dx12_cmd_list_reset(dx12_command_list* cmd) {
     if (!cmd || !cmd->allocator || !cmd->d3d_list) return false;
 
+    // Skip allocator Reset on first use: calling allocator->Reset()
+    // on a fresh allocator returns E_FAIL on AMD RDNA4 drivers.
+    // CreateCommandList already left the list open with allocator bound,
+    // so we only flip the tracking state without touching the D3D12 API.
+    if (cmd->first_use) {
+        cmd->first_use = false;
+        cmd->is_recording = true;
+        cmd->is_closed = false;
+        cmd->last_pso = nullptr;
+        cmd->last_root_sig = nullptr;
+        return true;
+    }
+
     // Wait for GPU to finish before resetting allocator.
     // allocator->Reset() fails with E_FAIL if the GPU is still executing
     // commands recorded with this allocator (DX12 spec requirement).
@@ -88,18 +104,33 @@ bool dx12_cmd_list_reset(dx12_command_list* cmd) {
 
     HRESULT hr = cmd->allocator->Reset();
     if (FAILED(hr)) {
-        dx12_log(DX12_LOG_ERROR, "cmd_list_reset: allocator->Reset failed hr=0x%08X", hr);
-        return false;
-    }
-
-    hr = cmd->d3d_list->Reset(cmd->allocator.Get(), nullptr);
-    if (FAILED(hr)) {
-        dx12_log(DX12_LOG_ERROR, "cmd_list_reset: cmd_list->Reset failed hr=0x%08X", hr);
-        return false;
+        // RDNA4 workaround: allocator->Reset() returns E_FAIL even after the
+        // allocator has been used and GPU work has completed. Recreate the
+        // allocator and command list from scratch instead.
+        D3D12_COMMAND_LIST_TYPE list_type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        hr = cmd->device->device->CreateCommandAllocator(list_type, IID_PPV_ARGS(&cmd->allocator));
+        if (FAILED(hr)) {
+            dx12_log(DX12_LOG_ERROR, "cmd_list_reset: CreateCommandAllocator failed hr=0x%08X", hr);
+            return false;
+        }
+        hr = cmd->device->device->CreateCommandList(0, list_type, cmd->allocator.Get(), nullptr, IID_PPV_ARGS(&cmd->d3d_list));
+        if (FAILED(hr)) {
+            dx12_log(DX12_LOG_ERROR, "cmd_list_reset: CreateCommandList failed hr=0x%08X", hr);
+            return false;
+        }
+        cmd->first_use = true; // fresh allocator: skip Reset again on next call
+    } else {
+        hr = cmd->d3d_list->Reset(cmd->allocator.Get(), nullptr);
+        if (FAILED(hr)) {
+            dx12_log(DX12_LOG_ERROR, "cmd_list_reset: cmd_list->Reset failed hr=0x%08X", hr);
+            return false;
+        }
     }
 
     cmd->is_recording = true;
     cmd->is_closed = false;
+    cmd->last_pso = nullptr;
+    cmd->last_root_sig = nullptr;
     return true;
 }
 
@@ -114,6 +145,7 @@ bool dx12_cmd_list_close(dx12_command_list* cmd) {
 
     cmd->is_recording = false;
     cmd->is_closed = true;
+    cmd->first_use = false; // list has been closed: next Reset must reopen it
     return true;
 }
 
@@ -139,13 +171,17 @@ void dx12_cmd_list_dispatch_1d(dx12_command_list* cmd, uint32_t threads) {
 
 void dx12_cmd_list_set_pso(dx12_command_list* cmd, ID3D12PipelineState* pso) {
     if (!cmd || !cmd->d3d_list || !pso) return;
+    if (cmd->last_pso == pso) return;
     cmd->d3d_list->SetPipelineState(pso);
+    cmd->last_pso = pso;
 }
 
 void dx12_cmd_list_set_root_signature(dx12_command_list* cmd,
                                        ID3D12RootSignature* root_sig) {
     if (!cmd || !cmd->d3d_list || !root_sig) return;
+    if (cmd->last_root_sig == root_sig) return;
     cmd->d3d_list->SetComputeRootSignature(root_sig);
+    cmd->last_root_sig = root_sig;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -158,6 +194,7 @@ uint64_t dx12_cmd_list_submit(dx12_command_list* cmd) {
     // Close if still recording
     if (cmd->is_recording) {
         if (!dx12_cmd_list_close(cmd)) return 0;
+        cmd->first_use = false; // allocator now used; next Reset needs full path
     }
 
     if (!cmd->is_closed) return 0;
@@ -191,15 +228,6 @@ void dx12_cmd_list_uav_barrier(dx12_command_list* cmd, ID3D12Resource* resource)
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     barrier.UAV.pResource = resource;
-    cmd->d3d_list->ResourceBarrier(1, &barrier);
-}
-
-void dx12_cmd_list_global_uav_barrier(dx12_command_list* cmd) {
-    if (!cmd || !cmd->d3d_list) return;
-
-    D3D12_RESOURCE_BARRIER barrier{};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-    barrier.UAV.pResource = nullptr; // Global
     cmd->d3d_list->ResourceBarrier(1, &barrier);
 }
 

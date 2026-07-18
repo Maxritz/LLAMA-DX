@@ -222,7 +222,7 @@ bool dx12_shader_dispatch_gemm(dx12_device* dev,
     }
 
     // GEMM parameters packed as uint32 constants
-    // Layout: M, N, K, stride_A, stride_B, stride_C, transposed_b, reserved
+    // Layout: M, N, K, stride_A, stride_B, stride_C, transposed_b, alpha_f16, reserved
     struct gemm_params {
         uint32_t M;
         uint32_t N;
@@ -231,7 +231,8 @@ bool dx12_shader_dispatch_gemm(dx12_device* dev,
         uint32_t stride_B;
         uint32_t stride_C;
         uint32_t transposed_b;
-        uint32_t reserved[9]; // Pad to 16 uints
+        uint32_t alpha_f16;
+        uint32_t reserved[8]; // Pad to 16 uints
     } params{};
 
     params.M = M;
@@ -241,6 +242,7 @@ bool dx12_shader_dispatch_gemm(dx12_device* dev,
     params.stride_B = transposed_b ? K : N; // B is KxN (or NxK if transposed)
     params.stride_C = N;          // C is MxN
     params.transposed_b = transposed_b ? 1 : 0;
+    params.alpha_f16 = 0x3C00;    // 1.0 as F16
 
     // Calculate tile-based dispatch
     const dx12_shader_entry* entry = dx12_get_shader_entry(shader_name);

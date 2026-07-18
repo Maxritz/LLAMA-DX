@@ -23,10 +23,15 @@ dx12_gemm_path dx12_select_gemm_path(dx12_device* dev,
         return DX12_GEMM_STANDARD;
     }
 
-    // Some quant formats only work with standard GEMM
-    if (weight_quant != DX12_QUANT_F16 &&
-        weight_quant != DX12_QUANT_F32 &&
-        weight_quant != DX12_QUANT_Q4_0) {
+    // Allowed quant types for DXLA wave/TG path. Q4_0, Q4_K, and Q8_0 have
+    // dedicated wave-scope shaders that dequant in groupshared before Mat::Load.
+    if (weight_quant == DX12_QUANT_F16 ||
+        weight_quant == DX12_QUANT_F32 ||
+        weight_quant == DX12_QUANT_Q4_0 ||
+        weight_quant == DX12_QUANT_Q4_K ||
+        weight_quant == DX12_QUANT_Q8_0) {
+        // Allowed for DXLA — proceed to dimension check
+    } else {
         return DX12_GEMM_STANDARD;
     }
 
@@ -102,9 +107,13 @@ bool dx12_gemm_dispatch_standard(dx12_device* dev,
     }
 
     // Transition buffers to correct states
-    dx12_buffer_transition(cmd, matrix_a, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    dx12_buffer_transition(cmd, matrix_b, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    dx12_buffer_transition(cmd, result, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    dx12_buffer* bufs[3] = { matrix_a, matrix_b, result };
+    D3D12_RESOURCE_STATES states[3] = {
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+    };
+    dx12_buffer_transition_batch(cmd, bufs, states, 3);
 
     // Tile size from device caps
     uint32_t tile_m = dev->caps.optimal_gemm_tile;
@@ -165,15 +174,24 @@ bool dx12_gemm_dispatch_dxla_wave(dx12_device* dev,
     }
 
     const char* shader_name = "mul_mat_dxla_wave_f16_f16";
-    if (params->quant_a == DX12_QUANT_Q4_0) {
-        shader_name = "mul_mat_dxla_wave_q4_0_f16";
-    } else if (params->transposed_b) {
-        shader_name = "mul_mat_dxla_wave_f16_f16_trans";
+    switch (params->quant_a) {
+        case DX12_QUANT_Q4_0: shader_name = "mul_mat_dxla_wave_q4_0_f16"; break;
+        case DX12_QUANT_Q4_K: shader_name = "mul_mat_dxla_wave_q4_k_f16"; break;
+        case DX12_QUANT_Q8_0: shader_name = "mul_mat_dxla_wave_q8_0_f16"; break;
+        default:
+            if (params->transposed_b) {
+                shader_name = "mul_mat_dxla_wave_f16_f16_trans";
+            }
+            break;
     }
 
-    dx12_buffer_transition(cmd, matrix_a, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    dx12_buffer_transition(cmd, matrix_b, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    dx12_buffer_transition(cmd, result, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    dx12_buffer* bufs[3] = { matrix_a, matrix_b, result };
+    D3D12_RESOURCE_STATES states[3] = {
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+    };
+    dx12_buffer_transition_batch(cmd, bufs, states, 3);
 
     // DXLA wave: each wave handles 16x16 tile
     uint32_t tile = 16;
@@ -229,9 +247,13 @@ bool dx12_gemm_dispatch_dxla_tg(dx12_device* dev,
 
     const char* shader_name = "mul_mat_dxla_tg_f16_f16";
 
-    dx12_buffer_transition(cmd, matrix_a, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    dx12_buffer_transition(cmd, matrix_b, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    dx12_buffer_transition(cmd, result, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    dx12_buffer* bufs[3] = { matrix_a, matrix_b, result };
+    D3D12_RESOURCE_STATES states[3] = {
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+    };
+    dx12_buffer_transition_batch(cmd, bufs, states, 3);
 
     // ThreadGroup: 32x32 tiles with 128 threads (4 waves of 32)
     uint32_t tile = 32;
@@ -276,9 +298,13 @@ bool dx12_gemm_dispatch_quantized(dx12_device* dev,
     const char* shader_name = dx12_quant_gemm_shader_name(
         params->quant_a, params->quant_b, false);
 
-    dx12_buffer_transition(cmd, quantized_weights, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    dx12_buffer_transition(cmd, activations, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    dx12_buffer_transition(cmd, result, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    dx12_buffer* bufs[3] = { quantized_weights, activations, result };
+    D3D12_RESOURCE_STATES states[3] = {
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+    };
+    dx12_buffer_transition_batch(cmd, bufs, states, 3);
 
     uint32_t tile_m = dev->caps.optimal_gemm_tile;
     uint32_t tile_n = dev->caps.optimal_gemm_tile;

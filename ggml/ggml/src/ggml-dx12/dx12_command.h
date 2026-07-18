@@ -130,10 +130,7 @@ void dx12_cmd_list_submit_and_wait(dx12_command_list* cmd);
  */
 void dx12_cmd_list_uav_barrier(dx12_command_list* cmd, ID3D12Resource* resource);
 
-/**
- * dx12_cmd_list_global_uav_barrier — Global UAV barrier (all resources)
- */
-void dx12_cmd_list_global_uav_barrier(dx12_command_list* cmd);
+
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Direct Constant/Descriptor Setting (for root signature binding)

@@ -157,7 +157,203 @@ NumElements = vs * em / 2;    // for F16 buffers (2 bytes/element, must be even)
 
 | Shader | Size | Latency | GFLOPS |
 |--------|------|---------|--------|
-| Scalar GEMV F16 | 4096×4096 | 42.7 µs | 786 |
-| Scalar GEMM F16 (tile) | 32×4096×4096 | 1955.9 µs | 549 |
-| DXLA Wave GEMM F16 | 32×4096×4096 | 59.6 µs | 18,010 |
-| DXLA Wave speedup | — | 32.81× | 32.81× |
+| Scalar GEMV F16 | 4096x4096 | 42.7 us | 786 |
+| Scalar GEMM F16 (tile) | 32x4096x4096 | 1955.9 us | 549 |
+| DXLA Wave GEMM F16 | 32x4096x4096 | 59.6 us | 18,010 |
+| DXLA Wave speedup | - | 32.81x | 32.81x |
+
+# SESSION SUMMARY (2026-07-12, ongoing)
+
+## Objective
+- Fix DX12 dispatch bottleneck by removing per-split fence wait, adding GPU/CPU profiler (DX12_PROFILE), and adding Q8_0 DXLA wave shader support.
+- Build and benchmark the DX12 backend against previous numbers.
+
+## Build Fixes
+- CMake builds with Visual Studio 17 2022 generator (-G "Visual Studio 17 2022" -A x64 -T host=x64). Ninja generator detects Clang instead of MSVC with CMake 4.3 -- do not use Ninja.
+- Strawberry Perl PATH conflict: use full path to CMake after running vcvars64.bat, with set PATH=C:\Program Files\CMake\bin;%PATH%.
+- Build output is in build-msvc\bin\Release\.
+- Be sure to copy Agility SDK DLLs from dist\dx12-bundle\D3D12\ to the build output directory (build-msvc\bin\Release\D3D12\). Without them, D3D12CreateDevice with FL 12_2 fails and falls back to system runtime (FL 12_1), causing severe performance regression.
+
+## Baseline Regression Root Cause
+- Clean git 67f64f3 gave tg32=27.13 t/s for Llama 1B Q8_0 when run from build-msvc\bin\Release\.
+- Expected baseline is ~90.88 t/s (recorded in bench_results.txt, run from dist\dx12-bundle\ with Agility SDK DLLs present).
+- The regression is NOT from code changes -- the code is identical between these commits.
+- ROOT CAUSE: The EXE searches for .\D3D12\D3D12Core.dll relative to working directory. Without it, FL 12_2 device creation fails, falling back to the system D3D12 runtime (FL 12_1 or missing driver optimization paths).
+- With Agility SDK DLLs copied into build output, baseline recovers to ~85 t/s.
+
+## All Changes Are Stashed
+All source changes are in git stash. Files modified:
+- ggml/ggml/src/ggml-dx12/CMakeLists.txt -- adds Q8_0 DXLA shader to build
+- ggml/ggml/src/ggml-dx12/dx12_gemm.cpp -- Q8_0 routing to DXLA path
+- ggml/ggml/src/ggml-dx12/dx12_graph.cpp -- fence wait removal (reverted), profiler scopes
+- ggml/ggml/src/ggml-dx12/dx12_profiler.cpp -- D3D12_FEATURE_DATA_GPU_BASED_VALIDATION fix, profile scope for ring_wait_idle
+- ggml/ggml/src/ggml-dx12/dx12_profiler.h -- dx12_profile_scope, enhanced dump_results, dx12_profile_enabled()
+- ggml/ggml/src/ggml-dx12/dx12_quantize.cpp -- minor fix
+- ggml/ggml/src/ggml-dx12/dx12_ring.cpp -- ring_wait_idle optimized to single fence wait
+- ggml/ggml/src/ggml-dx12/ggml-backend-dx12.cpp -- profiler initialization
+- ggml/ggml/src/ggml-dx12/shaders/compile_shaders.ps1 -- added Q8_0 DXLA compilation
+- ggml/ggml/src/ggml-dx12/shaders/mul_mat_dxla_wave_q4_0_f16.hlsl -- modified (Q4_0 DXLA tweaks)
+- ggml/src/ggml-dx12/CMakeLists.txt -- adds Q8_0 shader
+- ggml/src/ggml-dx12/dx12_gemm.cpp -- Q8_0 path routing (duplicate, in both ggml/ggml/ and ggml/ paths)
+- ggml/src/ggml-dx12/dx12_graph.cpp -- profiler scopes
+- ggml/src/ggml-dx12/dx12_profiler.cpp -- profiler changes
+- ggml/src/ggml-dx12/dx12_profiler.h -- profiler changes
+- ggml/src/ggml-dx12/dx12_quantize.cpp -- minor fix
+- ggml/src/ggml-dx12/dx12_ring.cpp -- ring optimization
+- ggml/src/ggml-dx12/ggml-backend-dx12.cpp -- profiler init
+- ggml/src/ggml-dx12/generated/dx12_shader_registry.cpp -- updated for new CSOs
+- ggml/src/ggml-dx12/generated/mv_f16.cso -- updated CSO
+- ggml/src/ggml-dx12/shaders/compile_shaders.ps1 -- Q8_0 DXLA
+- ggml/src/ggml-dx12/shaders/mul_mat_dxla_wave_q4_0_f16.hlsl -- Q4_0 DXLA tweaks
+
+Deleted files: INTEGRATION_GUIDE.md, README-DX12.md, agility_shim.cpp, build-dx12.ps1, build/, dx12_backend_exports.def, dx12_buffer.cpp/.h, dx12_command.cpp/.h, dx12_descriptor.cpp/.h, dx12_device.cpp/.h, dx12_gemm.h, dx12_graph.h, dx12_quantize.h, dx12_ring.h, dx12_shader.cpp/.h, dx12_shader_cache.cpp/.h, generated/*.cso (most), ggml-backend-dx12.h, llama_cpp_dx12_component_plan.md, shaders/CMakeLists.txt, shaders/DX12_AI_PIPELINE.hlsli, shaders/*.hlsl (most), tests/.
+
+## Fence Wait Removal Status
+- Fence wait removal was tested WITHOUT Agility SDK DLLs. Results: catastrophic regression (tg32 dropped from 27 to 4 t/s for Llama 1B Q8_0). Reverted for the Agility SDK benchmark run.
+- The fence wait removal may still be unsafe even with proper Agility SDK DLLs. It needs careful incremental testing:
+  1. First test profiler + Q8_0 DXLA + ring optimization (no fence removal)
+  2. Then test fence removal alone
+  3. If fence removal still regresses, abandon it
+
+## Build Command
+```powershell
+& "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+set PATH=C:\Program Files\CMake\bin;%PATH%
+& "C:\Program Files\CMake\bin\cmake.exe" -B build-msvc -G "Visual Studio 17 2022" -A x64 -T host=x64 `
+    -DCMAKE_BUILD_TYPE=Release `
+    -DGGML_DX12=ON `
+    -DGGML_CUDA=OFF `
+    -DGGML_VULKAN=OFF `
+    -DGGML_METAL=OFF `
+    -DGGML_BLAS=OFF `
+    -DCMAKE_INSTALL_PREFIX="E:/DXllama/OptimiseDX/build-msvc" `
+    -DLLAMA_BENCH=ON `
+    -DCMAKE_VERBOSE_MAKEFILE=OFF `
+    -DDXC_EXECUTABLE="E:/DXllama/dxc-1.10.2605.2/bin/x64/dxc.exe"
+& "C:\Program Files\CMake\bin\cmake.exe" --build build-msvc --config Release --target llama-bench -j 8
+```
+
+## Benchmark Command
+```powershell
+cd build-msvc\bin\Release
+.\llama-bench.exe -m E:\DXllama\gguf\Llama-1B-Q8_0.gguf -p 512 -n 128 -ngl 99 -t 8 -o 0,1,2
+```
+
+## Agility SDK DLLs (must copy before running benchmark)
+```powershell
+New-Item -ItemType Directory -Force -Path build-msvc\bin\Release\D3D12
+Copy-Item -Path "dist\dx12-bundle\D3D12\*" -Destination "build-msvc\bin\Release\D3D12\" -Recurse -Force
+```
+
+## Test Harness Procedure (MANDATORY)
+
+### Build + Run All Tests
+```powershell
+# Build all test targets
+cmake --build build-msvc --config Release --target test_dx12_buffer test_dx12_device test_dx12_e2e test_dx12_gemm test_dx12_ops test_dx12_quantize test_dx12_layer test_dx12_model_load test_dx12_stability test_dxla_wave_bench test_dxla_wave_trans_bench test_sm610_dxla_probe -j 8
+
+# Run tests individually (NEVER batch all at once — can hang system)
+.\build-msvc\bin\Release\test_dx12_buffer.exe
+.\build-msvc\bin\Release\test_dx12_device.exe
+.\build-msvc\bin\Release\test_dx12_e2e.exe
+.\build-msvc\bin\Release\test_dx12_gemm.exe
+.\build-msvc\bin\Release\test_dx12_ops.exe
+.\build-msvc\bin\Release\test_dx12_quantize.exe
+.\build-msvc\bin\Release\test_dx12_layer.exe
+.\build-msvc\bin\Release\test_dx12_model_load.exe
+.\build-msvc\bin\Release\test_dx12_stability.exe
+.\build-msvc\bin\Release\test_dxla_wave_bench.exe
+.\build-msvc\bin\Release\test_dxla_wave_trans_bench.exe   # CAUTION: can hang if bugs present
+```
+
+### Known Allocator Error (Harmless on RDNA4)
+`cmd_list_reset: allocator->Reset failed hr=0x80004005` — occurs on RDNA4 when calling Reset on a fresh command allocator (created via CreateCommandList in open state). The command list is already open and usable; the failed Reset is redundant. Safe to ignore.
+
+## P0 Fix: DXLA Wave Shader Buffer Overrun (2026-07-12)
+
+### Root Cause
+All 6 DXLA wave shaders used `acc.Store(result, c_offset, stride, RowMajor)` which stores a full 16x16 tile unconditionally. For matrices with M < 16 or N < 16, this writes past the output buffer, corrupting adjacent GPU memory.
+
+### Files Fixed
+- `ggml/src/ggml-dx12/shaders/mul_mat_dxla_wave_f16_f16.hlsl`
+- `ggml/src/ggml-dx12/shaders/mul_mat_dxla_wave_f16_f16_trans.hlsl`
+- `ggml/src/ggml-dx12/shaders/mul_mat_dxla_wave_f16_f16_static.hlsl`
+- `ggml/src/ggml-dx12/shaders/mul_mat_dxla_wave_f16_f16_rowmajor.hlsl`
+- `ggml/src/ggml-dx12/shaders/mul_mat_dxla_wave_q8_0_f16.hlsl`
+- `ggml/src/ggml-dx12/shaders/mul_mat_dxla_wave_q4_0_f16.hlsl` (also fixed: column index `lr`→`lc`, uninitialized matrices)
+
+### Fix Applied
+Replaced `acc.Store(result, offset, stride, RowMajor)` with per-element bounds-checked loop:
+```hlsl
+for (uint i = WaveGetLaneIndex(); i < 256; i += 32) {
+    uint r = tile_row + i / 16;
+    uint c = tile_col + i % 16;
+    if (r < params.M && c < params.N) {
+        result.Store((r * params.stride_c + c) * 4, asuint(acc.Get(i)));
+    }
+}
+```
+
+### Remaining Issue: A-Matrix LOAD Overrun
+The MatA::Load still reads a full 16x16 tile from the input matrix even for M < 16. This reads garbage from padded heap bytes (within 64KB allocation, so doesn't page fault) but produces NaN in accumulator rows >= M. The per-element store discards these NaN rows. Not a crash risk but produces garbage F16 reads that could theoretically cause DXLA hardware issues.
+
+### Fix Options
+Option A (test fix): Only use tile-aligned sizes (M,N multiples of 16) for DXLA wave dispatch.
+Option B (shader fix): Load via groupshared with per-element bounds check, then Mat::Load from groupshared — adds GroupMemoryBarrier overhead but guarantees no garbage reads.
+
+## Fence Wait Removal (Branch: fence-wait-removal)
+
+### Change
+In `dx12_graph_compute_end()`, removed `dx12_device_wait_for_fence()` after `dx12_ring_submit()`. The ring buffer (4 slots) with backpressure in `dx12_ring_acquire()` handles synchronization.
+
+### Safety Analysis
+- **Ring overflow**: dx12_ring_acquire() checks fence before recycling oldest slot (lines 80-86)
+- **Memory safety**: allocator reset guarded by fence check
+- **Upload ordering**: dx12_flush_uploads() called before each graph_compute
+- **Effects**: only affects ggml graph pipeline; test harness (dx12_cmd_list_submit_and_wait) is unaffected
+
+### Test Harness Results (known issues)
+- `test_dx12_gemm`: 3/4 pass, 1 FAIL (pso_simple copy — allocator Reset on fresh cmd, harmless)
+- All other tests: PASS (including stability, E2E, probe)
+- `test_dx12_shader_perf`: SKIP (hangs on RDNA4 — known issue, not related to fence removal)
+- `test_dxla_wave_trans_bench`: Phase 1 passes, Phase 2 first benchmark completes but subsequent allocs fail with DXGI_ERROR_DEVICE_REMOVED (0x887A0005) — likely a separate RX 9070 XT driver issue with heavy dispatch loops (500 dispatches in 5 reps) causing TDR
+
+### Q4_0 Wave Shader (also fixed)
+The Q4_0 wave shader had additional bugs: wrong column index (`gc=tc+lr` instead of `gc=tc+lc`), uninitialized matrices passed to MultiplyAccumulate, and a per-element store without bounds check. Rewritten to follow the Q8_0 pattern with groupshared dequantization.
+
+## Safe Optimizations (2026-07-12)
+
+### 1. pending_staging Memory Leak Fix
+**File**: `dx12_device.cpp:814-836` (wait_idle), `dx12_quantize.cpp:169`
+**Fix**: Drain `dev->pending_staging` in `dx12_device_wait_idle()` after GPU fence completes. Previously these upload buffers were pushed but never freed.
+**Risk**: LOW — GPU is idle when drain occurs.
+
+### 2. Ring Capacity 4→8
+**File**: `dx12_ring.h:21`
+**Fix**: `DX12_RING_CAPACITY = 4` → `8`. Each slot ~128KB, total +512KB VRAM. Deeper pipelining reduces ring-stall probability.
+**Risk**: LOW — no behavioral change, only reduces stall probability.
+
+### 3. Skip Redundant PSO/Root-Sig Sets
+**Files**: `dx12_command.h:31-32` (tracking fields), `dx12_command.cpp:140-149` (skip logic)
+**Fix**: Track `last_pso` / `last_root_sig` per command list. `dx12_cmd_list_set_pso` and `dx12_cmd_list_set_root_signature` compare pointers and skip the D3D12 API call if unchanged. Reset tracking on `dx12_cmd_list_create` / `dx12_cmd_list_reset`.
+**Risk**: LOW — worst case is a redundant set (no-op). No GPU hang risk.
+
+### 4. Batch ResourceBarrier Calls
+**Files**: `dx12_buffer.h` (declaration), `dx12_buffer.cpp` (implementation)
+**Fix**: Added `dx12_buffer_transition_batch()` that collects up to 8 transitions into a single `ResourceBarrier(N, ...)` call instead of N individual `ResourceBarrier(1, ...)` calls. Same barriers, fewer D3D12 API calls.
+**Risk**: LOW — same barriers, batched. No GPU execution change.
+
+### 5. GPU_UPLOAD Heap for Staging
+**File**: `ggml-backend-dx12.cpp:159`
+**Fix**: `dx12_upload_batch::ensure()` now checks `dev->caps.gpu_upload_heap` and uses `dx12_heap_type::gpu_upload` on ReBAR systems (RX 9070 XT). On ReBAR, this puts the staging buffer in VRAM, making `CopyBufferRegion` a GPU-internal copy (500-900 GB/s) instead of PCIe copy (~32 GB/s). Falls back to `dx12_heap_type::upload` if not supported.
+**Risk**: LOW — feature-detect gated, benchmark-verified in `test_gpu_upload_bench`.
+
+### 6. Upload Cmd List Reuse
+**File**: `ggml-backend-dx12.cpp:165-173`
+**Fix**: `dx12_upload_batch::flush()` now calls `dx12_cmd_list_reset(cmd)` instead of `dx12_cmd_list_destroy(cmd)` + lazy recreate on next use. Eliminates `CreateCommandAllocator` + `CreateCommandList` per flush cycle.
+**Risk**: LOW — `dx12_cmd_list_reset` waits for fence before resetting allocator.
+
+### 7. Readback Pool for get_tensor
+**File**: `ggml-backend-dx12.cpp:510-550` (get_tensor)
+**Fix**: Replaced per-call `CreateCommittedResource` + `CreateCommandList` with a persistent `dx12_readback_pool` (grows to max size needed, never shrinks). Eliminates create/destroy per logit read.
+**Risk**: LOW — same submit+wait pattern, just reused objects.

@@ -11,7 +11,7 @@ cmake_minimum_required(VERSION 3.25)
 include(FetchContent)
 
 set(DX12_AGILITY_SDK_VERSION "1.721.1" CACHE STRING "DirectX Agility SDK version")
-set(DX12_AGILITY_SDK_PATH "E:/DXllama/agility1.721.1" CACHE PATH "Path to local Agility SDK root")
+set(DX12_AGILITY_SDK_PATH "E:/DXllama/sdk" CACHE PATH "Path to local Agility SDK root (preview for SM 6.10/DXLA)")
 
 set(AGILITY_SDK_DIR ${DX12_AGILITY_SDK_PATH})
 message(STATUS "Using Agility SDK from: ${AGILITY_SDK_DIR}")
@@ -193,6 +193,7 @@ set(DX12_SHADERS_DXLA
     mul_mat_dxla_wave_f16_f16
     mul_mat_dxla_wave_f16_f16_trans
     mul_mat_dxla_wave_q4_0_f16
+    mul_mat_dxla_wave_q8_0_f16
     mul_mat_dxla_tg_f16_f16
     attn_qk_dxla
     attn_ov_dxla

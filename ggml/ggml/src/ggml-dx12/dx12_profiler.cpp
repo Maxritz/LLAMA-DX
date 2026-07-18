@@ -8,6 +8,9 @@
 #include <cstring>
 #include <cstdio>
 #include <ctime>
+#include <windows.h>
+#include <cstdlib>
+#include <algorithm>
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // GPU Timer
@@ -49,9 +52,9 @@ bool dx12_gpu_timer::init(dx12_device* dev, uint32_t max_q) {
 }
 
 void dx12_gpu_timer::begin(dx12_command_list* cmd, const char* name) {
-    (void)name;
     if (!cmd || !cmd->d3d_list || current_query >= max_queries) return;
     cmd->d3d_list->EndQuery(query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, current_query * 2);
+    query_names.push_back(name ? name : "unknown");
 }
 
 void dx12_gpu_timer::end(dx12_command_list* cmd) {
@@ -78,6 +81,97 @@ double dx12_gpu_timer::get_time_ms(uint32_t query_idx) {
     uint64_t end = data[1];
     readback_buf->Unmap(0, nullptr);
     return (double)(end - begin) * gpu_freq_ms;
+}
+
+void dx12_gpu_timer::dump_results() {
+    if (current_query == 0) return;
+
+    // Aggregate by op name
+    struct op_agg { double total; uint32_t count; double max; };
+    std::unordered_map<std::string, op_agg> agg;
+    double total_gpu = 0.0;
+    for (uint32_t i = 0; i < current_query; i++) {
+        double ms = get_time_ms(i);
+        total_gpu += ms;
+        const char* name = i < query_names.size() ? query_names[i].c_str() : "?";
+        auto& a = agg[name];
+        a.total += ms;
+        a.count++;
+        if (ms > a.max) a.max = ms;
+    }
+
+    // Build sorted list
+    std::vector<std::pair<std::string, op_agg>> sorted(agg.begin(), agg.end());
+    std::sort(sorted.begin(), sorted.end(),
+        [](const auto& a, const auto& b) { return a.second.total > b.second.total; });
+
+    dx12_log(DX12_LOG_INFO, "=== GPU Timings ===");
+    for (auto& [name, a] : sorted) {
+        if (a.count > 1) {
+            dx12_log(DX12_LOG_INFO, "  %s: GPU=%.3fms count=%u avg=%.3fms peak=%.3fms",
+                name.c_str(), a.total, a.count, a.total / a.count, a.max);
+        } else {
+            dx12_log(DX12_LOG_INFO, "  %s: GPU=%.3fms", name.c_str(), a.total);
+        }
+    }
+    dx12_log(DX12_LOG_INFO, "--- TOTAL GPU: %.3f ms (over %u queries) ---",
+        total_gpu, current_query);
+}
+
+void dx12_gpu_timer::reset() {
+    current_query = 0;
+    query_names.clear();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Profile Scope (enabled only when DX12_PROFILE env var is set)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+bool dx12_profile_enabled() {
+    static bool checked = false;
+    static bool enabled = false;
+    if (!checked) {
+        enabled = getenv("DX12_PROFILE") != nullptr;
+        checked = true;
+    }
+    return enabled;
+}
+
+dx12_profile_scope::dx12_profile_scope(dx12_gpu_timer* t, dx12_command_list* c,
+                                       const char* n, bool gpu)
+    : name(n), timer(t), cmd(c), query_idx(UINT32_MAX), active(false) {
+    if (!dx12_profile_enabled()) return;
+    LARGE_INTEGER freq;
+    QueryPerformanceFrequency(&freq);
+    cpu_freq_ms = 1000.0 / (double)freq.QuadPart;
+    LARGE_INTEGER pc;
+    QueryPerformanceCounter(&pc);
+    cpu_start = pc.QuadPart;
+    if (gpu && timer && cmd) {
+        timer->begin(cmd, n);
+        query_idx = timer->current_query;
+    }
+    active = true;
+}
+
+dx12_profile_scope::~dx12_profile_scope() {
+    if (!active) return;
+    LARGE_INTEGER pc;
+    QueryPerformanceCounter(&pc);
+    double cpu_ms = (double)(pc.QuadPart - cpu_start) * cpu_freq_ms;
+    if (query_idx != UINT32_MAX && timer && cmd) {
+        timer->end(cmd);
+    }
+    dx12_log(DX12_LOG_INFO, "[PROFILE] %s: CPU=%.3fms%s",
+        name, cpu_ms,
+        (query_idx != UINT32_MAX) ? " (GPU timed)" : "");
+}
+
+double dx12_profile_scope::elapsed_cpu() const {
+    if (!active) return 0.0;
+    LARGE_INTEGER pc;
+    QueryPerformanceCounter(&pc);
+    return (double)(pc.QuadPart - cpu_start) * cpu_freq_ms;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

@@ -7,11 +7,13 @@
 #include "dx12_graph.h"
 #include "dx12_shader.h"
 #include "dx12_gemm.h"
+#include "dx12_profiler.h"
 #include "dx12_quantize.h"
 #include "dx12_ring.h"
 #include "ggml-backend-dx12.h"
 #include <ggml-impl.h>
 #include <cstring>
+#include <cstdio>
 
 // Forward declarations
 static bool dx12_dispatch_mul_mat_fused_act(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst, uint32_t act_op);
@@ -270,6 +272,9 @@ bool dx12_graph_validate(dx12_device* dev, ggml_cgraph* graph,
 dx12_command_list* dx12_graph_compute_begin(dx12_device* dev) {
     if (!dev || !dev->ring) return nullptr;
 
+    dx12_profile_scope acq(dev->gpu_timer, nullptr, "ring_acquire");
+    (void)acq;
+
     // Acquire a slot from the ring buffer (pre-allocated, fence-polling)
     dx12_ring_slot* slot = dx12_ring_acquire(dev->ring);
     if (!slot) return nullptr;
@@ -290,12 +295,13 @@ dx12_command_list* dx12_graph_compute_begin(dx12_device* dev) {
 void dx12_graph_compute_end(dx12_device* dev, dx12_command_list* cmd) {
     if (!dev || !cmd) return;
 
-    // Submit via ring buffer (non-blocking, just signals fence + advances head)
-    uint64_t fence = dx12_ring_submit(dev->ring);
+    dx12_profile_scope sub(dev->gpu_timer, nullptr, "ring_submit");
+    (void)sub;
 
-    // Wait for completion — the scheduler needs results before the next token.
-    // This is the blocking ~400µs cost. The ring saves the allocator
-    // create/destroy churn (~15µs) and enables future pipelining.
+    // Submit via ring buffer, then wait for GPU completion.
+    // Per-split fence wait keeps GPU submissions serialized, avoiding
+    // ring-buffer stalls and ensuring sync correctness.
+    uint64_t fence = dx12_ring_submit(dev->ring);
     if (fence > 0) {
         dx12_device_wait_for_fence(dev, fence);
     }
@@ -316,11 +322,20 @@ bool dx12_graph_compute(dx12_device* dev, dx12_command_list* cmd, ggml_cgraph* g
         return false;
     }
 
+    // Reset GPU timer for this sub-graph
+    if (dev->gpu_timer) dev->gpu_timer->reset();
+
     // Execute each node in topological order
     for (int i = 0; i < graph->n_nodes; i++) {
         ggml_tensor* node = graph->nodes[i];
         bool ok = false;
         bool dispatched = true;
+
+        bool record_timing = dev->gpu_timer &&
+            node->op != GGML_OP_VIEW && node->op != GGML_OP_RESHAPE &&
+            node->op != GGML_OP_PERMUTE && node->op != GGML_OP_TRANSPOSE &&
+            node->op != GGML_OP_NONE;
+        if (record_timing) dev->gpu_timer->begin(cmd, ggml_op_name(node->op));
 
         switch (node->op) {
             case GGML_OP_MUL_MAT:       ok = dx12_dispatch_mul_mat(dev, cmd, node); break;
@@ -365,17 +380,23 @@ bool dx12_graph_compute(dx12_device* dev, dx12_command_list* cmd, ggml_cgraph* g
                 break;
         }
 
+        if (record_timing) dev->gpu_timer->end(cmd);
+
         if (!ok) {
             dx12_log(DX12_LOG_ERROR, "Dispatch failed for op %s at node %d",
                 ggml_op_name(node->op), i);
             return false;
         }
 
-        // Order dependent dispatches: flush UAV writes before the next node reads them
-        if (dispatched) {
-            dx12_cmd_list_global_uav_barrier(cmd);
-        }
+        // No barrier needed between dispatched nodes — dx12_buffer_transition already
+        // inserts per-resource UAV barriers when a buffer stays in UNORDERED_ACCESS
+        // across dispatches (dx12_buffer.cpp:243-244), and state-transition barriers
+        // (UAV→SRV/COPY_DST) handle the rest. The old global UAV barrier was redundant.
     }
+
+    // Resolve GPU queries before submit (results are read after fence wait)
+    if (dev->gpu_timer) dev->gpu_timer->resolve(cmd);
+
     return true;
 }
 
@@ -589,7 +610,26 @@ bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor
         params.stride_c = N;
         return dx12_gemm_dispatch_dxla_wave(dev, cmd, buf_a, buf_b, buf_c, &params);
     }
-
+    // DXLA Wave path for Q8_0 prefill (M > 1)
+    else if (a->type == GGML_TYPE_Q8_0 && dev->caps.dxla_wave && M > 1) {
+        dx12_buffer* buf_a = dx12_backend_buffer_from_tensor(a);
+        dx12_buffer* buf_b = dx12_backend_buffer_from_tensor(b);
+        dx12_buffer* buf_c = dx12_backend_buffer_from_tensor(dst);
+        if (!buf_a || !buf_b || !buf_c) return false;
+        dx12_gemm_params params{};
+        params.M = M;
+        params.N = N;
+        params.K = K;
+        params.quant_a = DX12_QUANT_Q8_0;
+        params.quant_b = DX12_QUANT_F16;
+        params.alpha = 1.0f;
+        params.batch_count = 1;
+        params.transposed_b = false;
+        params.stride_a = K;
+        params.stride_b = K;
+        params.stride_c = N;
+        return dx12_gemm_dispatch_dxla_wave(dev, cmd, buf_a, buf_b, buf_c, &params);
+    }
     // K-quants share one shader pair; the quant selector rides in the CBV pad
     uint32_t kq_type = 0;
     const char* shader_name = nullptr;
@@ -667,8 +707,16 @@ bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor
         dispatch.uav_addr    = c_base + (uint64_t)m0 * N * 4;   // C rows are N f32
         dispatch.dispatch_x = (N + 15) / 16;
         dispatch.dispatch_y = (mc + 15) / 16;
+        if (dev->gpu_timer && dx12_profile_enabled()) {
+            char chunk_name[64];
+            snprintf(chunk_name, sizeof(chunk_name), "%s.chunk.%u", shader_name, m0 / m_chunk);
+            dev->gpu_timer->begin(cmd, chunk_name);
+        }
         if (!dx12_shader_dispatch(dev, cmd, dispatch, &params, sizeof(params), srvs, 2, buf_c)) {
             return false;
+        }
+        if (dev->gpu_timer && dx12_profile_enabled()) {
+            dev->gpu_timer->end(cmd);
         }
     }
     return true;

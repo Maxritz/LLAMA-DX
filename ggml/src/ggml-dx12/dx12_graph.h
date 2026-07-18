@@ -38,7 +38,7 @@ dx12_command_list* dx12_graph_compute_begin(dx12_device* dev);
 bool dx12_graph_compute(dx12_device* dev, dx12_command_list* cmd, ggml_cgraph* graph);
 
 /**
- * dx12_graph_compute_end — Submit and wait for the batched command list
+ * dx12_graph_compute_end — Submit the batched command list (deferred fence wait)
  */
 void dx12_graph_compute_end(dx12_device* dev, dx12_command_list* cmd);
 
@@ -61,6 +61,17 @@ bool dx12_op_supported(const ggml_tensor* node);
 bool dx12_graph_validate(dx12_device* dev, ggml_cgraph* graph,
                          char* error_buf, size_t error_buf_size);
 
+struct ggml_backend;
+
+/**
+ * dx12_graph_optimize — Reorder graph nodes for op fusion
+ *
+ * Matches Vulkan backend's ggml_vk_graph_optimize: reorders nodes so that
+ * dependent ops appear consecutively for fused dispatch detection.
+ * RMS_NORM+MUL, MUL_MAT+ADD, and MUL_MAT+ADD+ADD patterns are kept adjacent.
+ */
+void dx12_graph_optimize(struct ggml_backend* backend, struct ggml_cgraph* graph);
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Individual Op Dispatchers
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -68,6 +79,7 @@ bool dx12_graph_validate(dx12_device* dev, ggml_cgraph* graph,
 bool dx12_dispatch_add       (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
 bool dx12_dispatch_mul       (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
 bool dx12_dispatch_mul_mat   (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
+bool dx12_dispatch_mul_mat_id(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
 bool dx12_dispatch_scale     (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
 bool dx12_dispatch_silu      (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
 bool dx12_dispatch_gelu      (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);

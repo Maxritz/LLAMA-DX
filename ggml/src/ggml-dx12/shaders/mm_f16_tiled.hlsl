@@ -50,7 +50,6 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
         Bs[gtid.y * 2][gtid.x + 16] = 0.0f;
         Bs[gtid.y * 2 + 1][gtid.x] = 0.0f;
         Bs[gtid.y * 2 + 1][gtid.x + 16] = 0.0f;
-        GroupMemoryBarrierWithGroupSync();
 
         // Load A elements into shared memory
         if (col0 < params.N) {

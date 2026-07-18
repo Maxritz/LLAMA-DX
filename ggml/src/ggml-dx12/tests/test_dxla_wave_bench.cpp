@@ -89,7 +89,7 @@ struct DXLAWave {
     bool dispatch(dx12_command_list* cmd, dx12_buffer* a, dx12_buffer* b, dx12_buffer* c,
                   uint32_t M, uint32_t N, uint32_t K) {
         uint32_t p[16] = {M,N,K, K,K,N, 0,32};
-        D3D12_GPU_VIRTUAL_ADDRESS cbv = dx12_device_allocate_cbv(dev, p, sizeof(p));
+        D3D12_GPU_VIRTUAL_ADDRESS cbv = dx12_device_allocate_cbv(dev, nullptr, p, sizeof(p));
         if (!cbv) return false;
         dx12_buffer_transition(cmd, a, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         dx12_buffer_transition(cmd, b, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -202,7 +202,7 @@ int main() {
 
         size_t sa = (size_t)M * K * 2;
         size_t sb = (size_t)K * N * 2;
-        size_t sc_s = (size_t)M * N * 2; // F16 output (scalar)
+        size_t sc_s = (size_t)M * N * 4; // F32 output for scalar (matches DXLA)
         size_t sc_d = (size_t)M * N * 4; // F32 output (DXLA wave)
 
         dx12_buffer* bufA = dx12_buffer_create(dev, sa, dx12_heap_type::default_);
@@ -250,7 +250,7 @@ int main() {
             HRESULT reason = dev->device->GetDeviceRemovedReason();
             if (!ok || reason != S_OK) { printf("scalar DISPATCH FAIL 0x%08X\n", (unsigned)reason); }
             else if (!readback(dev, cmd, bufC, sc_s, gpu)) { printf("scalar readback FAIL\n"); }
-            else { printf("scalar: "); check_f16(gpu, M, N, ref_f16.data()); }
+            else { printf("scalar: "); check_f32(gpu, M, N, ref_f32.data(), 0.1f); }
         }
         dx12_buffer_destroy(bufC);
 

@@ -8,6 +8,8 @@
 #include "dx12_buffer.h"
 #include <cstring>
 #include <algorithm>
+#include <mutex>
+#include <unordered_map>
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Global Shader Database
@@ -71,18 +73,28 @@ bool dx12_shader_dispatch(dx12_device* dev,
         return false;
     }
 
-    // Get or create PSO. Use a function-local static cache so the PSO and its
-    // root signature stay alive until the command list is submitted and executed
-    // (a local cache would be destroyed on return, deleting the root signature
-    // while the command list still references it -> OBJECT_DELETED_WHILE_STILL_IN_USE).
-    static dx12_pso_cache pso_cache(dev);
+    // Get or create PSO. Caches are per-device and process-lifetime so PSOs
+    // and root signatures stay alive while command lists reference them
+    // (OBJECT_DELETED_WHILE_STILL_IN_USE otherwise). A function-local static
+    // bound the FIRST device forever — wrong after device recreation.
+    static std::mutex g_pso_cache_mutex;
+    static std::unordered_map<dx12_device*, dx12_pso_cache*> g_pso_caches;
+    dx12_pso_cache* cache;
+    {
+        std::lock_guard<std::mutex> lk(g_pso_cache_mutex);
+        auto it = g_pso_caches.find(dev);
+        if (it == g_pso_caches.end()) {
+            it = g_pso_caches.emplace(dev, new dx12_pso_cache(dev)).first;
+        }
+        cache = it->second;
+    }
     std::array<uint32_t, 3> tg_size = {
         dispatch.thread_group_x ? dispatch.thread_group_x : entry->thread_group_x,
         dispatch.thread_group_y ? dispatch.thread_group_y : entry->thread_group_y,
         dispatch.thread_group_z ? dispatch.thread_group_z : entry->thread_group_z
     };
 
-    dx12_pso* pso = pso_cache.get_or_create(
+    dx12_pso* pso = cache->get_or_create(
         dispatch.shader_name,
         entry->cso_data, entry->cso_size,
         dispatch.sig_type,
@@ -108,7 +120,7 @@ bool dx12_shader_dispatch(dx12_device* dev,
         const void* cbv_data = (constants && constants_size > 0) ? constants : zero_cbv;
         uint32_t cbv_size = (constants && constants_size > 0) ? (uint32_t)constants_size : (uint32_t)sizeof(zero_cbv);
         D3D12_GPU_VIRTUAL_ADDRESS cbv_address =
-            dx12_device_allocate_cbv(dev, cbv_data, cbv_size);
+            dx12_device_allocate_cbv(dev, cmd->ring_slot, cbv_data, cbv_size);
         if (cbv_address) {
             cmd->d3d_list->SetComputeRootConstantBufferView(0, cbv_address);
         } else {
@@ -222,7 +234,7 @@ bool dx12_shader_dispatch_gemm(dx12_device* dev,
     }
 
     // GEMM parameters packed as uint32 constants
-    // Layout: M, N, K, stride_A, stride_B, stride_C, transposed_b, reserved
+    // Layout: M, N, K, stride_A, stride_B, stride_C, transposed_b, alpha_f16, reserved
     struct gemm_params {
         uint32_t M;
         uint32_t N;
@@ -231,7 +243,8 @@ bool dx12_shader_dispatch_gemm(dx12_device* dev,
         uint32_t stride_B;
         uint32_t stride_C;
         uint32_t transposed_b;
-        uint32_t reserved[9]; // Pad to 16 uints
+        uint32_t alpha_f16;
+        uint32_t reserved[8]; // Pad to 16 uints
     } params{};
 
     params.M = M;
@@ -241,6 +254,7 @@ bool dx12_shader_dispatch_gemm(dx12_device* dev,
     params.stride_B = transposed_b ? K : N; // B is KxN (or NxK if transposed)
     params.stride_C = N;          // C is MxN
     params.transposed_b = transposed_b ? 1 : 0;
+    params.alpha_f16 = 0x3C00;    // 1.0 as F16
 
     // Calculate tile-based dispatch
     const dx12_shader_entry* entry = dx12_get_shader_entry(shader_name);

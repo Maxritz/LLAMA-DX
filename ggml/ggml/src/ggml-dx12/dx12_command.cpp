@@ -194,15 +194,6 @@ void dx12_cmd_list_uav_barrier(dx12_command_list* cmd, ID3D12Resource* resource)
     cmd->d3d_list->ResourceBarrier(1, &barrier);
 }
 
-void dx12_cmd_list_global_uav_barrier(dx12_command_list* cmd) {
-    if (!cmd || !cmd->d3d_list) return;
-
-    D3D12_RESOURCE_BARRIER barrier{};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-    barrier.UAV.pResource = nullptr; // Global
-    cmd->d3d_list->ResourceBarrier(1, &barrier);
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // Root Parameter Binding
 // ═══════════════════════════════════════════════════════════════════════════════

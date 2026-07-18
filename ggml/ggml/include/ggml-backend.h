@@ -154,6 +154,8 @@ extern "C" {
         bool buffer_from_host_ptr;
         // event synchronization
         bool events;
+        // DirectStorage async file reads
+        bool ds;
     };
 
     // all the device properties

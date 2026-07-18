@@ -38,7 +38,7 @@ dx12_command_list* dx12_graph_compute_begin(dx12_device* dev);
 bool dx12_graph_compute(dx12_device* dev, dx12_command_list* cmd, ggml_cgraph* graph);
 
 /**
- * dx12_graph_compute_end — Submit and wait for the batched command list
+ * dx12_graph_compute_end — Submit the batched command list (deferred fence wait)
  */
 void dx12_graph_compute_end(dx12_device* dev, dx12_command_list* cmd);
 

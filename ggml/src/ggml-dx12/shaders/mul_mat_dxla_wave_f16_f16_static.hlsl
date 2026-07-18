@@ -21,6 +21,7 @@ using MatA = Matrix<ComponentType::F16, TILE, TILE, MatrixUse::A, MatrixScope::W
 using MatB = Matrix<ComponentType::F16, TILE, TILE, MatrixUse::B, MatrixScope::Wave>;
 using MatC = Matrix<ComponentType::F32, TILE, TILE, MatrixUse::Accumulator, MatrixScope::Wave>;
 
+[WaveSize(32)]
 [numthreads(32, 1, 1)]
 void main(uint3 gid : SV_GroupID) {
     uint tile_row = gid.y * TILE;
@@ -38,6 +39,11 @@ void main(uint3 gid : SV_GroupID) {
         acc.MultiplyAccumulate(a_tile, b_tile);
     }
 
-    uint c_offset = (tile_row * params.stride_c + tile_col) * 4;
-    acc.Store(result, c_offset, params.stride_c * 4, MatrixLayout::RowMajor);
+    for (uint i = WaveGetLaneIndex(); i < 256; i += 32) {
+        uint r = tile_row + i / 16;
+        uint c = tile_col + i % 16;
+        if (r < params.M && c < params.N) {
+            result.Store((r * params.stride_c + c) * 4, asuint(acc.Get(i)));
+        }
+    }
 }

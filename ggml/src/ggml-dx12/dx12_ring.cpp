@@ -31,19 +31,11 @@ dx12_ring_context* dx12_ring_create(dx12_device* dev, uint32_t capacity) {
             return nullptr;
         }
 
-        // Create command list (opens automatically)
-        hr = dev->device->CreateCommandList(
-            0, list_type, slot.allocator.Get(), nullptr,
-            IID_PPV_ARGS(&slot.d3d_list));
-        if (FAILED(hr)) {
-            dx12_log(DX12_LOG_ERROR, "ring_create: cmd_list[%u] failed hr=0x%08X", i, hr);
-            for (uint32_t j = 0; j <= i; j++) {
-                ring->slots[j].d3d_list.Reset();
-                ring->slots[j].allocator.Reset();
-            }
-            delete ring;
-            return nullptr;
-        }
+        // Command lists are created lazily on first ring_acquire (see below).
+        // Pre-creating them at device init leaves stale command lists on some
+        // drivers (AMD RDNA4) that then fail Close() with E_INVALIDARG on the
+        // first submit. The upload path creates a fresh list at runtime and
+        // works, so we mirror that here.
 
         slot.fence_value = 0;
         slot.in_flight = false;
@@ -94,27 +86,77 @@ dx12_ring_slot* dx12_ring_acquire(dx12_ring_context* ring) {
     uint32_t head_idx = ring->head % ring->capacity;
     auto& slot = ring->slots[head_idx];
 
+    // First use: create a fresh command list + allocator at runtime, mirroring
+    // the working upload path. Pre-created init-time lists fail Close() with
+    // E_INVALIDARG on some drivers. We never Reset a fresh allocator (it returns
+    // E_FAIL on AMD RDNA4), just hand over the open list.
+    if (slot.first_use) {
+        D3D12_COMMAND_LIST_TYPE list_type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        HRESULT hr = ring->dev->device->CreateCommandAllocator(list_type, IID_PPV_ARGS(&slot.allocator));
+        if (FAILED(hr)) {
+            dx12_log(DX12_LOG_ERROR, "ring_acquire: first_create allocator failed hr=0x%08X", hr);
+            return nullptr;
+        }
+        hr = ring->dev->device->CreateCommandList(0, list_type, slot.allocator.Get(), nullptr, IID_PPV_ARGS(&slot.d3d_list));
+        if (FAILED(hr)) {
+            dx12_log(DX12_LOG_ERROR, "ring_acquire: first_create cmd_list failed hr=0x%08X", hr);
+            return nullptr;
+        }
+        slot.first_use = false;
+        slot.fence_value = 0;
+        slot.in_flight = false;
+        slot.cbv_used = 0;
+        return &slot;
+    }
+
     // Reset allocator + command list for reuse
     // Skip on first_use: CreateCommandList leaves the list open, and
     // allocator->Reset on a fresh allocator returns E_FAIL on AMD RDNA4.
     if (!slot.first_use) {
         HRESULT hr = slot.allocator->Reset();
         if (FAILED(hr)) {
-            dx12_log(DX12_LOG_ERROR, "ring_acquire: allocator->Reset failed hr=0x%08X", hr);
-            return nullptr;
-        }
-
-        hr = slot.d3d_list->Reset(slot.allocator.Get(), nullptr);
-        if (FAILED(hr)) {
-            dx12_log(DX12_LOG_ERROR, "ring_acquire: cmd_list->Reset failed hr=0x%08X", hr);
-            return nullptr;
+            // RDNA4 workaround: allocator->Reset() may fail even after
+            // use. Recreate allocator and command list from scratch.
+            D3D12_COMMAND_LIST_TYPE list_type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            hr = ring->dev->device->CreateCommandAllocator(list_type, IID_PPV_ARGS(&slot.allocator));
+            if (FAILED(hr)) {
+                dx12_log(DX12_LOG_ERROR, "ring_acquire: CreateCommandAllocator failed hr=0x%08X", hr);
+                return nullptr;
+            }
+            hr = ring->dev->device->CreateCommandList(0, list_type, slot.allocator.Get(), nullptr, IID_PPV_ARGS(&slot.d3d_list));
+            if (FAILED(hr)) {
+                dx12_log(DX12_LOG_ERROR, "ring_acquire: CreateCommandList failed hr=0x%08X", hr);
+                return nullptr;
+            }
+            slot.first_use = true; // fresh allocator: skip Reset on next acquire
+        } else {
+            hr = slot.d3d_list->Reset(slot.allocator.Get(), nullptr);
+            if (FAILED(hr)) {
+                // List unusable (e.g. left open by an earlier failed Close):
+                // recreate allocator + list, mirroring the allocator->Reset
+                // failure path above, instead of failing this slot forever.
+                dx12_log(DX12_LOG_ERROR, "ring_acquire: cmd_list->Reset failed hr=0x%08X, recreating slot", hr);
+                slot.d3d_list.Reset();
+                slot.allocator.Reset();
+                D3D12_COMMAND_LIST_TYPE list_type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+                hr = ring->dev->device->CreateCommandAllocator(list_type, IID_PPV_ARGS(&slot.allocator));
+                if (FAILED(hr)) {
+                    dx12_log(DX12_LOG_ERROR, "ring_acquire: CreateCommandAllocator failed hr=0x%08X", hr);
+                    return nullptr;
+                }
+                hr = ring->dev->device->CreateCommandList(0, list_type, slot.allocator.Get(), nullptr, IID_PPV_ARGS(&slot.d3d_list));
+                if (FAILED(hr)) {
+                    dx12_log(DX12_LOG_ERROR, "ring_acquire: CreateCommandList failed hr=0x%08X", hr);
+                    return nullptr;
+                }
+            }
         }
     }
 
     slot.first_use = false;
     slot.fence_value = 0;
     slot.in_flight = false;
-
+    slot.cbv_used = 0;
     return &slot;
 }
 
@@ -129,7 +171,16 @@ uint64_t dx12_ring_submit(dx12_ring_context* ring) {
     // Close the command list
     HRESULT hr = slot.d3d_list->Close();
     if (FAILED(hr)) {
-        dx12_log(DX12_LOG_ERROR, "ring_submit: Close failed hr=0x%08X", hr);
+        // The list is stuck open: Reset() on it will fail forever and every
+        // later acquire of this slot would fail too (permanent cascade).
+        // Drop this submission and recreate the slot from scratch so the
+        // next acquire takes the first_use path with a fresh allocator+list.
+        dx12_log(DX12_LOG_ERROR, "ring_submit: Close failed hr=0x%08X, recreating slot %u", hr, slot_idx);
+        slot.d3d_list.Reset();
+        slot.allocator.Reset();
+        slot.first_use = true;
+        slot.fence_value = 0;
+        slot.in_flight = false;
         return 0;
     }
 
@@ -151,25 +202,26 @@ uint64_t dx12_ring_submit(dx12_ring_context* ring) {
 }
 
 void dx12_ring_cancel_acquire(dx12_ring_context* ring) {
-    if (!ring || ring->count == 0 || ring->head == 0) return;
+    if (!ring || ring->capacity == 0) return;
 
-    // The last acquired slot is at head-1
-    uint32_t last_idx = (ring->head - 1) % ring->capacity;
-    auto& slot = ring->slots[last_idx];
+    // The acquired-but-unsubmitted slot is at head: acquire returns the slot
+    // at head and does NOT advance it — submit does. (The old code reset the
+    // slot at head-1, i.e. the PREVIOUS submitted slot, which may be in
+    // flight on the GPU, and decremented head/count that acquire never
+    // incremented.)
+    uint32_t idx = ring->head % ring->capacity;
+    auto& slot = ring->slots[idx];
+    if (!slot.d3d_list) return; // nothing acquired
 
-    // Close if still open (safe to call Close on an open list)
+    // The list holds partially recorded commands; recreate the slot instead
+    // of trusting Close+Reset on it (mirrors the ring_submit failure path).
     slot.d3d_list->Close();
-
-    // Reset allocator + command list for reuse
-    slot.allocator->Reset();
-    slot.d3d_list->Reset(slot.allocator.Get(), nullptr);
-
-    // Restore ring bookkeeping
+    slot.d3d_list.Reset();
+    slot.allocator.Reset();
+    slot.first_use = true;
     slot.fence_value = 0;
     slot.in_flight = false;
-    slot.first_use = false;  // no longer fresh — Reset was already called
-    ring->head--;
-    ring->count--;
+    // head/count unchanged: this acquire was never submitted.
 }
 
 dx12_ring_slot* dx12_ring_submit_and_acquire(dx12_ring_context* ring) {
@@ -178,18 +230,26 @@ dx12_ring_slot* dx12_ring_submit_and_acquire(dx12_ring_context* ring) {
 }
 
 void dx12_ring_wait_idle(dx12_ring_context* ring) {
-    if (!ring || !ring->dev) return;
+    if (!ring || !ring->dev || ring->count == 0) return;
 
-    // Wait for the oldest in-flight slot's fence
+    // D3D12 fences are monotonic: waiting for the highest value signals
+    // that all lower values are also complete. Find and wait once.
+    uint64_t max_fence = 0;
     for (uint32_t i = 0; i < ring->count; i++) {
         uint32_t idx = (ring->tail + i) % ring->capacity;
         auto& slot = ring->slots[idx];
-        if (slot.in_flight && slot.fence_value > 0) {
-            dx12_device_wait_for_fence(ring->dev, slot.fence_value);
-            slot.in_flight = false;
+        if (slot.in_flight && slot.fence_value > max_fence) {
+            max_fence = slot.fence_value;
         }
     }
+    if (max_fence > 0) {
+        dx12_device_wait_for_fence(ring->dev, max_fence);
+    }
 
+    for (uint32_t i = 0; i < ring->count; i++) {
+        uint32_t idx = (ring->tail + i) % ring->capacity;
+        ring->slots[idx].in_flight = false;
+    }
     ring->tail = ring->head;
     ring->count = 0;
 }

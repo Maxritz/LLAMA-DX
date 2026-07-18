@@ -12,6 +12,7 @@
 #include "dx12_device.h"
 #include "dx12_buffer.h"
 #include "dx12_command.h"
+#include "dx12_profiler.h"
 #include "dx12_ring.h"
 
 #include <windows.h>
@@ -718,6 +719,14 @@ dx12_result dx12_device_create(int32_t adapter_index, dx12_device** out_device) 
         return DX12_ERROR_OUT_OF_MEMORY;
     }
 
+    // Create GPU timestamp profiler
+    dev->gpu_timer = new dx12_gpu_timer();
+    if (!dev->gpu_timer->init(dev, 512)) {
+        dx12_log(DX12_LOG_INFO, "GPU timer init failed (timestamps disabled)");
+        delete dev->gpu_timer;
+        dev->gpu_timer = nullptr;
+    }
+
     // Verify minimum requirements
     if (!dev->caps.wave_ops) {
         dx12_log(DX12_LOG_ERROR, "GPU does not support wave operations (SM 6.0+)");
@@ -752,6 +761,10 @@ void dx12_device_destroy(dx12_device* dev) {
     if (!removed) {
         dx12_device_wait_idle(dev);
     }
+
+    // Cleanup GPU timestamp profiler
+    delete dev->gpu_timer;
+    dev->gpu_timer = nullptr;
 
     // Cleanup CBV ring buffer
     if (dev->cbv_ring_cpu_address) {

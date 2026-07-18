@@ -89,13 +89,6 @@ $Shaders = @(
     @{Name="mul_mat_q8_0_f16"; Threads=@{X=16;Y=16;Z=1}},
     @{Name="mul_mat_batched"; Threads=@{X=8;Y=8;Z=4}},
     @{Name="mul_mat_strided"; Threads=@{X=16;Y=16;Z=1}},
-    # DXLA GEMM/Attention shaders excluded — need SM 6.10 (dx::linalg cooperative
-    # matrix), but the DXLA dispatch path is currently disabled (dx12_gemm.cpp /
-    # dx12_device.cpp), so these are unreachable dead weight. Re-add here (and
-    # switch $TargetProfile back to cs_6_10 + re-enable experimental features in
-    # dx12_device.cpp) if DXLA is ever revisited:
-    #   mul_mat_dxla_wave_f16_f16, mul_mat_dxla_wave_q4_0_f16,
-    #   mul_mat_dxla_tg_f16_f16, attn_qk_dxla, attn_ov_dxla
     # Activation
     @{Name="silu"; Threads=@{X=256;Y=1;Z=1}},
     @{Name="gelu"; Threads=@{X=256;Y=1;Z=1}},
@@ -113,6 +106,7 @@ $Shaders = @(
     @{Name="flash_attn"; Threads=@{X=64;Y=1;Z=1}},
     # FFN
     @{Name="ffn_fused"; Threads=@{X=256;Y=1;Z=1}},
+    @{Name="fused_ffn_q4k"; Threads=@{X=16;Y=16;Z=1}},
     # Misc
     @{Name="get_rows"; Threads=@{X=256;Y=1;Z=1}},
     @{Name="permute"; Threads=@{X=256;Y=1;Z=1}},
@@ -125,6 +119,7 @@ $Shaders = @(
     # Normalization (dx12_graph dispatch)
     @{Name="soft_max_row"; Threads=@{X=256;Y=1;Z=1}},
     @{Name="rms_norm_row"; Threads=@{X=256;Y=1;Z=1}},
+    @{Name="rms_norm_mul_row"; Threads=@{X=256;Y=1;Z=1}},
     @{Name="rope_f32"; Threads=@{X=64;Y=1;Z=1}},
     @{Name="pad_f32"; Threads=@{X=256;Y=1;Z=1}},
     # Copy / scatter / gather (dx12_graph dispatch)
@@ -139,16 +134,19 @@ $Shaders = @(
     @{Name="mv_q8_0"; Threads=@{X=256;Y=1;Z=1}},
     @{Name="mv_q4_0"; Threads=@{X=256;Y=1;Z=1}},
     @{Name="mv_kq"; Threads=@{X=256;Y=1;Z=1}},
+    @{Name="mv_id"; Threads=@{X=256;Y=1;Z=1}},
     # GEMM (tile-based prefill, M>1)
     @{Name="mm_f32"; Threads=@{X=16;Y=16;Z=1}},
     @{Name="mm_f16"; Threads=@{X=16;Y=16;Z=1}},
     @{Name="mm_q4_0"; Threads=@{X=16;Y=16;Z=1}},
     @{Name="mm_q8_0"; Threads=@{X=16;Y=16;Z=1}},
     @{Name="mm_kq"; Threads=@{X=16;Y=16;Z=1}},
+    @{Name="mm_tiled"; Threads=@{X=16;Y=16;Z=1}},
     @{Name="mm_fused_act"; Threads=@{X=32;Y=32;Z=1}},
     # Strided mul_mat (attention QK/V)
     @{Name="mms_f32"; Threads=@{X=16;Y=16;Z=1}},
-    @{Name="mms_f16"; Threads=@{X=16;Y=16;Z=1}}
+    @{Name="mms_f16"; Threads=@{X=16;Y=16;Z=1}},
+    @{Name="mms_tiled"; Threads=@{X=16;Y=16;Z=1}}
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -206,7 +204,64 @@ Write-Host ""
 Write-Host "Results: $SuccessCount succeeded, $FailCount failed" -ForegroundColor $(if ($FailCount -eq 0) { "Green" } else { "Red" })
 Write-Host ""
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# DXLA Shaders (need SM 6.10 for dx::linalg cooperative matrix)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+$DxlaShaders = @(
+    @{Name="mul_mat_dxla_wave_f16_f16"; Threads=@{X=32;Y=1;Z=1}},
+    @{Name="mul_mat_dxla_wave_f16_f16_trans"; Threads=@{X=32;Y=1;Z=1}},
+    @{Name="mul_mat_dxla_wave_q4_0_f16"; Threads=@{X=32;Y=1;Z=1}},
+    @{Name="mul_mat_dxla_wave_q8_0_f16"; Threads=@{X=32;Y=1;Z=1}},
+    @{Name="mul_mat_dxla_tg_f16_f16"; Threads=@{X=256;Y=1;Z=1}},
+    @{Name="attn_qk_dxla"; Threads=@{X=256;Y=1;Z=1}},
+    @{Name="attn_ov_dxla"; Threads=@{X=256;Y=1;Z=1}}
+)
+
+$DxlaDxcPath = "E:\DXllama\dxc-1.10.2605.2\bin\x64\dxc.exe"
+$DxlaIncludeDir = "E:\DXllama\dxc-1.10.2605.2\inc\hlsl"
+if ((Test-Path $DxlaDxcPath) -and (Test-Path $DxlaIncludeDir)) {
+    Write-Host "Compiling $($DxlaShaders.Count) DXLA shaders (cs_6_10)..." -ForegroundColor Cyan
+    foreach ($shader in $DxlaShaders) {
+        $Name = $shader.Name
+        $HlslFile = Join-Path $ShaderDir "$Name.hlsl"
+        $CsoFile = Join-Path $OutputDir "$Name.cso"
+        if (-not (Test-Path $HlslFile)) {
+            Write-Warning "DXLA shader not found: $HlslFile"
+            continue
+        }
+        $args = @(
+            "-T", "cs_6_10",
+            "-E", "main",
+            "-enable-16bit-types",
+            "-HV", "2021",
+            "-I", $ShaderDir,
+            "-I", $DxlaIncludeDir,
+            "-Fo", $CsoFile,
+            $HlslFile
+        ) + $DebugFlags
+        try {
+            $output = & $DxlaDxcPath @args 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                Write-Error "FAILED: $Name`n$output"
+            } else {
+                $size = (Get-Item $CsoFile).Length
+                Write-Host "  OK  $Name.cso ($size bytes)" -ForegroundColor Green
+                $SuccessCount++
+                $CsoFiles += @{Name=$Name; File=$CsoFile; Threads=$shader.Threads}
+            }
+        } catch {
+            Write-Error "FAILED: $Name - $_"
+        }
+    }
+} else {
+    Write-Warning "DXLA DXC or include dir not found — skipping DXLA shaders"
+    Write-Warning "  DXC: $DxlaDxcPath"
+    Write-Warning "  Inc: $DxlaIncludeDir"
+}
+
 if ($FailCount -gt 0) {
+    Write-Host "Total: $SuccessCount succeeded, $FailCount failed" -ForegroundColor Red
     exit 1
 }
 

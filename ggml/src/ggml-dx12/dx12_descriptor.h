@@ -119,9 +119,10 @@ struct dx12_pso {
 struct dx12_pso_cache {
     dx12_device* dev;
     std::unordered_map<std::string, std::unique_ptr<dx12_pso>> cache;
+    dx12_root_signature_cache sig_cache;
     std::mutex mutex;
 
-    explicit dx12_pso_cache(dx12_device* d) : dev(d) {}
+    explicit dx12_pso_cache(dx12_device* d) : dev(d), sig_cache(d) {}
 
     dx12_pso* get_or_create(const char* shader_name,
                             const void* cso_data, size_t cso_size,

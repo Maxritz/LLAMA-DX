@@ -1624,7 +1624,7 @@ bool llama_model_loader::load_all_data(
 
                         // Async upload actual data to GPU
                         ggml_backend_tensor_set_async(upload_backend, cur,
-                                                      reinterpret_cast<void *>(ptr_data), data_read, data_to_copy);
+                                                    reinterpret_cast<void *>(ptr_data), data_read, data_to_copy);
                         ggml_backend_event_record(events[buffer_idx], upload_backend);
 
                         data_read += data_to_copy;

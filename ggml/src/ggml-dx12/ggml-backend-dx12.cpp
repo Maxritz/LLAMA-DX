@@ -12,6 +12,7 @@
  */
 
 #include "ggml-backend-dx12.h"
+#include "ggml-backend-impl.h"
 #include "dx12_device.h"
 #include "dx12_buffer.h"
 #include "dx12_command.h"
@@ -20,13 +21,15 @@
 #include "dx12_quantize.h"
 #include "dx12_gemm.h"
 #include "dx12_graph.h"
+#include "dx12_profiler.h"
 #include "dx12_ring.h"
-
+#include "dx12_ds.h"
+ 
 #include <ggml.h>
 #include <ggml-backend.h>
 #include <ggml-backend-impl.h>
 #include <ggml-impl.h>
-
+ 
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
@@ -153,23 +156,41 @@ struct dx12_upload_batch {
         if (capacity >= needed) return;
         size_t new_cap = capacity ? capacity * 2 : 64 * 1024 * 1024;
         while (new_cap < needed) new_cap *= 2;
-        flush();
+        if (!flush()) {
+            // Flush failed (Close error). Staging buffer still has old data
+            // and capacity is still valid, so the next set_tensor will retry.
+            return;
+        }
         if (staging) dx12_buffer_destroy(staging);
-        staging = dx12_buffer_create(dev, new_cap, dx12_heap_type::upload);
+        // RDNA4 workaround: GPU_UPLOAD + CopyBufferRegion can cause Close
+        // failures. Use regular UPLOAD heap for staging until verified stable.
+        dx12_heap_type heap_type = dx12_heap_type::upload;
+        staging = dx12_buffer_create(dev, new_cap, heap_type);
         capacity = staging ? new_cap : 0;
         used = 0;
-        dx12_log(DX12_LOG_INFO, "upload_batch: grown to %zu MB", capacity / (1024 * 1024));
+        dx12_log(DX12_LOG_INFO, "upload_batch: grown to %zu MB (%s)",
+                 capacity / (1024 * 1024),
+                 heap_type == dx12_heap_type::gpu_upload ? "GPU_UPLOAD" : "UPLOAD");
     }
 
-    void flush() {
-        if (!pending || !cmd) return;
-        dx12_cmd_list_close(cmd);
-        dx12_cmd_list_submit_and_wait(cmd);
-        dx12_cmd_list_destroy(cmd);
-        cmd = nullptr;
-        dx12_log(DX12_LOG_INFO, "upload_batch: flushed %zu bytes", used);
+    bool flush(bool wait = true) {
+        if (!pending || !cmd) return true;
+        if (!dx12_cmd_list_close(cmd)) {
+            // Close failure: recreate cmd list and keep data for retry.
+            // The staging buffer still holds the accumulated data.
+            dx12_cmd_list_destroy(cmd);
+            cmd = dx12_cmd_list_create(dev);
+            return false;
+        }
+        if (wait) {
+            dx12_cmd_list_submit_and_wait(cmd);
+        } else {
+            dx12_cmd_list_submit(cmd);
+        }
+        dx12_cmd_list_reset(cmd);
         used = 0;
         pending = false;
+        return true;
     }
 
     void destroy() {
@@ -259,6 +280,57 @@ static const char* dx12_buft_get_name(ggml_backend_buffer_type_t buft) {
     return "DX12";
 }
 
+static void dx12_buf_set_tensor(ggml_backend_buffer_t buf, ggml_tensor* tensor,
+                                 const void* data, size_t offset, size_t size);
+ 
+ // Tensor extra context for storing file offset info (used by DirectStorage)
+ struct dx12_tensor_extra {
+     uint64_t file_offset;
+     bool has_file_offset;
+ };
+ 
+ static void dx12_set_tensor_async(ggml_backend_t backend, ggml_tensor* tensor,
+                                        const void* data, size_t offset, size_t size) {
+     if (!backend || !backend->context || !tensor || !tensor->buffer) return;
+ 
+     auto* ctx = (ggml_backend_dx12_context*)backend->context;
+     auto* buft = ggml_backend_buffer_get_type(tensor->buffer);
+     auto* dev = ggml_backend_buft_get_device(buft);
+     if (!dev || !ctx->device) {
+         dx12_buf_set_tensor(tensor->buffer, tensor, data, offset, size);
+         return;
+     }
+ 
+     // Try DirectStorage read: file -> GPU buffer directly
+     if (ctx->device->ds_ctx) {
+         dx12_buffer* gpu_buf = dx12_backend_get_gpu_buffer(tensor);
+         if (gpu_buf) {
+             // Calculate tensor offset in buffer
+             size_t dst_offset = 0;
+             void* mapped = dx12_buffer_map(gpu_buf);
+             if (mapped) {
+                 dst_offset = (size_t)((const char*)tensor->data - (const char*)mapped);
+             } else if (gpu_buf->heap == dx12_heap_type::default_) {
+                 dst_offset = (size_t)((uintptr_t)tensor->data - 0x1000);
+             }
+ 
+             // Check if caller provided file offset (encoded via tensor extra or data pointer)
+             // For now, data pointer could be the file offset when DS is active
+             uint64_t file_off = (uint64_t)(uintptr_t)data;
+             
+             // Validate file offset is reasonable (not a small pointer, indicates intentional encoding)
+             // File offsets are typically large (> 1MB for tensors)
+             if (file_off > 1024 * 1024) {
+                 dx12_ds_read_tensor_async(ctx->device->ds_ctx, gpu_buf, file_off, size, dst_offset + offset);
+                 return;
+             }
+         }
+     }
+ 
+     // Fall back to standard async upload (staging buffer -> GPU)
+     dx12_buf_set_tensor(tensor->buffer, tensor, data, offset, size);
+ }
+
 static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     auto* btctx = (dx12_backend_buffer_type_context*)buft->context;
     uint32_t adapter_idx = (uint32_t)(uintptr_t)btctx->device->context;
@@ -283,7 +355,7 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
         return nullptr;
     }
 
-    dx12_log(DX12_LOG_INFO, "buft_alloc: idx=%u size=%zu heap=%s DONE", adapter_idx, size,
+    dx12_log(DX12_LOG_VERBOSE, "buft_alloc: idx=%u size=%zu heap=%s DONE", adapter_idx, size,
              heap == dx12_heap_type::upload ? "upload" : "default");
 
     auto* ctx = new dx12_backend_buffer_context();
@@ -315,6 +387,17 @@ static size_t dx12_buft_get_max_size(ggml_backend_buffer_type_t buft) {
 
 static size_t dx12_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor* tensor) {
     (void)buft;
+    // K-quants: allocate F16-sized buffer when dequant-to-F16 is enabled.
+    static bool s_dequant_f16 = []() {
+        const char* env = getenv("DX12_DEQUANT_TO_F16");
+        return env && env[0] == '1';
+    }();
+    if (s_dequant_f16 &&
+        (tensor->type == GGML_TYPE_Q4_K ||
+         tensor->type == GGML_TYPE_Q5_K ||
+         tensor->type == GGML_TYPE_Q6_K)) {
+        return (size_t)ggml_nelements(tensor) * sizeof(ggml_fp16_t);
+    }
     return ggml_nbytes(tensor);
 }
 
@@ -384,7 +467,7 @@ static enum ggml_status dx12_buf_init_tensor(ggml_backend_buffer_t buf, ggml_ten
     return GGML_STATUS_SUCCESS;
 }
 
-static void dx12_flush_uploads(dx12_device* dev);
+static void dx12_flush_uploads(dx12_device* dev, bool wait = true);
 
 static void dx12_buf_memset_tensor(ggml_backend_buffer_t buf, ggml_tensor* tensor,
                                     uint8_t value, size_t offset, size_t size) {
@@ -420,6 +503,38 @@ static void dx12_buf_set_tensor(ggml_backend_buffer_t buf, ggml_tensor* tensor,
         return;
     }
 
+    // K-quant weight tensors: optionally dequantize to F16 on load (opt-in via
+    // DX12_DEQUANT_TO_F16=1). This routes through the fast DXLA F16 GEMM path
+    // instead of the slow scalar mm_kq shader, at the cost of 3.5x VRAM.
+    static bool s_dequant_f16 = []() {
+        const char* env = getenv("DX12_DEQUANT_TO_F16");
+        return env && env[0] == '1';
+    }();
+    bool is_kquant = s_dequant_f16 &&
+        (tensor->type == GGML_TYPE_Q4_K ||
+         tensor->type == GGML_TYPE_Q5_K ||
+         tensor->type == GGML_TYPE_Q6_K);
+    ggml_fp16_t* f16_buf = nullptr;
+    size_t f16_size = 0;
+    if (is_kquant && offset == 0) {
+        int64_t ne = ggml_nelements(tensor);
+        f16_size = (size_t)ne * sizeof(ggml_fp16_t);
+        float* tmp = (float*)malloc((size_t)ne * sizeof(float));
+        f16_buf = (ggml_fp16_t*)malloc(f16_size);
+        // Dequant via type traits (works for any quant format, no direct dep)
+        const struct ggml_type_traits* tt = ggml_get_type_traits(tensor->type);
+        if (tt->to_float) {
+            tt->to_float(data, tmp, ne);
+        }
+        ggml_fp32_to_fp16_row(tmp, f16_buf, ne);
+        free(tmp);
+        data = f16_buf;
+        size = f16_size;
+        // NOTE: tensor->type stays Q4_K — GGML uses it for stride computation.
+        // The F16 data is only in the GPU buffer; dispatch routing must check
+        // the buffer allocation size (F16 == 3.5x quantized) to select the path.
+    }
+
     void* mapped = dx12_buffer_map(ctx->gpu_buffer);
     size_t tensor_off = mapped
         ? (size_t)((const char*)tensor->data - (const char*)mapped)
@@ -427,6 +542,7 @@ static void dx12_buf_set_tensor(ggml_backend_buffer_t buf, ggml_tensor* tensor,
 
     if (mapped) {
         bool ok = dx12_buffer_upload(ctx->gpu_buffer, data, size, tensor_off + offset);
+        if (f16_buf) free(f16_buf);
         if (!ok) dx12_log(DX12_LOG_ERROR, "upload FAILED: %s", tensor->name);
         return;
     }
@@ -481,6 +597,8 @@ static void dx12_buf_set_tensor(ggml_backend_buffer_t buf, ggml_tensor* tensor,
 
     // Record GPU copy
     auto* d3d_cmd = reinterpret_cast<ID3D12GraphicsCommandList10*>(batch.cmd->d3d_list.Get());
+    dx12_log(DX12_LOG_VERBOSE, "upload: copy size=%zu staging_off=%zu dst_off=%llu",
+             size, batch.used, (unsigned long long)(tensor_off + offset));
     d3d_cmd->CopyBufferRegion(
         gpu_buf->resource.Get(), tensor_off + offset,
         batch.staging->resource.Get(), batch.used,
@@ -494,18 +612,54 @@ static void dx12_buf_set_tensor(ggml_backend_buffer_t buf, ggml_tensor* tensor,
     // the staging buffer, so the caller's pointer may be freed immediately.
     // (The historical per-tensor flush was a workaround for the wait_idle
     // fence double-signal bug, fixed in dx12_device.cpp.)
+    if (f16_buf) free(f16_buf);
 }
 
-// Flush all pending upload batches (called from synchronize or graph_compute)
-static void dx12_flush_uploads(dx12_device* dev) {
+// Flush all pending upload batches.
+// Called from synchronize (wait=true) and graph_compute (wait=false).
+// When wait=false, the upload copy is submitted without blocking, relying on
+// queue ordering to ensure uploads complete before the subsequent compute.
+static void dx12_flush_uploads(dx12_device* dev, bool wait) {
     if (!dev) return;
 
     std::lock_guard<std::mutex> lk(g_upload_batch_mutex);
     auto it = g_upload_batches.find(dev);
     if (it != g_upload_batches.end()) {
-        it->second.flush();
+        it->second.flush(wait);
     }
 }
+
+struct dx12_readback_pool {
+    dx12_device*        dev = nullptr;
+    dx12_buffer*        buffer = nullptr;
+    dx12_command_list*  cmd = nullptr;
+    size_t              capacity = 0;
+
+    dx12_buffer* acquire(dx12_device* d, size_t size) {
+        if (dev != d) { destroy(); dev = d; }
+        if (capacity < size) {
+            if (buffer) dx12_buffer_destroy(buffer);
+            capacity = (size + 1024 * 1024 - 1) & ~(1024 * 1024 - 1);
+            buffer = dx12_buffer_create(dev, capacity, dx12_heap_type::readback);
+            if (!buffer) { capacity = 0; return nullptr; }
+        }
+        return buffer;
+    }
+
+    dx12_command_list* get_cmd() {
+        if (!cmd) cmd = dx12_cmd_list_create(dev);
+        else dx12_cmd_list_reset(cmd);
+        return cmd;
+    }
+
+    void destroy() {
+        if (cmd) { dx12_cmd_list_destroy(cmd); cmd = nullptr; }
+        if (buffer) { dx12_buffer_destroy(buffer); buffer = nullptr; }
+        capacity = 0; dev = nullptr;
+    }
+};
+
+static dx12_readback_pool g_readback_pool;
 
 static void dx12_buf_get_tensor(ggml_backend_buffer_t buf, const ggml_tensor* tensor,
                                  void* data, size_t offset, size_t size) {
@@ -519,26 +673,23 @@ static void dx12_buf_get_tensor(ggml_backend_buffer_t buf, const ggml_tensor* te
         return;
     }
 
-    // DEFAULT heap: copy through a readback staging buffer
+    // DEFAULT heap: copy through pooled readback staging buffer
     size_t tensor_off = (size_t)((uintptr_t)tensor->data - 0x1000);
 
     dx12_flush_uploads(ctx->device);
 
-    dx12_buffer* staging = dx12_buffer_create(ctx->device, size, dx12_heap_type::readback);
+    dx12_buffer* staging = g_readback_pool.acquire(ctx->device, size);
     if (!staging) {
-        dx12_log(DX12_LOG_ERROR, "get_tensor: readback alloc failed (%zu bytes)", size);
+        dx12_log(DX12_LOG_ERROR, "get_tensor: readback pool alloc failed (%zu bytes)", size);
         return;
     }
 
-    dx12_command_list* cmd = dx12_cmd_list_create(ctx->device);
-    if (!cmd) {
-        dx12_buffer_destroy(staging);
-        return;
-    }
-    dx12_buffer_transition(cmd, ctx->gpu_buffer, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    dx12_buffer_copy(cmd, staging, 0, ctx->gpu_buffer, tensor_off + offset, size);
-    dx12_cmd_list_submit_and_wait(cmd);
-    dx12_cmd_list_destroy(cmd);
+    dx12_command_list* rcmd = g_readback_pool.get_cmd();
+    if (!rcmd) return;
+
+    dx12_buffer_transition(rcmd, ctx->gpu_buffer, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    dx12_buffer_copy(rcmd, staging, 0, ctx->gpu_buffer, tensor_off + offset, size);
+    dx12_cmd_list_submit_and_wait(rcmd);
 
     void* src = dx12_buffer_map(staging);
     if (src) {
@@ -546,7 +697,6 @@ static void dx12_buf_get_tensor(ggml_backend_buffer_t buf, const ggml_tensor* te
     } else {
         dx12_log(DX12_LOG_ERROR, "get_tensor: readback map failed: %s", tensor->name);
     }
-    dx12_buffer_destroy(staging);
 }
 
 static void dx12_buf_clear(ggml_backend_buffer_t buf, uint8_t value) {
@@ -633,9 +783,12 @@ static void ggml_backend_dx12_free(ggml_backend_t backend) {
 
     dx12_log(DX12_LOG_INFO, "Freeing DX12 backend");
 
-    // Flush any pending uploads before teardown
+    // Drain this backend's outstanding GPU work before freeing its objects
     if (ctx->device) {
         dx12_flush_uploads(ctx->device);
+        if (ctx->device->ring) {
+            dx12_ring_wait_idle(ctx->device->ring);
+        }
     }
 
     delete ctx->pso_cache;
@@ -644,19 +797,15 @@ static void ggml_backend_dx12_free(ggml_backend_t backend) {
     delete ctx->descriptor_heap;
     delete ctx->cmd_pool;
 
-    if (ctx->device) {
-        // Remove from device cache before destroying
-        {
-            std::lock_guard<std::mutex> lk(g_dx12_device_cache_mutex);
-            auto it = g_dx12_device_cache.find(ctx->device->adapter_index);
-            if (it != g_dx12_device_cache.end() && it->second == ctx->device) {
-                g_dx12_device_cache.erase(it);
-                dx12_log(DX12_LOG_INFO, "Removed device idx=%u from cache on teardown",
-                    ctx->device->adapter_index);
-            }
-        }
-        dx12_device_destroy(ctx->device);
-    }
+    // Do NOT destroy the shared dx12_device here. The device is a
+    // process-lifetime singleton (g_dx12_device_cache): model weight buffers
+    // and other backend instances outlive any one backend — llama.cpp frees
+    // per-context backends while weight buffers persist, and llama-bench
+    // creates a second context against the same device. Destroying the device
+    // here caused use-after-free / AV on the next context (BUG 4, see
+    // WHAT-WE-ARE-FIXING.md). The OS reclaims the device at process exit;
+    // the stale-device path in dx12_get_or_create_device handles recreation
+    // after a real device removal.
 
     delete ctx;
     backend->context = nullptr;
@@ -679,7 +828,15 @@ void ggml_backend_dx12_synchronize(ggml_backend_t backend) {
     // Flush any pending staging uploads before sync
     dx12_flush_uploads(ctx->device);
 
-    dx12_device_wait_idle(ctx->device);
+    // Wait for all in-flight ring submissions
+    dx12_ring_wait_idle(ctx->device->ring);
+
+    // Dump GPU timings if DX12_PROFILE env var is set.
+    // After ring_wait_idle, the GPU has completed the latest resolve.
+    // Note: sub-graphs before the last are overwritten by timer->reset().
+    if (ctx->device->gpu_timer && dx12_profile_enabled()) {
+        ctx->device->gpu_timer->dump_results();
+    }
 }
 
 static bool dx12_check_device_health(dx12_device* dev) {
@@ -704,14 +861,18 @@ static ggml_status ggml_backend_dx12_graph_compute(ggml_backend_t backend,
         return GGML_STATUS_FAILED;
     }
 
-    // Flush any pending staging uploads
-    dx12_flush_uploads(ctx->device);
+    // Flush pending uploads asynchronously (no wait). Upload and compute use
+    // the same DIRECT queue, so the CopyBufferRegion completes before any
+    // subsequent compute dispatch on the ring. The ring's fence backpressure
+    // in synchronize() drains all work.
+    dx12_flush_uploads(ctx->device, false);
 
     if (!cgraph || cgraph->n_nodes == 0) return GGML_STATUS_SUCCESS;
 
-    // Record and submit this sub-graph, then wait for completion. Per-split
-    // submits keep each GPU submission small (well under the ~2s TDR limit)
-    // and results must be visible before the scheduler reads outputs anyway.
+    // Record and submit this sub-graph. The ring buffer handles fence waiting
+    // lazily — synchronize() drains all in-flight submissions. This avoids
+    // per-split CPU stalls (the previous bottleneck) while keeping each GPU
+    // submission small (well under the ~2s TDR limit).
     dx12_command_list* cmd = dx12_graph_compute_begin(ctx->device);
     if (!cmd) {
         dx12_log(DX12_LOG_ERROR, "graph_compute: failed to create command list");
@@ -760,7 +921,7 @@ static bool ggml_backend_dx12_supports_buft(ggml_backend_t backend,
 static struct ggml_backend_i ggml_backend_dx12_interface = {
     /* get_name          */ ggml_backend_dx12_name,
     /* free              */ ggml_backend_dx12_free,
-    /* set_tensor_async  */ nullptr,
+    /* set_tensor_async  */ dx12_set_tensor_async,
     /* get_tensor_async  */ nullptr,
     /* set_tensor_2d_async */ nullptr,
     /* get_tensor_2d_async */ nullptr,
@@ -773,7 +934,7 @@ static struct ggml_backend_i ggml_backend_dx12_interface = {
     /* graph_compute     */ ggml_backend_dx12_graph_compute,
     /* event_record      */ nullptr,
     /* event_wait        */ nullptr,
-    /* graph_optimize    */ nullptr,
+    /* graph_optimize    */ dx12_graph_optimize,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -918,10 +1079,10 @@ void ggml_backend_dx12_set_n_gpu_layers(ggml_backend_t backend, int32_t n_layers
 }
 
 void ggml_backend_dx12_get_vram_usage(ggml_backend_t backend,
-                                       uint64_t* total_bytes,
-                                       uint64_t* used_bytes,
-                                       uint64_t* model_bytes,
-                                       uint64_t* kv_cache_bytes) {
+                                        uint64_t* total_bytes,
+                                        uint64_t* used_bytes,
+                                        uint64_t* model_bytes,
+                                        uint64_t* kv_cache_bytes) {
     if (!backend) return;
     auto* ctx = (ggml_backend_dx12_context*)backend->context;
     if (!ctx || !ctx->device) return;
@@ -930,6 +1091,67 @@ void ggml_backend_dx12_get_vram_usage(ggml_backend_t backend,
     if (used_bytes)      *used_bytes      = ctx->vram_used;
     if (model_bytes)     *model_bytes     = ctx->vram_model;
     if (kv_cache_bytes)  *kv_cache_bytes  = ctx->vram_kv_cache;
+}
+
+bool ggml_backend_dx12_set_model_file(ggml_backend_t backend, const char* path) {
+    if (!backend) return false;
+    auto* ctx = (ggml_backend_dx12_context*)backend->context;
+    if (!ctx || !ctx->device) return false;
+
+    // Initialize DirectStorage if not already done
+    if (!ctx->device->ds_ctx) {
+        ctx->device->ds_ctx = dx12_ds_init(ctx->device);
+    }
+
+    if (!ctx->device->ds_ctx) {
+        dx12_log(DX12_LOG_INFO, "DirectStorage not available - will use staging buffer uploads");
+        return false;
+    }
+
+    // Convert UTF-8 path to wide string
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, path, -1, nullptr, 0);
+    if (wlen <= 0) return false;
+    
+    wchar_t* wpath = new wchar_t[wlen];
+    MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, wlen);
+    
+    HRESULT hr = dx12_ds_open_file(ctx->device->ds_ctx, wpath);
+    delete[] wpath;
+    
+    if (FAILED(hr)) {
+        dx12_log(DX12_LOG_INFO, "DirectStorage file open failed: 0x%08X", hr);
+        return false;
+    }
+    
+    dx12_log(DX12_LOG_INFO, "DirectStorage ready for model file async loading");
+    return true;
+}
+
+bool ggml_backend_dx12_load_tensor_async(ggml_backend_t backend,
+                                           struct ggml_tensor* tensor,
+                                           uint64_t file_offset,
+                                           uint64_t dst_offset,
+                                           size_t size) {
+    if (!backend || !tensor || !backend->context) return false;
+    
+    auto* ctx = (ggml_backend_dx12_context*)backend->context;
+    if (!ctx->device || !ctx->device->ds_ctx) return false;
+
+    dx12_buffer* gpu_buf = dx12_backend_buffer_from_tensor(tensor);
+    if (!gpu_buf) return false;
+
+    return dx12_ds_read_tensor_async(ctx->device->ds_ctx, gpu_buf, 
+                                        file_offset, size, dst_offset);
+}
+
+void ggml_backend_dx12_flush_and_wait(ggml_backend_t backend) {
+    if (!backend || !backend->context) return;
+    
+    auto* ctx = (ggml_backend_dx12_context*)backend->context;
+    if (ctx->device && ctx->device->ds_ctx) {
+        dx12_ds_flush_pending(ctx->device->ds_ctx, true);
+    }
+    ggml_backend_synchronize(backend);
 }
 
 // ---------------------------------------------------------------------------
@@ -965,10 +1187,36 @@ static const char * dx12_dev_get_description(ggml_backend_dev_t dev) {
     return info ? info->name : "DirectX 12 GPU";
 }
 
+// Live VRAM budget via the cached device's own DXGI adapter (never a raw
+// adapter index — DXGI indices are not contiguous). Falls back to the
+// static estimate when no device exists yet or the query fails.
+static bool dx12_query_vram_free(ggml_backend_dev_t dev, size_t* free_out) {
+    uint32_t adapter_idx = (uint32_t)(uintptr_t)dev->context;
+    dx12_device* d = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_dx12_device_cache_mutex);
+        auto it = g_dx12_device_cache.find(adapter_idx);
+        if (it != g_dx12_device_cache.end()) d = it->second;
+    }
+    if (!d || !d->adapter) return false;
+
+    DXGI_QUERY_VIDEO_MEMORY_INFO mi{};
+    if (FAILED(d->adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mi))) return false;
+    *free_out = (mi.Budget > mi.CurrentUsage) ? (size_t)(mi.Budget - mi.CurrentUsage) : 0;
+    return true;
+}
+
 static void dx12_dev_get_memory(ggml_backend_dev_t dev, size_t *free, size_t *total) {
     auto* info = dx12_dev_get_adapter_info(dev);
     if (total) *total = info ? info->dedicated_vram : 0;
-    if (free)  *free  = info ? info->dedicated_vram / 2 : 0; // estimate
+    if (free) {
+        size_t f = 0;
+        if (dx12_query_vram_free(dev, &f)) {
+            *free = f;
+        } else {
+            *free = info ? info->dedicated_vram / 2 : 0; // pre-device estimate
+        }
+    }
 }
 
 static enum ggml_backend_dev_type dx12_dev_get_type(ggml_backend_dev_t dev) {
@@ -981,7 +1229,11 @@ static void dx12_dev_get_props(ggml_backend_dev_t dev, struct ggml_backend_dev_p
     auto* info = dx12_dev_get_adapter_info(dev);
     props->name = info ? info->name : "DX12 GPU";
     props->description = info ? info->name : "DirectX 12 GPU";
-    props->memory_free = info ? info->dedicated_vram / 2 : 0;
+    {
+        size_t f = 0;
+        props->memory_free = dx12_query_vram_free(dev, &f)
+            ? f : (info ? info->dedicated_vram / 2 : 0);
+    }
     props->memory_total = info ? info->dedicated_vram : 0;
     props->type = GGML_BACKEND_DEVICE_TYPE_GPU;
     props->device_id = nullptr;
@@ -1153,7 +1405,16 @@ static ggml_backend_dev_t dx12_reg_get_device(ggml_backend_reg_t reg, size_t ind
 }
 
 static void * dx12_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
-    (void)reg; (void)name;
+    (void)reg;
+    if (strcmp(name, "ggml_backend_dx12_load_tensor_async") == 0) {
+        return (void*)ggml_backend_dx12_load_tensor_async;
+    }
+    if (strcmp(name, "ggml_backend_dx12_flush_and_wait") == 0) {
+        return (void*)ggml_backend_dx12_flush_and_wait;
+    }
+    if (strcmp(name, "ggml_backend_dx12_set_model_file") == 0) {
+        return (void*)ggml_backend_dx12_set_model_file;
+    }
     return nullptr;
 }
 
@@ -1180,3 +1441,5 @@ ggml_backend_reg_t ggml_backend_dx12_reg(void) {
 
     return &g_dx12_reg;
 }
+
+GGML_BACKEND_DL_IMPL(ggml_backend_dx12_reg)

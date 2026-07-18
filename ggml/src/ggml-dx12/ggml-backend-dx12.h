@@ -80,7 +80,7 @@ typedef struct {
 
     // Performance hints
     uint32_t optimal_gemm_tile;      // Recommended GEMM tile size
-    bool     prefers_wave64;         // True for AMD, false for NVIDIA
+    bool     prefers_wave64;         // True if wave64 is supported and not forced
 } dx12_device_caps;
 
 /* ═══════════════════════════════════════════════════════════════════════════ */
@@ -195,23 +195,59 @@ void ggml_backend_dx12_set_n_gpu_layers(struct ggml_backend* backend,
                                          int32_t n_layers);
 
 /**
- * ggml_backend_dx12_get_vram_usage — Query current VRAM consumption
- *
- * @param total_bytes:     Total dedicated VRAM
- * @param used_bytes:      Currently allocated by this backend
- * @param model_bytes:     Model weights on GPU
- * @param kv_cache_bytes:  KV cache on GPU
- */
-void ggml_backend_dx12_get_vram_usage(struct ggml_backend* backend,
-                                       uint64_t* total_bytes,
-                                       uint64_t* used_bytes,
-                                       uint64_t* model_bytes,
-                                       uint64_t* kv_cache_bytes);
+  * ggml_backend_dx12_get_vram_usage — Query current VRAM consumption
+  *
+  * @param total_bytes:     Total dedicated VRAM
+  * @param used_bytes:      Currently allocated by this backend
+  * @param model_bytes:     Model weights on GPU
+  * @param kv_cache_bytes:  KV cache on GPU
+  */
+ void ggml_backend_dx12_get_vram_usage(struct ggml_backend* backend,
+                                        uint64_t* total_bytes,
+                                        uint64_t* used_bytes,
+                                        uint64_t* model_bytes,
+                                        uint64_t* kv_cache_bytes);
 
-/**
- * ggml_backend_dx12_synchronize — Block until GPU finishes all work
- */
-void ggml_backend_dx12_synchronize(struct ggml_backend* backend);
+ /**
+  * ggml_backend_dx12_set_model_file — Open GGUF file for DirectStorage async loading
+  *
+  * Opens the model file for DirectStorage reads. When DS is available and this is
+  * called, set_tensor_async will use file -> GPU direct transfers.
+  *
+  * @param backend: Initialized DX12 backend
+  * @param path:    UTF-8 path to the GGUF model file
+  * @return true on success (DS available), false if DS unavailable or file open failed
+  */
+ bool ggml_backend_dx12_set_model_file(struct ggml_backend* backend, const char* path);
+
+ /**
+  * ggml_backend_dx12_load_tensor_async — Load tensor data directly from file via DirectStorage
+  *
+  * Used by model loader to stream weights directly from disk to GPU memory.
+  * Only works after ggml_backend_dx12_set_model_file() opens the file.
+  *
+  * @param backend:   Initialized DX12 backend
+  * @param tensor:    Tensor to load data into
+  * @param file_off:  File offset of tensor data
+  * @param dst_off:   Destination buffer offset (usually 0)
+  * @param size:      Size of tensor data in bytes
+  * @return true if async read was queued, false if sync fallback needed
+  */
+ bool ggml_backend_dx12_load_tensor_async(struct ggml_backend* backend,
+                                            struct ggml_tensor* tensor,
+                                            uint64_t file_offset,
+                                            uint64_t dst_offset,
+                                            size_t size);
+
+ /**
+  * ggml_backend_dx12_flush_and_wait — Wait for pending DirectStorage reads
+  */
+ void ggml_backend_dx12_flush_and_wait(struct ggml_backend* backend);
+
+ /**
+  * ggml_backend_dx12_synchronize — Block until GPU finishes all work
+  */
+ void ggml_backend_dx12_synchronize(struct ggml_backend* backend);
 
 /* ═══════════════════════════════════════════════════════════════════════════ */
 /* Error Handling                                                              */

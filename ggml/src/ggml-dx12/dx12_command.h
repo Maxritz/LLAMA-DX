@@ -28,6 +28,11 @@ struct dx12_command_list {
     uint64_t                            fence_value = 0;
     bool                                is_recording = false;
     bool                                is_closed = false;
+    bool                                first_use = true;
+    ID3D12PipelineState*                last_pso = nullptr;
+    ID3D12RootSignature*                last_root_sig = nullptr;
+    struct dx12_ring_slot*              ring_slot = nullptr; // region-tracked CBV source
+    struct dx12_barrier_tracker*        barrier_tracker = nullptr;
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -130,10 +135,7 @@ void dx12_cmd_list_submit_and_wait(dx12_command_list* cmd);
  */
 void dx12_cmd_list_uav_barrier(dx12_command_list* cmd, ID3D12Resource* resource);
 
-/**
- * dx12_cmd_list_global_uav_barrier — Global UAV barrier (all resources)
- */
-void dx12_cmd_list_global_uav_barrier(dx12_command_list* cmd);
+
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Direct Constant/Descriptor Setting (for root signature binding)

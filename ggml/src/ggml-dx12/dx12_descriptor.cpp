@@ -343,8 +343,7 @@ dx12_pso* dx12_pso_cache::get_or_create(const char* shader_name,
         return it->second.get();
     }
 
-    // Get root signature
-    dx12_root_signature_cache sig_cache(dev);
+    // Get root signature from persistent cache (avoids recreating per PSO)
     ID3D12RootSignature* root_sig = sig_cache.get_or_create(sig_type);
     if (!root_sig) return nullptr;
 

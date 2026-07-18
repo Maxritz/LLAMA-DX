@@ -91,7 +91,7 @@ TEST(rms_norm_kernel) {
     dx12_command_list* cmd=dx12_cmd_list_create(g_dev);
     struct{unsigned int n;unsigned int row_size;float eps;unsigned int pad;}p={N,ROW,1e-6f,0};
     dx12_buffer* srvs[2]={buf_a,buf_w};
-    struct dx12_shader_dispatch d{};d.shader_name="rms_norm";d.sig_type=dx12_root_signature_type::reduction;
+    struct dx12_shader_dispatch d{};d.shader_name="rms_norm";d.sig_type=dx12_root_signature_type::simple_2in_1out;
     d.thread_group_x=(N+255)/256;d.thread_group_y=1;d.thread_group_z=1;
     dx12_shader_dispatch(g_dev,cmd,d,&p,sizeof(p),srvs,2,buf_c);
     dx12_cmd_list_submit_and_wait(cmd);

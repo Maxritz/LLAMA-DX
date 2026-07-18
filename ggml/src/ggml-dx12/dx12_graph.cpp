@@ -7,14 +7,19 @@
 #include "dx12_graph.h"
 #include "dx12_shader.h"
 #include "dx12_gemm.h"
+#include "dx12_profiler.h"
 #include "dx12_quantize.h"
 #include "dx12_ring.h"
 #include "ggml-backend-dx12.h"
 #include <ggml-impl.h>
 #include <cstring>
+#include <cstdio>
 
 // Forward declarations
 static bool dx12_dispatch_mul_mat_fused_act(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst, uint32_t act_op);
+static bool dx12_can_fuse_rms_mul(ggml_cgraph* graph, int i);
+static bool dx12_dispatch_rms_norm_mul(dx12_device* dev, dx12_command_list* cmd,
+                                       ggml_tensor* rms, ggml_tensor* mul);
 
 static void apply_tensor_offset(dx12_buffer* buf, const ggml_tensor* t) {
     if (!buf || !t) return;
@@ -66,6 +71,28 @@ bool dx12_op_supported(const ggml_tensor* node) {
             // Strided/batched path: F32/F16 sources with arbitrary strides
             if (dx12_op_disabled("mms")) return false;
             return a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16;
+        }
+
+        case GGML_OP_MUL_MAT_ID: {
+            // MoE expert routing: as [K,N,n_expert] x b [K,b_ne1,n_tok]
+            // with ids [n_used,n_tok] -> dst [N,n_used,n_tok] (mv_id.hlsl)
+            const ggml_tensor* as  = node->src[0];
+            const ggml_tensor* b   = node->src[1];
+            const ggml_tensor* ids = node->src[2];
+            if (!as || !b || !ids) return false;
+            if (dx12_op_disabled("mulmatid")) return false;
+            if (as->type != GGML_TYPE_F32 && as->type != GGML_TYPE_F16 &&
+                as->type != GGML_TYPE_Q8_0 && as->type != GGML_TYPE_Q4_0 &&
+                as->type != GGML_TYPE_Q4_K && as->type != GGML_TYPE_Q5_K &&
+                as->type != GGML_TYPE_Q6_K) return false;
+            if (!ggml_is_contiguous(as)) return false;
+            if (b->type != GGML_TYPE_F32 || b->nb[0] != 4) return false;
+            if (ids->type != GGML_TYPE_I32 || ids->nb[0] != 4) return false;
+            if (node->type != GGML_TYPE_F32 || node->nb[0] != 4) return false;
+            if ((as->ne[1] + 7) / 8 > DX12_MAX_GROUPS) return false;
+            if (node->ne[1] * node->ne[2] > DX12_MAX_GROUPS) return false;
+            return dx12_dims_fit_u32(as) && dx12_dims_fit_u32(b) &&
+                   dx12_dims_fit_u32(node);
         }
 
         case GGML_OP_ADD:
@@ -264,23 +291,197 @@ bool dx12_graph_validate(dx12_device* dev, ggml_cgraph* graph,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Graph Optimization (op fusion reordering)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+void dx12_graph_optimize(struct ggml_backend* backend, struct ggml_cgraph* graph) {
+    (void)backend;
+    // DISABLED (BUG 3 investigation, see WHAT-WE-ARE-FIXING.md): this reorder
+    // pulls a node forward past intervening nodes while only checking direct
+    // src adjacency — it can move a node before one of its other producers.
+    // The fusions it enables never fire on real graphs anyway (they require
+    // F16 activations; llama.cpp feeds F32). Re-enable only with a full
+    // dependency check.
+    if (getenv("DX12_ENABLE_GRAPH_REORDER") == nullptr) return;
+    if (!graph || graph->n_nodes < 2) return;
+
+    auto is_view = [](ggml_tensor* node) -> bool {
+        return node->op == GGML_OP_NONE || node->op == GGML_OP_RESHAPE ||
+               node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW ||
+               node->op == GGML_OP_PERMUTE;
+    };
+
+    auto is_src_of = [](ggml_tensor* dst, ggml_tensor* src) -> bool {
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            if (dst->src[i] == src) return true;
+        }
+        const ggml_tensor* dst_v = dst->view_src ? dst->view_src : dst;
+        const ggml_tensor* src_v = src->view_src ? src->view_src : src;
+        return dst_v == src_v;
+    };
+
+    std::vector<ggml_tensor*> new_order;
+    std::vector<bool> used(graph->n_nodes, false);
+
+    int first_unused = 0;
+    while (first_unused < graph->n_nodes) {
+        // Pattern: RMS_NORM + MUL (+ optional ROPE or ADD)
+        if (first_unused + 1 < graph->n_nodes &&
+            !used[first_unused] && !used[first_unused + 1] &&
+            graph->nodes[first_unused]->op == GGML_OP_RMS_NORM &&
+            graph->nodes[first_unused + 1]->op == GGML_OP_MUL &&
+            is_src_of(graph->nodes[first_unused + 1], graph->nodes[first_unused])) {
+
+            new_order.push_back(graph->nodes[first_unused]);
+            new_order.push_back(graph->nodes[first_unused + 1]);
+            used[first_unused] = used[first_unused + 1] = true;
+
+            // Look for ROPE that uses the MUL result
+            for (int k = first_unused + 2; k < graph->n_nodes; k++) {
+                if (!used[k] && graph->nodes[k]->op == GGML_OP_ROPE &&
+                    is_src_of(graph->nodes[k], graph->nodes[first_unused + 1])) {
+                    new_order.push_back(graph->nodes[k]);
+                    used[k] = true;
+                    break;
+                }
+            }
+
+            first_unused += 2;
+            while (first_unused < graph->n_nodes && used[first_unused]) first_unused++;
+            continue;
+        }
+
+        // Pattern: MUL_MAT + ADD (+ optional second ADD)
+        if (first_unused + 1 < graph->n_nodes &&
+            !used[first_unused] && !used[first_unused + 1] &&
+            graph->nodes[first_unused]->op == GGML_OP_MUL_MAT &&
+            graph->nodes[first_unused + 1]->op == GGML_OP_ADD &&
+            is_src_of(graph->nodes[first_unused + 1], graph->nodes[first_unused])) {
+
+            new_order.push_back(graph->nodes[first_unused]);
+            new_order.push_back(graph->nodes[first_unused + 1]);
+            used[first_unused] = used[first_unused + 1] = true;
+
+            // Look for second ADD (MUL_MAT + ADD + ADD)
+            for (int k = first_unused + 2; k < graph->n_nodes; k++) {
+                if (!used[k] && graph->nodes[k]->op == GGML_OP_ADD &&
+                    is_src_of(graph->nodes[k], graph->nodes[first_unused + 1])) {
+                    new_order.push_back(graph->nodes[k]);
+                    used[k] = true;
+                    break;
+                }
+            }
+
+            first_unused += 2;
+            while (first_unused < graph->n_nodes && used[first_unused]) first_unused++;
+            continue;
+        }
+
+        // Single non-view node: place it
+        if (!used[first_unused] && !is_view(graph->nodes[first_unused])) {
+            new_order.push_back(graph->nodes[first_unused]);
+            used[first_unused] = true;
+        }
+        first_unused++;
+    }
+
+    // Append any remaining nodes (views, etc.)
+    for (int i = 0; i < graph->n_nodes; i++) {
+        if (!used[i]) {
+            new_order.push_back(graph->nodes[i]);
+        }
+    }
+
+    // Apply new ordering
+    GGML_ASSERT(new_order.size() == (size_t)graph->n_nodes);
+    memcpy(graph->nodes, new_order.data(), graph->n_nodes * sizeof(ggml_tensor*));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Fused Dispatch: MUL_MAT + ADD (Q4_K prefill)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+static bool dx12_dispatch_mul_mat_add_fused_q4k(dx12_device* dev, dx12_command_list* cmd,
+                                                  ggml_tensor* mm_dst, ggml_tensor* add_dst) {
+    ggml_tensor* a_w = mm_dst->src[0]; // Q4_K weights [N, K]
+    ggml_tensor* b_a = mm_dst->src[1]; // F16 activations [M, K]
+    // ADD's other source is the bias
+    ggml_tensor* bias = (add_dst->src[0] == mm_dst) ? add_dst->src[1] : add_dst->src[0];
+
+    if (a_w->type != GGML_TYPE_Q4_K || b_a->type != GGML_TYPE_F16) return false;
+    if (bias->type != GGML_TYPE_F16) return false;
+
+    uint32_t M = (uint32_t)b_a->ne[1];
+    uint32_t N = (uint32_t)a_w->ne[1];
+    uint32_t K = (uint32_t)a_w->ne[0];
+
+    // GEMV (decode) not supported by this fused shader (15/16 lanes wasted)
+    if (M <= 1) return false;
+
+    dx12_buffer* buf_w   = dx12_backend_buffer_from_tensor(a_w);
+    dx12_buffer* buf_a   = dx12_backend_buffer_from_tensor(b_a);
+    dx12_buffer* buf_bias = dx12_backend_buffer_from_tensor(bias);
+    dx12_buffer* buf_dst = dx12_backend_buffer_from_tensor(add_dst);
+    if (!buf_w || !buf_a || !buf_bias || !buf_dst) return false;
+
+    // Transition: SRVs to NON_PIXEL_SHADER_RESOURCE, UAV to UNORDERED_ACCESS
+    dx12_buffer_transition(cmd, buf_w, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    dx12_buffer_transition(cmd, buf_a, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    dx12_buffer_transition(cmd, buf_bias, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    dx12_buffer_transition(cmd, buf_dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    struct FusedQ4KGEMMAddParams {
+        uint32_t M,N,K;
+        uint32_t stride_a, stride_b, stride_c;
+        uint32_t stride_residual;
+        uint32_t transposed_b;
+        uint32_t wave_size;
+        uint32_t reserved[7];
+    };
+    FusedQ4KGEMMAddParams params{};
+    params.M = M;
+    params.N = N;
+    params.K = K;
+    params.stride_a = K;               // unused by shader but set for clarity
+    params.stride_b = K;               // byte stride between activation rows (K * sizeof(f16))
+    params.stride_c = N;               // byte stride between output rows (N * sizeof(f32))
+    params.stride_residual = N;        // byte stride between bias rows (N * sizeof(f16))
+    params.transposed_b = 0;
+    params.wave_size = 32;
+
+    struct dx12_shader_dispatch dispatch{};
+    dispatch.shader_name = "fused_gemm_add_q4k";
+    dispatch.sig_type = dx12_root_signature_type::dequant_gemm;
+    dispatch.srv_addr[0] = dx12_backend_tensor_gpu_addr(a_w);
+    dispatch.srv_addr[1] = dx12_backend_tensor_gpu_addr(b_a);
+    dispatch.srv_addr[2] = dx12_backend_tensor_gpu_addr(bias);
+    dispatch.uav_addr    = dx12_backend_tensor_gpu_addr(add_dst);
+    dispatch.dispatch_x = (N + 15) / 16;
+    dispatch.dispatch_y = (M + 15) / 16;
+    dispatch.dispatch_z = 1;
+
+    dx12_buffer* srvs[4] = { buf_w, buf_a, buf_bias, nullptr };
+    return dx12_shader_dispatch(dev, cmd, dispatch, &params, sizeof(params), srvs, 3, buf_dst);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Graph Compute
 // ═══════════════════════════════════════════════════════════════════════════════
 
 dx12_command_list* dx12_graph_compute_begin(dx12_device* dev) {
     if (!dev || !dev->ring) return nullptr;
 
-    // Acquire a slot from the ring buffer (pre-allocated, fence-polling)
+    dx12_profile_scope acq(dev->gpu_timer, nullptr, "ring_acquire");
+    (void)acq;
+
     dx12_ring_slot* slot = dx12_ring_acquire(dev->ring);
     if (!slot) return nullptr;
 
-    // Wrap the ring slot's d3d_list in a lightweight dx12_command_list
-    // that the dispatch functions can use. We don't own the allocator —
-    // the ring does. Reset is handled by the ring on next acquire.
     auto* cmd = new dx12_command_list();
     cmd->d3d_list = slot->d3d_list;
     cmd->device = dev;
-    cmd->allocator = nullptr;  // owned by ring, don't touch
+    cmd->ring_slot = slot;
+    cmd->allocator = nullptr;
     cmd->fence_value = 0;
     cmd->is_recording = true;
     cmd->is_closed = false;
@@ -290,15 +491,15 @@ dx12_command_list* dx12_graph_compute_begin(dx12_device* dev) {
 void dx12_graph_compute_end(dx12_device* dev, dx12_command_list* cmd) {
     if (!dev || !cmd) return;
 
-    // Submit via ring buffer (non-blocking, just signals fence + advances head)
-    uint64_t fence = dx12_ring_submit(dev->ring);
+    dx12_profile_scope sub(dev->gpu_timer, nullptr, "ring_submit");
+    (void)sub;
 
-    // Wait for completion — the scheduler needs results before the next token.
-    // This is the blocking ~400µs cost. The ring saves the allocator
-    // create/destroy churn (~15µs) and enables future pipelining.
-    if (fence > 0) {
-        dx12_device_wait_for_fence(dev, fence);
-    }
+    // Submit via ring buffer (no per-split fence wait).
+    // The ring has limited capacity (DX12_RING_CAPACITY=4) and
+    // dx12_ring_acquire stalls automatically when all slots are
+    // in-flight. This pipelines sub-graph submissions for better
+    // GPU utilization. Call synchronize() to drain all in-flight work.
+    dx12_ring_submit(dev->ring);
 
     // Destroy the wrapper (not the ring slot — ring owns the allocator)
     cmd->d3d_list.Reset();
@@ -316,14 +517,63 @@ bool dx12_graph_compute(dx12_device* dev, dx12_command_list* cmd, ggml_cgraph* g
         return false;
     }
 
+    // Reset GPU timer for this sub-graph
+    if (dev->gpu_timer) dev->gpu_timer->reset();
+
+    // Barrier tracker for cross-dispatch UAV barrier coalescing
+    dx12_barrier_tracker barrier_tracker{};
+    cmd->barrier_tracker = &barrier_tracker;
+
     // Execute each node in topological order
     for (int i = 0; i < graph->n_nodes; i++) {
         ggml_tensor* node = graph->nodes[i];
         bool ok = false;
         bool dispatched = true;
+        bool is_fused = false;
 
-        switch (node->op) {
-            case GGML_OP_MUL_MAT:       ok = dx12_dispatch_mul_mat(dev, cmd, node); break;
+        bool record_timing = dev->gpu_timer &&
+            node->op != GGML_OP_VIEW && node->op != GGML_OP_RESHAPE &&
+            node->op != GGML_OP_PERMUTE && node->op != GGML_OP_TRANSPOSE &&
+            node->op != GGML_OP_NONE;
+
+        // ── Fusion: MUL_MAT + ADD ──────────────────────────────────────────
+        // When the next node is ADD and its src[0] or src[1] is this node,
+        // dispatch a single fused kernel instead of two separate dispatches.
+        // Currently handles Q4_K weights + F16 activations + F16 bias in prefill.
+        if (node->op == GGML_OP_MUL_MAT && i + 1 < graph->n_nodes &&
+            graph->nodes[i + 1]->op == GGML_OP_ADD &&
+            (graph->nodes[i + 1]->src[0] == node || graph->nodes[i + 1]->src[1] == node)) {
+
+            ggml_tensor* add_node = graph->nodes[i + 1];
+            if (record_timing) dev->gpu_timer->begin(cmd, "mm_add_fused");
+            if (dx12_dispatch_mul_mat_add_fused_q4k(dev, cmd, node, add_node)) {
+                i++; // skip the ADD — consumed by fused dispatch
+                ok = true;
+                is_fused = true;
+            }
+            if (record_timing) dev->gpu_timer->end(cmd);
+        }
+
+        // ── Fusion: RMS_NORM + MUL (row-broadcast norm weight) ─────────────
+        // One dispatch + one barrier instead of two of each; ~1 per layer.
+        if (!is_fused && node->op == GGML_OP_RMS_NORM &&
+            dx12_can_fuse_rms_mul(graph, i)) {
+            if (record_timing) dev->gpu_timer->begin(cmd, "rms_mul_fused");
+            bool fok = dx12_dispatch_rms_norm_mul(dev, cmd, node, graph->nodes[i + 1]);
+            if (record_timing) dev->gpu_timer->end(cmd);
+            if (fok) {
+                i++; // skip the MUL — consumed by the fused dispatch
+                ok = true;
+                is_fused = true;
+            }
+        }
+
+        if (!is_fused) {
+            if (record_timing) dev->gpu_timer->begin(cmd, ggml_op_name(node->op));
+
+            switch (node->op) {
+                case GGML_OP_MUL_MAT:       ok = dx12_dispatch_mul_mat(dev, cmd, node); break;
+                case GGML_OP_MUL_MAT_ID:    ok = dx12_dispatch_mul_mat_id(dev, cmd, node); break;
             case GGML_OP_ADD:           ok = dx12_dispatch_add(dev, cmd, node); break;
             case GGML_OP_MUL:           ok = dx12_dispatch_mul(dev, cmd, node); break;
             case GGML_OP_SCALE:         ok = dx12_dispatch_scale(dev, cmd, node); break;
@@ -365,17 +615,24 @@ bool dx12_graph_compute(dx12_device* dev, dx12_command_list* cmd, ggml_cgraph* g
                 break;
         }
 
+            if (record_timing) dev->gpu_timer->end(cmd);
+        }
+
         if (!ok) {
             dx12_log(DX12_LOG_ERROR, "Dispatch failed for op %s at node %d",
                 ggml_op_name(node->op), i);
             return false;
         }
 
-        // Order dependent dispatches: flush UAV writes before the next node reads them
-        if (dispatched) {
-            dx12_cmd_list_global_uav_barrier(cmd);
-        }
+        // No barrier needed between dispatched nodes — dx12_buffer_transition already
+        // inserts per-resource UAV barriers when a buffer stays in UNORDERED_ACCESS
+        // across dispatches (dx12_buffer.cpp:243-244), and state-transition barriers
+        // (UAV→SRV/COPY_DST) handle the rest. The old global UAV barrier was redundant.
     }
+
+    // Resolve GPU queries before submit (results are read after fence wait)
+    if (dev->gpu_timer) dev->gpu_timer->resolve(cmd);
+
     return true;
 }
 
@@ -421,14 +678,14 @@ static bool dx12_run_mm(dx12_device* dev, dx12_command_list* cmd,
     }
     bufs[nsrc] = buf_d;
 
-    // Transition each unique buffer to UNORDERED_ACCESS
-    for (uint32_t i = 0; i <= nsrc; i++) {
-        bool seen = false;
-        for (uint32_t j = 0; j < i; j++) {
-            if (bufs[j] == bufs[i]) { seen = true; break; }
-        }
-        if (!seen) dx12_buffer_transition(cmd, bufs[i], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    }
+    // Coalesced barriers: batch all transitions + skip redundant UAV barriers
+    D3D12_RESOURCE_STATES mm_states[4] = {
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+    };
+    dx12_barrier_pre_dispatch(cmd, cmd->barrier_tracker, bufs, mm_states, nsrc + 1);
 
     dispatch.shader_name = shader;
     dispatch.sig_type = dx12_root_signature_type::mm;
@@ -519,6 +776,15 @@ static bool dx12_dispatch_mul_mat_strided(dx12_device* dev, dx12_command_list* c
     p.dnb0 = (uint32_t)dst->nb[0]; p.dnb1 = (uint32_t)dst->nb[1];
     p.dnb2 = (uint32_t)dst->nb[2]; p.dnb3 = (uint32_t)dst->nb[3];
 
+    // Prefill-sized batches use the LDS-tiled kernel (64x reuse of A/B
+    // elements); small M keeps the per-element kernels (tile mostly empty).
+    if (p.M >= 16) {
+        p.pad0 = (a->type == GGML_TYPE_F16) ? 1u : 0u; // a_f16 flag
+        return dx12_run_mm(dev, cmd, "mms_tiled", &p, sizeof(p),
+                           a, b, nullptr, dst,
+                           (p.N + 63) / 64, (p.M + 63) / 64,
+                           (uint32_t)(dst->ne[2] * dst->ne[3]));
+    }
     const char* shader = (a->type == GGML_TYPE_F16) ? "mms_f16" : "mms_f32";
     return dx12_run_mm(dev, cmd, shader, &p, sizeof(p),
                        a, b, nullptr, dst,
@@ -569,38 +835,26 @@ bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor
         params.stride_c = N;
         return dx12_gemm_dispatch_dxla_wave(dev, cmd, buf_a, buf_b, buf_c, &params);
     }
-    // DXLA Wave path for Q4_0 prefill (M > 1)
-    else if (a->type == GGML_TYPE_Q4_0 && dev->caps.dxla_wave && M > 1) {
-        dx12_buffer* buf_a = dx12_backend_buffer_from_tensor(a);
-        dx12_buffer* buf_b = dx12_backend_buffer_from_tensor(b);
-        dx12_buffer* buf_c = dx12_backend_buffer_from_tensor(dst);
-        if (!buf_a || !buf_b || !buf_c) return false;
-        dx12_gemm_params params{};
-        params.M = M;
-        params.N = N;
-        params.K = K;
-        params.quant_a = DX12_QUANT_Q4_0;
-        params.quant_b = DX12_QUANT_F16;
-        params.alpha = 1.0f;
-        params.batch_count = 1;
-        params.transposed_b = false;
-        params.stride_a = K;
-        params.stride_b = K;
-        params.stride_c = N;
-        return dx12_gemm_dispatch_dxla_wave(dev, cmd, buf_a, buf_b, buf_c, &params);
-    }
-
+    // Quantized DXLA wave paths (Q4_0/Q8_0/Q4_K) removed: those shaders read
+    // ByteAddressBuffer with byte-address/4 and fill only 32/256 of the A tile
+    // — garbage output and DEVICE_HUNG on -p 128 (see TRACE-gemv-direct-path-opt.md).
+    // Quant prefill falls through to the correct mm_* tiled shaders below.
     // K-quants share one shader pair; the quant selector rides in the CBV pad
+    // Prefill (M > 1) runs the LDS-tiled GEMM (mm_tiled.hlsl) for every
+    // weight type; the qtype selector in the CBV picks the dequant.
+    // GEMV (M == 1) keeps the per-type wave kernels. The old naive mm_*
+    // per-output-element shaders and the broken mm_q*_k_prefill kernels are
+    // no longer referenced (see WHAT-WE-ARE-FIXING.md).
     uint32_t kq_type = 0;
     const char* shader_name = nullptr;
     switch (a->type) {
-        case GGML_TYPE_F32:  shader_name = gemv ? "mv_f32"  : "mm_f32";  break;
-        case GGML_TYPE_F16:  shader_name = gemv ? "mv_f16"  : "mm_f16";  break;
-        case GGML_TYPE_Q8_0: shader_name = gemv ? "mv_q8_0" : "mm_q8_0"; break;
-        case GGML_TYPE_Q4_0: shader_name = gemv ? "mv_q4_0" : "mm_q4_0"; break;
-        case GGML_TYPE_Q4_K: shader_name = gemv ? "mv_kq" : "mm_kq"; kq_type = 4; break;
-        case GGML_TYPE_Q5_K: shader_name = gemv ? "mv_kq" : "mm_kq"; kq_type = 5; break;
-        case GGML_TYPE_Q6_K: shader_name = gemv ? "mv_kq" : "mm_kq"; kq_type = 6; break;
+        case GGML_TYPE_F32:  shader_name = gemv ? "mv_f32"  : "mm_tiled"; kq_type = 0; break;
+        case GGML_TYPE_F16:  shader_name = gemv ? "mv_f16"  : "mm_tiled"; kq_type = 1; break;
+        case GGML_TYPE_Q8_0: shader_name = gemv ? "mv_q8_0" : "mm_tiled"; kq_type = 2; break;
+        case GGML_TYPE_Q4_0: shader_name = gemv ? "mv_q4_0" : "mm_tiled"; kq_type = 3; break;
+        case GGML_TYPE_Q4_K: shader_name = gemv ? "mv_kq" : "mm_tiled"; kq_type = 4; break;
+        case GGML_TYPE_Q5_K: shader_name = gemv ? "mv_kq" : "mm_tiled"; kq_type = 5; break;
+        case GGML_TYPE_Q6_K: shader_name = gemv ? "mv_kq" : "mm_tiled"; kq_type = 6; break;
         default:
             dx12_log(DX12_LOG_ERROR, "MUL_MAT: unsupported weight type %s", ggml_type_name(a->type));
             return false;
@@ -615,12 +869,14 @@ bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor
         return false;
     }
 
-    // All three buffers are bound as root UAVs (mm root signature), so a
-    // single UNORDERED_ACCESS state covers sources that alias the result's
-    // resource. Ordering between nodes comes from the global UAV barrier.
-    dx12_buffer_transition(cmd, buf_c, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    if (buf_a != buf_c) dx12_buffer_transition(cmd, buf_a, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    if (buf_b != buf_c && buf_b != buf_a) dx12_buffer_transition(cmd, buf_b, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    // Coalesced barriers: batch all transitions + skip redundant UAV barriers
+    dx12_buffer* mm_bufs[3] = { buf_a, buf_b, buf_c };
+    D3D12_RESOURCE_STATES mm_states[3] = {
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+    };
+    dx12_barrier_pre_dispatch(cmd, cmd->barrier_tracker, mm_bufs, mm_states, 3);
 
     struct dx12_shader_dispatch dispatch{};
     dispatch.shader_name = shader_name;
@@ -646,17 +902,21 @@ bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor
         return dx12_shader_dispatch(dev, cmd, dispatch, &params, sizeof(params), srvs, 2, buf_c);
     }
 
-    // Prefill: one dispatch cannot be preempted, so a large M*N*K (K-quant 7B
-    // prefill is ~35G MACs) exceeds the ~2s TDR. Chunk along M into separate
-    // dispatches; chunks write disjoint C rows, so no barrier is needed
-    // between them.
-    const uint64_t max_macs = kq_type ? 500ull * 1000 * 1000 : 2000ull * 1000 * 1000;
+    // Chunk large GEMMs along M to avoid exceeding the TDR limit (~2s).
+    // RX 9070 XT at 30 TFLOPS processes ~60T MACs in 2s — far above any
+    // single GEMM in practice. Old limits (500M K-quant, 2000M other) were
+    // conservative for slower GPUs; raised 4x to reduce dispatch overhead.
+    const uint64_t max_macs = kq_type ? 2000ull * 1000 * 1000 : 8000ull * 1000 * 1000;
     uint32_t m_chunk = M;
     uint64_t macs = (uint64_t)M * N * K;
     if (macs > max_macs) {
         m_chunk = (uint32_t)(max_macs / ((uint64_t)N * K));
         if (m_chunk == 0) m_chunk = 1;
     }
+
+    // mm_tiled: 64x64 C tile per 16x16 group; mm_kq (unused fallback): 16
+    uint32_t tile = (strcmp(shader_name, "mm_tiled") == 0) ? 64 : 16;
+    uint32_t tile_n = (N + tile - 1) / tile;
 
     D3D12_GPU_VIRTUAL_ADDRESS b_base = dispatch.srv_addr[1];
     D3D12_GPU_VIRTUAL_ADDRESS c_base = dispatch.uav_addr;
@@ -665,10 +925,18 @@ bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor
         struct { uint32_t M, N, K, qtype; } params = { mc, N, K, kq_type };
         dispatch.srv_addr[1] = b_base + (uint64_t)m0 * K * 4;   // B rows are K f32
         dispatch.uav_addr    = c_base + (uint64_t)m0 * N * 4;   // C rows are N f32
-        dispatch.dispatch_x = (N + 15) / 16;
-        dispatch.dispatch_y = (mc + 15) / 16;
+        dispatch.dispatch_x = tile_n;
+        dispatch.dispatch_y = (mc + tile - 1) / tile;
+        if (dev->gpu_timer && dx12_profile_enabled()) {
+            char chunk_name[64];
+            snprintf(chunk_name, sizeof(chunk_name), "%s.chunk.%u", shader_name, m0 / m_chunk);
+            dev->gpu_timer->begin(cmd, chunk_name);
+        }
         if (!dx12_shader_dispatch(dev, cmd, dispatch, &params, sizeof(params), srvs, 2, buf_c)) {
             return false;
+        }
+        if (dev->gpu_timer && dx12_profile_enabled()) {
+            dev->gpu_timer->end(cmd);
         }
     }
     return true;
@@ -693,9 +961,13 @@ static bool dx12_dispatch_mul_mat_fused_act(dx12_device* dev, dx12_command_list*
     dx12_buffer* buf_c = dx12_backend_buffer_from_tensor(dst);
     if (!buf_a || !buf_b || !buf_c) return false;
 
-    dx12_buffer_transition(cmd, buf_c, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    if (buf_a != buf_c) dx12_buffer_transition(cmd, buf_a, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    if (buf_b != buf_c && buf_b != buf_a) dx12_buffer_transition(cmd, buf_b, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    dx12_buffer* fa_bufs[3] = { buf_a, buf_b, buf_c };
+    D3D12_RESOURCE_STATES fa_states[3] = {
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+    };
+    dx12_barrier_pre_dispatch(cmd, cmd->barrier_tracker, fa_bufs, fa_states, 3);
 
     struct dx12_shader_dispatch dispatch{};
     dispatch.shader_name = "mm_fused_act";
@@ -859,6 +1131,99 @@ bool dx12_dispatch_soft_max(dx12_device* dev, dx12_command_list* cmd, ggml_tenso
 }
 
 // RMS_NORM: F32, eps from op_params, one group per row
+// MUL_MAT_ID: MoE expert routing via mv_id.hlsl (one slot per dispatch z,
+// 8 output rows per group). Shapes/types guaranteed by dx12_op_supported.
+bool dx12_dispatch_mul_mat_id(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
+    const ggml_tensor* as  = dst->src[0];
+    const ggml_tensor* b   = dst->src[1];
+    const ggml_tensor* ids = dst->src[2];
+
+    uint32_t qtype;
+    switch (as->type) {
+        case GGML_TYPE_F32:  qtype = 0; break;
+        case GGML_TYPE_F16:  qtype = 1; break;
+        case GGML_TYPE_Q8_0: qtype = 2; break;
+        case GGML_TYPE_Q4_0: qtype = 3; break;
+        case GGML_TYPE_Q4_K: qtype = 4; break;
+        case GGML_TYPE_Q5_K: qtype = 5; break;
+        case GGML_TYPE_Q6_K: qtype = 6; break;
+        default:
+            dx12_log(DX12_LOG_ERROR, "MUL_MAT_ID: unsupported weight type %s",
+                     ggml_type_name(as->type));
+            return false;
+    }
+
+    struct {
+        uint32_t N, K, qtype, n_used;
+        uint32_t b_ne1, b_nb1, b_nb2, ids_nb1;
+        uint32_t d_nb1, d_nb2, w_nb2, pad;
+    } p{};
+    p.N       = (uint32_t)as->ne[1];
+    p.K       = (uint32_t)as->ne[0];
+    p.qtype   = qtype;
+    p.n_used  = (uint32_t)ids->ne[0];
+    p.b_ne1   = (uint32_t)b->ne[1];
+    p.b_nb1   = (uint32_t)b->nb[1];
+    p.b_nb2   = (uint32_t)b->nb[2];
+    p.ids_nb1 = (uint32_t)ids->nb[1];
+    p.d_nb1   = (uint32_t)dst->nb[1];
+    p.d_nb2   = (uint32_t)dst->nb[2];
+    p.w_nb2   = (uint32_t)as->nb[2];
+
+    uint32_t n_slots = (uint32_t)(dst->ne[1] * dst->ne[2]);
+    return dx12_run_mm(dev, cmd, "mv_id", &p, sizeof(p),
+                       as, b, ids, dst,
+                       (p.N + 7) / 8, 1, n_slots);
+}
+
+// Can RMS_NORM at graph->nodes[i] fuse with the MUL at i+1?
+// Requirements: MUL consumes the RMS result, its other source is a contiguous
+// F32 [ne0] row vector (llama norm-weight pattern), shapes match, and nothing
+// else in the graph reads the intermediate RMS result.
+static bool dx12_can_fuse_rms_mul(ggml_cgraph* graph, int i) {
+    if (i + 1 >= graph->n_nodes) return false;
+    ggml_tensor* rms = graph->nodes[i];
+    ggml_tensor* mul = graph->nodes[i + 1];
+    if (rms->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL) return false;
+    const ggml_tensor* w = nullptr;
+    if (mul->src[0] == rms)      w = mul->src[1];
+    else if (mul->src[1] == rms) w = mul->src[0];
+    if (!w) return false;
+    if (w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w)) return false;
+    if (w->ne[0] != rms->ne[0] || w->ne[1] != 1 || w->ne[2] != 1 || w->ne[3] != 1) return false;
+    if (!ggml_are_same_shape(mul, rms)) return false;
+    if (rms->flags & GGML_TENSOR_FLAG_OUTPUT) return false;
+    for (int k = i + 2; k < graph->n_nodes; k++) {
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            if (graph->nodes[k]->src[s] == rms) return false;
+        }
+    }
+    return true;
+}
+
+// Fused RMS_NORM + MUL: one dispatch + one barrier instead of two of each.
+// Preconditions checked by dx12_can_fuse_rms_mul.
+static bool dx12_dispatch_rms_norm_mul(dx12_device* dev, dx12_command_list* cmd,
+                                       ggml_tensor* rms, ggml_tensor* mul) {
+    const ggml_tensor* a = rms->src[0];
+    const ggml_tensor* w = (mul->src[0] == rms) ? mul->src[1] : mul->src[0];
+    float eps;
+    memcpy(&eps, (const char*)rms->op_params, sizeof(float));
+
+    struct {
+        uint32_t ne0; float eps;
+        uint32_t nb01, nb02, nb03, dnb1, dnb2, dnb3;
+    } p{};
+    p.ne0 = (uint32_t)a->ne[0];
+    p.eps = eps;
+    p.nb01 = (uint32_t)a->nb[1]; p.nb02 = (uint32_t)a->nb[2]; p.nb03 = (uint32_t)a->nb[3];
+    p.dnb1 = (uint32_t)mul->nb[1]; p.dnb2 = (uint32_t)mul->nb[2]; p.dnb3 = (uint32_t)mul->nb[3];
+
+    return dx12_run_mm(dev, cmd, "rms_norm_mul_row", &p, sizeof(p),
+                       a, w, nullptr, mul,
+                       (uint32_t)a->ne[1], (uint32_t)a->ne[2], (uint32_t)a->ne[3]);
+}
+
 bool dx12_dispatch_rms_norm(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
     const ggml_tensor* a = dst->src[0];
     float eps;

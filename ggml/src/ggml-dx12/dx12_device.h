@@ -44,13 +44,16 @@ constexpr uint64_t DX12_BUFFER_ALIGNMENT = 256;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Forward Declarations
-// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════
 
 struct dx12_buffer;
 struct dx12_command_list;
 struct dx12_descriptor_heap;
+struct dx12_gpu_timer;
 struct dx12_pso;
 struct dx12_ring_context;
+struct dx12_ring_slot;
+struct dx12_ds_context;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // dx12_device: D3D12 Device Manager
@@ -94,15 +97,28 @@ struct dx12_device {
     // Thread safety
     mutable std::mutex              device_mutex;
 
-    // Constant buffer ring buffer (256-byte aligned, 64KB upload heap)
+    // Constant buffer ring buffer (256-byte aligned, 4MB upload heap)
+    // Partitioned into N equally-sized regions, one per ring slot.
+    // Each region is owned by one slot; slot reuse is fence-protected
+    // by dx12_ring_acquire(), so no cross-slot CBV sync needed.
     ComPtr<ID3D12Resource>          cbv_ring_buffer;
     uint8_t*                        cbv_ring_cpu_address = nullptr;
     uint64_t                        cbv_ring_gpu_address = 0;
     uint32_t                        cbv_ring_size = 0;
-    uint32_t                        cbv_ring_offset = 0;
+    uint32_t                        cbv_region_size = 0; // per-slot region size
 
     // Ring-buffer command submission (pre-allocated, fence-polling)
     dx12_ring_context*              ring = nullptr;
+
+    // GPU timestamp profiler (per-dispatch timing)
+    dx12_gpu_timer*                 gpu_timer = nullptr;
+
+    // DirectStorage context (for async model file loading)
+    dx12_ds_context*                ds_ctx = nullptr;
+
+    // Deferred staging buffers: upload buffers kept alive until GPU queue is idle,
+    // then destroyed. Prevents RDNA4 compute-queue driver crash (HOW-TO-FIX #10).
+    std::vector<dx12_buffer*>       pending_staging;
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -212,12 +228,17 @@ extern "C" { __declspec(dllexport) extern const char* D3D12SDKPath; }
 /**
  * dx12_device_allocate_cbv — Allocate space in CBV ring buffer
  *
+ * Uses the ring slot's dedicated region — no cross-slot sync needed
+ * because slot reuse is already fence-protected by dx12_ring_acquire.
+ *
  * @param dev:  Device pointer
- * @param data: Constant data to copy (must be 256-byte aligned size)
+ * @param slot: Ring slot this CBV belongs to (provides region base)
+ * @param data: Constant data to copy
  * @param size: Size of constant data in bytes
  * @return GPU virtual address of the allocated constant buffer
  */
 D3D12_GPU_VIRTUAL_ADDRESS dx12_device_allocate_cbv(dx12_device* dev,
+                                                     dx12_ring_slot* slot,
                                                      const void* data,
                                                      uint32_t size);
 
