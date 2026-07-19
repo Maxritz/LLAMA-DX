@@ -126,6 +126,19 @@ prefill additionally wants multi-query tiles (process 8-16 q rows per group
 so K/V loads amortize). Needs a backend scratch allocation sized
 n_head * n_splits * (dv + 2) floats.
 
+UPDATE (session 6): FA v2 split-KV LANDED — fa_split.hlsl + fa_combine.hlsl
++ device-lifetime scratch (dev->fa_scratch, grown on demand), used when
+n_q*n_head*batch < 256 groups and n_kv >= 256 (>=128 KV rows per split,
+<= 16 splits). Verified: FA suite 553/553 with splits active, full suite
+2233/0, default path untouched.
+Perf: tg64 @ d4096 = 125.5 t/s WITH FA vs 101.8 without — long-context
+decode now wins by 23% (v1 was 38 t/s). Still behind at short context
+(tg128 186 vs 208; pp512 3242 vs 5324) so DX12_ENABLE_FA stays opt-in.
+Remaining for default-on: multi-query prefill tiles (8-16 q rows per group
+sharing K/V loads) and a small-KV fast path. Note: shape-conditional
+op claims do NOT work as a dodge — a rejected shape falls back to CPU
+attention (far slower than our mms path), not to mms.
+
 ## STILL OPEN
 
 - FIX 1 step 5: structural GEMM (8x8 register tile / 128x128, TILE_K 64,

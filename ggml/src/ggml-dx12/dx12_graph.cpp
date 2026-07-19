@@ -1280,10 +1280,17 @@ bool dx12_dispatch_mul_mat_id(dx12_device* dev, dx12_command_list* cmd, ggml_ten
                        (p.N + 7) / 8, 1, n_slots);
 }
 
-// FLASH_ATTN_EXT: fused attention with online softmax (flash_attn_ext.hlsl).
-// One group per (query, head, batch). Shapes/types guaranteed by
-// dx12_op_supported. When there is no mask, q is bound in the mask slot so
-// the shader's register layout (u0..u4) stays fixed; has_mask=0 gates reads.
+// FLASH_ATTN_EXT: fused attention with online softmax. Shapes/types are
+// guaranteed by dx12_op_supported. When there is no mask, q is bound in the
+// mask slot so the shader's register layout (u0..u4) stays fixed.
+//
+// Two execution strategies:
+// - n_split == 1: single-pass flash_attn_ext.hlsl, one group per
+//   (query, head, batch).
+// - n_split > 1 (few groups would underfill the GPU — decode): fa_split
+//   writes per-KV-chunk partials {m, l, o[dv]} to a device scratch buffer,
+//   fa_combine merges them. The barrier tracker orders pass1 -> pass2 via
+//   the scratch range.
 bool dx12_dispatch_flash_attn_ext(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
     const ggml_tensor* q    = dst->src[0];
     const ggml_tensor* k    = dst->src[1];
@@ -1295,7 +1302,7 @@ bool dx12_dispatch_flash_attn_ext(dx12_device* dev, dx12_command_list* cmd, ggml
 
     struct {
         uint32_t dk, dv, n_q, n_kv;
-        uint32_t n_head, gqa, has_mask, pad0;
+        uint32_t n_head, gqa, has_mask, n_split;
         float    scale;
         uint32_t qnb1, qnb2, qnb3;
         uint32_t knb1, knb2, knb3;
@@ -1318,10 +1325,127 @@ bool dx12_dispatch_flash_attn_ext(dx12_device* dev, dx12_command_list* cmd, ggml
     p.mnb3 = (mask && mask->ne[3] > 1) ? (uint32_t)mask->nb[3] : 0;
     p.dnb1 = (uint32_t)dst->nb[1]; p.dnb2 = (uint32_t)dst->nb[2]; p.dnb3 = (uint32_t)dst->nb[3];
 
-    return dx12_run_mm(dev, cmd, "flash_attn_ext", &p, sizeof(p),
-                       q, k, v, dst,
-                       (uint32_t)q->ne[1], (uint32_t)q->ne[2], (uint32_t)q->ne[3],
-                       mask ? mask : q);
+    uint32_t batch = (uint32_t)q->ne[3];
+    uint32_t slots = p.n_q * p.n_head * batch;
+
+    // Split KV when the slot count alone underfills the GPU. Each split
+    // should keep >= 128 KV rows; cap at fa_combine's MAX_SPLIT (16).
+    uint32_t n_split = 1;
+    if (slots < 256 && p.n_kv >= 256) {
+        n_split = (256 + slots - 1) / slots;
+        uint32_t max_by_kv = p.n_kv / 128;
+        if (n_split > max_by_kv) n_split = max_by_kv;
+        if (n_split > 16) n_split = 16;
+        if (n_split < 1) n_split = 1;
+    }
+
+    if (n_split <= 1 || batch * n_split > (uint32_t)DX12_MAX_GROUPS) {
+        p.n_split = 1;
+        return dx12_run_mm(dev, cmd, "flash_attn_ext", &p, sizeof(p),
+                           q, k, v, dst,
+                           p.n_q, p.n_head, batch,
+                           mask ? mask : q);
+    }
+    p.n_split = n_split;
+
+    // ── Scratch: slots * n_split partials of (dv + 2) floats ──
+    size_t scratch_bytes = (size_t)slots * n_split * (p.dv + 2) * 4;
+    if (dev->fa_scratch_cap < scratch_bytes) {
+        if (dev->fa_scratch) dx12_buffer_destroy(dev->fa_scratch);
+        size_t cap = (scratch_bytes + 65535) & ~(size_t)65535;
+        dev->fa_scratch = dx12_buffer_create(dev, cap, dx12_heap_type::default_);
+        dev->fa_scratch_cap = dev->fa_scratch ? cap : 0;
+        if (!dev->fa_scratch) {
+            dx12_log(DX12_LOG_ERROR, "FA: scratch alloc failed (%zu bytes)", cap);
+            p.n_split = 1;
+            return dx12_run_mm(dev, cmd, "flash_attn_ext", &p, sizeof(p),
+                               q, k, v, dst,
+                               p.n_q, p.n_head, batch,
+                               mask ? mask : q);
+        }
+    }
+    dx12_buffer* scratch = dev->fa_scratch;
+    D3D12_GPU_VIRTUAL_ADDRESS scratch_va = scratch->resource->GetGPUVirtualAddress();
+
+    // ── Pass 1: fa_split — q,k,v,mask read; scratch written ──
+    {
+        const ggml_tensor* srcs[4] = { q, k, v, mask ? mask : q };
+        dx12_buffer* bufs[5] = {};
+        dx12_buffer* srv_bufs[4] = {};
+        struct dx12_shader_dispatch dispatch{};
+        for (uint32_t i = 0; i < 4; i++) {
+            srv_bufs[i] = dx12_backend_buffer_from_tensor(srcs[i]);
+            dispatch.srv_addr[i] = dx12_backend_tensor_gpu_addr(srcs[i]);
+            if (!srv_bufs[i] || !dispatch.srv_addr[i]) {
+                dx12_log(DX12_LOG_ERROR, "fa_split: source %u not bound", i);
+                return false;
+            }
+            bufs[i] = srv_bufs[i];
+        }
+        bufs[4] = scratch;
+        dispatch.uav_addr = scratch_va;
+
+        D3D12_RESOURCE_STATES states[5] = {
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+        };
+        uint64_t rlo[5], rhi[5];
+        for (uint32_t i = 0; i < 4; i++) {
+            rlo[i] = dispatch.srv_addr[i];
+            rhi[i] = rlo[i] + ggml_nbytes(srcs[i]);
+        }
+        rlo[4] = scratch_va;
+        rhi[4] = scratch_va + scratch_bytes;
+        dx12_barrier_pre_dispatch(cmd, cmd->barrier_tracker, bufs, states, 5,
+                                  rlo, rhi, 1u << 4);
+
+        dispatch.shader_name = "fa_split";
+        dispatch.sig_type = dx12_root_signature_type::mm;
+        dispatch.dispatch_x = p.n_q;
+        dispatch.dispatch_y = p.n_head;
+        dispatch.dispatch_z = batch * n_split;
+        if (!dx12_shader_dispatch(dev, cmd, dispatch, &p, sizeof(p), srv_bufs, 4, scratch)) {
+            return false;
+        }
+    }
+
+    // ── Pass 2: fa_combine — scratch read; dst written ──
+    {
+        struct {
+            uint32_t n_q, n_head, dv, n_split;
+            uint32_t dnb1, dnb2, dnb3, pad;
+        } pc{};
+        pc.n_q = p.n_q; pc.n_head = p.n_head; pc.dv = p.dv; pc.n_split = n_split;
+        pc.dnb1 = p.dnb1; pc.dnb2 = p.dnb2; pc.dnb3 = p.dnb3;
+
+        dx12_buffer* buf_d = dx12_backend_buffer_from_tensor(dst);
+        D3D12_GPU_VIRTUAL_ADDRESS dst_va = dx12_backend_tensor_gpu_addr(dst);
+        if (!buf_d || !dst_va) {
+            dx12_log(DX12_LOG_ERROR, "fa_combine: dst not bound");
+            return false;
+        }
+
+        dx12_buffer* bufs[2] = { scratch, buf_d };
+        D3D12_RESOURCE_STATES states[2] = {
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+        };
+        uint64_t rlo[2] = { scratch_va, dst_va };
+        uint64_t rhi[2] = { scratch_va + scratch_bytes, dst_va + ggml_nbytes(dst) };
+        dx12_barrier_pre_dispatch(cmd, cmd->barrier_tracker, bufs, states, 2,
+                                  rlo, rhi, 1u << 1);
+
+        struct dx12_shader_dispatch dispatch{};
+        dispatch.shader_name = "fa_combine";
+        dispatch.sig_type = dx12_root_signature_type::mm;
+        dispatch.srv_addr[0] = scratch_va;
+        dispatch.uav_addr = dst_va;
+        dispatch.dispatch_x = p.n_q;
+        dispatch.dispatch_y = p.n_head;
+        dispatch.dispatch_z = batch;
+        dx12_buffer* srvs[1] = { scratch };
+        return dx12_shader_dispatch(dev, cmd, dispatch, &pc, sizeof(pc), srvs, 1, buf_d);
+    }
 }
 
 // Can RMS_NORM at graph->nodes[i] fuse with the MUL at i+1?
