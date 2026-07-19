@@ -1,6 +1,0 @@
-// dx12_backend_exports.def — DLL exports for the DX12 backend
-EXPORTS
-    D3D12SDKVersion  DATA
-    D3D12SDKPath     DATA
-    ggml_backend_dx12_reg
-    ggml_backend_dx12_init

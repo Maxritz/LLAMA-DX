@@ -1063,16 +1063,16 @@ bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor
         dispatch.uav_addr    = c_base + (uint64_t)m0 * N * 4;   // C rows are N f32
         dispatch.dispatch_x = tile_n;
         dispatch.dispatch_y = (mc + tile - 1) / tile;
-        if (dev->gpu_timer && dx12_profile_enabled()) {
-            char chunk_name[64];
-            snprintf(chunk_name, sizeof(chunk_name), "%s.chunk.%u", shader_name, m0 / m_chunk);
-            dev->gpu_timer->begin(cmd, chunk_name);
-        }
+        // No per-chunk gpu_timer begin/end here: the caller (dx12_graph_compute)
+        // already wraps this whole dispatch in one begin/end pair keyed on
+        // current_query. dx12_gpu_timer has no nesting support (begin() writes
+        // to current_query without incrementing it, only end() advances), so a
+        // second begin/end pair issued in here overwrote the outer pair's query
+        // slot and desynced query_names from current_query for every op for
+        // the rest of the graph -- this was the source of the uniform ~0.007ms
+        // readings under DX12_PROFILE.
         if (!dx12_shader_dispatch(dev, cmd, dispatch, &params, sizeof(params), srvs, 2, buf_c)) {
             return false;
-        }
-        if (dev->gpu_timer && dx12_profile_enabled()) {
-            dev->gpu_timer->end(cmd);
         }
     }
     return true;
@@ -1373,6 +1373,20 @@ bool dx12_dispatch_flash_attn_ext(dx12_device* dev, dx12_command_list* cmd, ggml
 
     if (n_split <= 1 || batch * n_split > (uint32_t)DX12_MAX_GROUPS) {
         p.n_split = 1;
+
+        // Large-prefill path: full 2D tiling (32x32 Q/KV tile, mms_tiled-
+        // style) gets ~32x K/V reuse vs the TQ=4 path's ~4x. Needs n_q large
+        // enough to amortize a 32-row tile (else most of the tile is padding
+        // and the smaller TQ=4 kernel wins on occupancy).
+        const uint32_t tiled_tile = 32;
+        uint32_t tiled_groups_x = (p.n_q + tiled_tile - 1) / tiled_tile;
+        bool tiled_disabled = getenv("DX12_FA_NO_TILED") != nullptr;
+        if (!tiled_disabled && p.n_q >= tiled_tile && tiled_groups_x <= (uint32_t)DX12_MAX_GROUPS) {
+            return dx12_run_mm(dev, cmd, "flash_attn_ext_tiled", &p, sizeof(p),
+                               q, k, v, dst,
+                               tiled_groups_x, p.n_head, batch,
+                               mask ? mask : q);
+        }
 
         // Prefill fast path: TQ=4 query rows/group share K (registers) and
         // V (LDS-staged) VRAM reads instead of re-reading them per query —

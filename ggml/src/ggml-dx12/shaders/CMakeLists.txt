@@ -40,7 +40,6 @@ set(DX12_SHADERS
     diag_mask_inf
     flash_attn
     ffn_fused
-    fused_ffn_q4k
     fused_gemm_add_q4k
     get_rows
     permute

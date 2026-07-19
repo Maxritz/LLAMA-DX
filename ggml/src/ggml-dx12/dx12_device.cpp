@@ -17,11 +17,13 @@
 
 #include <windows.h>
 #include <d3d12sdklayers.h>
+#include <dxgidebug.h>
 #include <cstdio>
 #include <iostream>
 #include <sstream>
 #include <cstring>
 #include <algorithm>
+#include <vector>
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Agility SDK Exports — Tells Windows to load D3D12Core.dll from our package
@@ -242,6 +244,33 @@ void dx12_enable_debug_layer() {
 void dx12_disable_debug_layer() {
     // Debug layer can only be disabled before device creation
     dx12_log(DX12_LOG_VERBOSE, "Debug layer disable (no-op after device creation)");
+}
+
+void dx12_report_live_objects() {
+#ifdef DX12_DEBUG_LAYER
+    ComPtr<IDXGIDebug1> dxgi_debug;
+    if (FAILED(DXGIGetDebugInterface1(0, IID_PPV_ARGS(&dxgi_debug)))) return;
+    dxgi_debug->ReportLiveObjects(DXGI_DEBUG_ALL,
+        (DXGI_DEBUG_RLO_FLAGS)(DXGI_DEBUG_RLO_SUMMARY | DXGI_DEBUG_RLO_IGNORE_INTERNAL));
+
+    // ReportLiveObjects only writes to OutputDebugString, which is invisible
+    // in a headless run (no DebugView/debugger attached). Drain the same
+    // messages back out of the DXGI info queue and print them so the report
+    // is actually visible in stdout/stderr logs.
+    ComPtr<IDXGIInfoQueue> info_queue;
+    if (FAILED(DXGIGetDebugInterface1(0, IID_PPV_ARGS(&info_queue)))) return;
+    UINT64 n = info_queue->GetNumStoredMessages(DXGI_DEBUG_ALL);
+    for (UINT64 i = 0; i < n; i++) {
+        SIZE_T len = 0;
+        if (FAILED(info_queue->GetMessage(DXGI_DEBUG_ALL, i, nullptr, &len)) || len == 0) continue;
+        std::vector<char> buf(len);
+        auto* msg = reinterpret_cast<DXGI_INFO_QUEUE_MESSAGE*>(buf.data());
+        if (SUCCEEDED(info_queue->GetMessage(DXGI_DEBUG_ALL, i, msg, &len))) {
+            dx12_log(DX12_LOG_INFO, "[DXGI LIVE-OBJECT REPORT] %s", msg->pDescription);
+        }
+    }
+    info_queue->ClearStoredMessages(DXGI_DEBUG_ALL);
+#endif
 }
 
 void dx12_enable_gpu_validation() {
