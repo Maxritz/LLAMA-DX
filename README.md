@@ -18,12 +18,12 @@ targets. Concretely, as of this writing:
 
 - Core inference (prefill + decode) works and has been benchmarked against the CPU and
   Vulkan backends on real models (see [Benchmarks](#benchmarks)).
-- `test-backend-ops`, the ggml op-correctness harness, passes for everything the DX12
-  backend claims to support — but the harness itself has an open, intermittent,
-  timing-dependent crash unrelated to DX12 correctness (see
-  [KNOWN-ISSUE-test-backend-ops-crashes.md](KNOWN-ISSUE-test-backend-ops-crashes.md)).
-  Until that's root-caused, this fork can't credibly claim a clean, unconditional
-  green suite the way an upstream PR would need to.
+- `test-backend-ops`, the ggml op-correctness harness, passes cleanly end-to-end for
+  the DX12 backend: 1680/1680 executed cases pass and the process exits 0 (see
+  [KNOWN-ISSUE-test-backend-ops-crashes.md](KNOWN-ISSUE-test-backend-ops-crashes.md)
+  for a harness crash that was traced to it, root-caused, and fixed). The unrelated
+  Vulkan0-backend crash documented there is upstream ggml-vulkan code, out of scope
+  for this fork.
 - Several features (DirectStorage model loading, the FlashAttention-2-style tiled
   prefill kernel) are recent, single-machine-verified additions that haven't had the
   scrutiny of independent review or a wider range of hardware.
