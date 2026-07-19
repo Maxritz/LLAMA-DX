@@ -1525,6 +1525,39 @@ bool llama_model_loader::load_all_data(
             ggml_backend_name(upload_backend));
     }
 
+    // DirectStorage: narrow, isolated hook for true file->GPU async loads that
+    // bypass the CPU pinned-buffer staging path above entirely. Resolved via
+    // the generic backend proc-address mechanism so this file stays backend-
+    // agnostic (no DX12-specific includes/branches). No-ops on any backend
+    // that doesn't export these symbols.
+    ggml_backend_t ds_backend = nullptr;
+    bool (*ds_set_model_file)(ggml_backend_t, const char *) = nullptr;
+    bool (*ds_load_tensor_async)(ggml_backend_t, struct ggml_tensor *, uint64_t, uint64_t, size_t) = nullptr;
+    void (*ds_flush_and_wait)(ggml_backend_t) = nullptr;
+    std::string ds_open_path;
+
+    if (!use_mmap && !check_tensors) {
+        auto * ds_buf = bufs.count(0) ? bufs.at(0) : nullptr;
+        auto * ds_dev = ds_buf ? ggml_backend_buft_get_device(ggml_backend_buffer_get_type(ds_buf)) : nullptr;
+        if (ds_dev) {
+            auto * reg = ggml_backend_dev_backend_reg(ds_dev);
+            ds_set_model_file    = (decltype(ds_set_model_file))    ggml_backend_reg_get_proc_address(reg, "ggml_backend_dx12_set_model_file");
+            ds_load_tensor_async = (decltype(ds_load_tensor_async)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dx12_load_tensor_async");
+            ds_flush_and_wait    = (decltype(ds_flush_and_wait))    ggml_backend_reg_get_proc_address(reg, "ggml_backend_dx12_flush_and_wait");
+            if (ds_set_model_file && ds_load_tensor_async && ds_flush_and_wait) {
+                ds_backend = ggml_backend_dev_init(ds_dev, nullptr);
+                if (ds_backend) {
+                    LLAMA_LOG_DEBUG("%s: using DirectStorage async loads for device %s\n", __func__,
+                        ggml_backend_dev_name(ds_dev));
+                } else {
+                    ds_set_model_file = nullptr;
+                    ds_load_tensor_async = nullptr;
+                    ds_flush_and_wait = nullptr;
+                }
+            }
+        }
+    }
+
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
@@ -1580,8 +1613,20 @@ bool llama_model_loader::load_all_data(
                     }));
                 }
             } else {
+                bool ds_handled = false;
+                if (ds_backend) {
+                    if (ds_open_path != file->path()) {
+                        ds_open_path = ds_set_model_file(ds_backend, file->path()) ? file->path() : std::string();
+                    }
+                    if (!ds_open_path.empty()) {
+                        ds_handled = ds_load_tensor_async(ds_backend, cur, weight->offs, 0, n_size);
+                    }
+                }
+
                 // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
-                if (upload_backend) {
+                if (ds_handled) {
+                    // handled directly via DirectStorage above; nothing more to do
+                } else if (upload_backend) {
                     size_t offset = weight->offs;
                     alignment = file->read_alignment();
                     size_t aligned_offset = offset & ~(alignment - 1);
@@ -1657,6 +1702,11 @@ bool llama_model_loader::load_all_data(
         ggml_backend_buffer_free(buf);
     }
     ggml_backend_free(upload_backend);
+
+    if (ds_backend) {
+        ds_flush_and_wait(ds_backend);
+        ggml_backend_free(ds_backend);
+    }
 
     // check validation results
     bool validation_failed = false;

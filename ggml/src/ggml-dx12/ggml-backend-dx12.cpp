@@ -763,21 +763,29 @@ dx12_buffer* dx12_backend_buffer_from_tensor(const ggml_tensor* tensor) {
     return dx12_backend_get_gpu_buffer(tensor);
 }
 
+// Tensors of a given buffer share one underlying dx12_buffer/resource;
+// tensor->data only identifies where within that shared resource this
+// tensor's bytes actually live. Any caller writing/reading at the resource
+// level (DS async loads, GPU VA lookups) must add this offset -- using the
+// resource's base address alone silently aliases every tensor onto the
+// same bytes.
+static size_t dx12_backend_tensor_buffer_offset(const ggml_tensor* tensor, dx12_buffer* buf) {
+    void* mapped = dx12_buffer_map(buf);
+    if (mapped) {
+        return (const char*)tensor->data - (const char*)mapped;
+    }
+    if (buf->heap == dx12_heap_type::default_) {
+        return (uintptr_t)tensor->data - 0x1000;
+    }
+    return 0;
+}
+
 D3D12_GPU_VIRTUAL_ADDRESS dx12_backend_tensor_gpu_addr(const ggml_tensor* tensor) {
     dx12_buffer* buf = dx12_backend_get_gpu_buffer(tensor);
     if (!buf || !buf->resource) return 0;
 
     D3D12_GPU_VIRTUAL_ADDRESS base = buf->resource->GetGPUVirtualAddress();
-    void* mapped = dx12_buffer_map(buf);
-    if (mapped) {
-        size_t offset = (const char*)tensor->data - (const char*)mapped;
-        return base + offset;
-    }
-    if (buf->heap == dx12_heap_type::default_) {
-        size_t offset = (uintptr_t)tensor->data - 0x1000;
-        return base + offset;
-    }
-    return base;
+    return base + dx12_backend_tensor_buffer_offset(tensor, buf);
 }
 
 static dx12_buffer* dx12_backend_get_gpu_buffer(const ggml_tensor* t) {
@@ -1163,8 +1171,13 @@ bool ggml_backend_dx12_load_tensor_async(ggml_backend_t backend,
     dx12_buffer* gpu_buf = dx12_backend_buffer_from_tensor(tensor);
     if (!gpu_buf) return false;
 
-    return dx12_ds_read_tensor_async(ctx->device->ds_ctx, gpu_buf, 
-                                        file_offset, size, dst_offset);
+    // dst_offset is relative to this tensor's own data (matching the
+    // ggml_backend_tensor_set_async convention); translate to the shared
+    // resource's byte offset before handing it to DirectStorage.
+    uint64_t buf_offset = dx12_backend_tensor_buffer_offset(tensor, gpu_buf) + dst_offset;
+
+    return dx12_ds_read_tensor_async(ctx->device->ds_ctx, gpu_buf,
+                                        file_offset, size, buf_offset);
 }
 
 void ggml_backend_dx12_flush_and_wait(ggml_backend_t backend) {

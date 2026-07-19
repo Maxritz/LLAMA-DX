@@ -13,6 +13,9 @@
 #include <cstring>
 #include <thread>
 #include <unordered_map>
+#include <algorithm>
+#include <vector>
+#include <mutex>
 
 using Microsoft::WRL::ComPtr;
 
@@ -23,6 +26,11 @@ using Microsoft::WRL::ComPtr;
 // Internal Context Structure
 // ============================================================================
 
+// DirectStorage requests are capped at the 32MB staging buffer size (the
+// max the DSTORAGE_STAGING_BUFFER_SIZE enum offers); tensors are commonly
+// 100-200MB, so every read must be chunked under that limit.
+static constexpr size_t DX12_DS_MAX_REQUEST_SIZE = 16 * 1024 * 1024;
+
 struct dx12_ds_context {
     ComPtr<IDStorageFactory> factory;
     ComPtr<IDStorageQueue>    file_queue;
@@ -30,6 +38,17 @@ struct dx12_ds_context {
     dx12_device*             device = nullptr;
     bool                     available = false;
     uint32_t                 queue_capacity = 256;
+
+    // Dedicated fence for DS completion. Must NOT reuse dev->fence or
+    // dev->copy_fence: EnqueueSignal() writes to this specific fence object,
+    // and dx12_device_wait_for_fence() waits on dev->fence's own counter --
+    // two unrelated fences with independent counters. Waiting on the wrong
+    // one either returns immediately (if dev->fence's counter happens to
+    // already be past the waited value from unrelated GPU work) or blocks/
+    // times out even after DS has actually finished.
+    ComPtr<ID3D12Fence>      fence;
+    HANDLE                   fence_event = nullptr;
+    uint64_t                 fence_counter = 0;
 };
 
 // ============================================================================
@@ -154,6 +173,15 @@ dx12_ds_context* dx12_ds_init(dx12_device* dev) {
         return nullptr;
     }
 
+    hr = dev->device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&ctx->fence));
+    if (FAILED(hr)) {
+        dx12_log(DX12_LOG_INFO, "DirectStorage fence creation failed: 0x%08X", hr);
+        ctx->file_queue.Reset();
+        delete ctx;
+        return nullptr;
+    }
+    ctx->fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+
     ctx->available = true;
     g_ds_contexts[dev] = ctx;
     dx12_log(DX12_LOG_INFO, "DirectStorage initialized");
@@ -180,36 +208,51 @@ bool dx12_ds_read_tensor_async(dx12_ds_context* ctx,
         return false;
     }
 
-    // Destination buffer must be in COMMON state for DirectStorage to write
-    // The caller should have transitioned it before calling this function
+    // Destination buffer must be in COMMON state for DirectStorage to write.
+    // Freshly-allocated DEFAULT-heap buffers already start in COMMON (see
+    // dx12_heap_type_default_state), so this is normally a no-op; it only
+    // does real work if this buffer's pool slot was previously used by a
+    // dispatch that left it in a different state (e.g. a reload/model-swap
+    // reusing pooled memory).
+    if (dst->state != D3D12_RESOURCE_STATE_COMMON) {
+        dx12_command_list* cmd = dx12_cmd_list_create(ctx->device);
+        if (cmd) {
+            dx12_buffer_transition(cmd, dst, D3D12_RESOURCE_STATE_COMMON);
+            dx12_cmd_list_close(cmd);
+            dx12_cmd_list_submit_and_wait(cmd);
+            dx12_cmd_list_destroy(cmd);
+        }
+    }
 
-    // Create DirectStorage request: file -> GPU buffer directly
-    DSTORAGE_REQUEST req{};
-    
-    // Source: file at offset
-    req.Source.File.Source = ctx->gguf_file.Get();
-    req.Source.File.Offset = file_offset;
-    req.Source.File.Size = (UINT32)size;
-
-    // Destination: GPU buffer
-    req.Destination.Buffer.Resource = dst->resource.Get();
-    req.Destination.Buffer.Offset = dst_offset;
-    req.Destination.Buffer.Size = (UINT32)size;
-    
-    req.Options.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
-    req.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_BUFFER;
-
-    // Queue the request
-    ctx->file_queue->EnqueueRequest(&req);
-
-    // Track for GPU completion signaling
     std::lock_guard<std::mutex> lock(g_pending_mutex);
     auto& pending = g_pending_requests[ctx->device];
-    pending.requests.push_back({dst_offset, size, dst, false});
 
-    dx12_log(DX12_LOG_VERBOSE, "DS: queued file read %llu bytes -> GPU offset %llu", 
+    // Chunk into <=DX12_DS_MAX_REQUEST_SIZE pieces -- DS requests are capped
+    // by the 32MB staging buffer; tensors routinely exceed that.
+    for (size_t done = 0; done < size; ) {
+        size_t chunk = (std::min)(DX12_DS_MAX_REQUEST_SIZE, size - done);
+
+        DSTORAGE_REQUEST req{};
+        req.Source.File.Source = ctx->gguf_file.Get();
+        req.Source.File.Offset = file_offset + done;
+        req.Source.File.Size = (UINT32)chunk;
+
+        req.Destination.Buffer.Resource = dst->resource.Get();
+        req.Destination.Buffer.Offset = dst_offset + done;
+        req.Destination.Buffer.Size = (UINT32)chunk;
+
+        req.Options.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
+        req.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_BUFFER;
+
+        ctx->file_queue->EnqueueRequest(&req);
+        pending.requests.push_back({dst_offset + done, chunk, dst, false});
+
+        done += chunk;
+    }
+
+    dx12_log(DX12_LOG_VERBOSE, "DS: queued file read %llu bytes -> GPU offset %llu",
               (unsigned long long)size, (unsigned long long)dst_offset);
-    
+
     return true;
 }
 
@@ -227,20 +270,20 @@ void dx12_ds_flush_pending(dx12_ds_context* ctx, bool wait_for_completion) {
     // Submit all queued DirectStorage requests
     ctx->file_queue->Submit();
 
-    // Signal fence after DS completes
-    if (ctx->device->fence) {
-        uint64_t fence_val = ctx->device->fence_value.fetch_add(1);
-        ctx->file_queue->EnqueueSignal(ctx->device->copy_fence ? 
-                                       ctx->device->copy_fence.Get() : 
-                                       ctx->device->fence.Get(), fence_val);
-        ctx->file_queue->Submit();
-        pending.fence_value = fence_val;
-    }
+    // Signal our dedicated fence after DS completes -- must not share
+    // dev->fence/copy_fence, whose counters belong to unrelated GPU work.
+    uint64_t fence_val = ++ctx->fence_counter;
+    ctx->file_queue->EnqueueSignal(ctx->fence.Get(), fence_val);
+    ctx->file_queue->Submit();
+    pending.fence_value = fence_val;
 
     // If wait requested, block until fence signals
     if (wait_for_completion && pending.fence_value > 0) {
-        dx12_device_wait_for_fence(ctx->device, pending.fence_value);
-        
+        if (ctx->fence->GetCompletedValue() < pending.fence_value) {
+            ctx->fence->SetEventOnCompletion(pending.fence_value, ctx->fence_event);
+            WaitForSingleObject(ctx->fence_event, INFINITE);
+        }
+
         // After DS completes, transition buffers to proper state for shaders
         // This is handled by DirectStorage when writing to GPU buffer - no manual transition needed
         // The buffer will be in COMMON state after DS write
@@ -255,13 +298,13 @@ void dx12_ds_flush_pending(dx12_ds_context* ctx, bool wait_for_completion) {
 }
 
 bool dx12_ds_is_complete(dx12_ds_context* ctx) {
-    if (!ctx || !ctx->available || !ctx->device->copy_fence) return true;
-    
+    if (!ctx || !ctx->available || !ctx->fence) return true;
+
     std::lock_guard<std::mutex> lock(g_pending_mutex);
     auto it = g_pending_requests.find(ctx->device);
     if (it == g_pending_requests.end()) return true;
-    
-    uint64_t completed = ctx->device->copy_fence->GetCompletedValue();
+
+    uint64_t completed = ctx->fence->GetCompletedValue();
     return completed >= it->second.fence_value;
 }
 
@@ -269,6 +312,10 @@ void dx12_ds_shutdown(dx12_ds_context* ctx) {
     if (!ctx) return;
     dx12_ds_close_file(ctx);
     if (ctx->file_queue) ctx->file_queue->Close();
+    if (ctx->fence_event) {
+        CloseHandle(ctx->fence_event);
+        ctx->fence_event = nullptr;
+    }
     {
         std::lock_guard<std::mutex> lock(g_pending_mutex);
         g_pending_requests.erase(ctx->device);
