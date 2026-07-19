@@ -116,6 +116,11 @@ struct dx12_device {
     // DirectStorage context (for async model file loading)
     dx12_ds_context*                ds_ctx = nullptr;
 
+    // Flash-attention split-KV scratch (per-split partials {m,l,o[dv]}),
+    // grown on demand, process-lifetime like the device itself
+    struct dx12_buffer*             fa_scratch = nullptr;
+    size_t                          fa_scratch_cap = 0;
+
     // Deferred staging buffers: upload buffers kept alive until GPU queue is idle,
     // then destroyed. Prevents RDNA4 compute-queue driver crash (HOW-TO-FIX #10).
     std::vector<dx12_buffer*>       pending_staging;

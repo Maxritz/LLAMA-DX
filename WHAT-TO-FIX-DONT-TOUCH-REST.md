@@ -95,6 +95,103 @@ STRUCTURAL GEMM — ATTEMPTED, NEGATIVE RESULT (kept v2):
   already on) or double-buffered LDS, and the honest endgame vs Vulkan
   coopmat needs DXLA (blocked on this driver).
 
+## PROGRESS UPDATE 4 (2026-07-18 session 5): FLASH_ATTN_EXT v1
+
+IMPLEMENTED AND CORRECT, GATED OPT-IN (DX12_ENABLE_FA=1):
+- shaders/flash_attn_ext.hlsl: fused attention with online softmax. One
+  256-thread group per (query, head, batch); 8 Wave32 subwaves score 8 KV
+  rows per iteration; dv-length accumulator in LDS; NaN-safe running max
+  (finite init, -inf mask weights collapse to 0). Supports F32 q + F16 k/v
+  (contiguous rows), optional F16 mask, GQA, differing dk/dv, head dims
+  <= 256. Rejected (CPU fallback): sinks, ALiBi max_bias, logit_softcap,
+  quantized/BF16 KV, permuted layouts, MLA hs 576.
+- Plumbing: mm root signature widened to 5 root UAVs (q,k,v,mask,dst);
+  dx12_run_mm takes an optional 4th source; when mask is absent q is bound
+  in the mask slot so shader register layout stays fixed.
+- Gates: test-backend-ops FLASH_ATTN_EXT 553/553 claimed cases pass; full
+  suite 2233 OK / 0 FAIL with FA on, 1681/0 with it off; defaults unchanged
+  (pp512 5378 / tg128 210 on 1B).
+
+WHY IT IS GATED: perf is not there yet, and llama.cpp "-fa auto" would
+auto-select FA the moment the op is claimed:
+- pp512 1B: 3282 (FA) vs 5324 (mms path) — one group per query row has no
+  KV reuse across queries.
+- tg64 @ d4096: 38 (FA) vs 98 (mms path) — decode spawns only n_head=32
+  groups on a 64-CU GPU; most of the chip idles while each group serially
+  streams 4096 KV rows, and the update phase only keeps dv(=64) of 256
+  threads busy.
+FA v2 design (the actual win): split-KV — dispatch (head, kv_chunk) groups
+writing (m, l, o_partial) to a scratch buffer, then a small combine pass;
+prefill additionally wants multi-query tiles (process 8-16 q rows per group
+so K/V loads amortize). Needs a backend scratch allocation sized
+n_head * n_splits * (dv + 2) floats.
+
+UPDATE (session 6): FA v2 split-KV LANDED — fa_split.hlsl + fa_combine.hlsl
++ device-lifetime scratch (dev->fa_scratch, grown on demand), used when
+n_q*n_head*batch < 256 groups and n_kv >= 256 (>=128 KV rows per split,
+<= 16 splits). Verified: FA suite 553/553 with splits active, full suite
+2233/0, default path untouched.
+Perf: tg64 @ d4096 = 125.5 t/s WITH FA vs 101.8 without — long-context
+decode now wins by 23% (v1 was 38 t/s). Still behind at short context
+(tg128 186 vs 208; pp512 3242 vs 5324) so DX12_ENABLE_FA stays opt-in.
+Remaining for default-on: multi-query prefill tiles (8-16 q rows per group
+sharing K/V loads) and a small-KV fast path. Note: shape-conditional
+op claims do NOT work as a dodge — a rejected shape falls back to CPU
+attention (far slower than our mms path), not to mms.
+
+## PROGRESS UPDATE 5 (2026-07-18 session 6b): TurboQuant FWHT fast path
+
+TurboQuant (github.com/TheTom/turboquant_plus, ICLR 2026 KV-cache
+compression) status in this tree:
+- The upstream llama.cpp/ggml half was ALREADY merged in: llama-kv-cache.cpp
+  generates orthonormal Walsh-Hadamard rotation tensors (DeepSeek lightning
+  indexers + rotated quantized KV) and tags the rotation matmul with
+  GGML_HINT_SRC0_IS_HADAMARD (op_params[1]); CUDA/Vulkan/CPU have dedicated
+  FWHT fast paths. The DX12 backend was already CORRECT here (it ran the
+  hinted node as a plain matmul of the materialized matrix) but slow.
+- NOW ADDED: shaders/fwht_row.hlsl + dx12_dispatch_fwht — O(n log n)
+  butterfly in LDS (pow2 n up to 1024, scale 1/sqrt(n) on load, pair
+  (p,q)->(p+q,p-q), semantics mirrored from ggml-cuda/fwht.cu), hooked at
+  the top of dx12_dispatch_mul_mat on the hint; any shape that does not fit
+  falls back to the generic matmul (still correct).
+- Gates: test-backend-ops MUL_MAT_HADAMARD 7/7, full suite 1681/0.
+- NOT in this tree from TurboQuant: nothing else missing on our side — the
+  Python research repo itself is not something to vendor; quantized KV cache
+  types for FA (q8_0/q4_0 KV) remain future FA work already listed below.
+
+## PROGRESS UPDATE 6 (2026-07-19 session 7): multi-query FA prefill tiles
+
+shaders/flash_attn_ext_mq.hlsl: TQ=4 query rows per group share one K/V
+stream — K rows read into registers once per group (not once per query)
+and dotted against all TQ queries; V rows staged through LDS once per KV
+chunk and reused by all TQ queries' accumulation. Selected automatically
+by the dispatcher whenever n_q >= 4 and the split-KV path isn't in play
+(i.e. prefill; decode's n_q==1 is unaffected). Debug override:
+DX12_FA_NO_MQ=1 forces the old single-query kernel for A/B testing.
+Gates: FLASH_ATTN_EXT suite 553/553, full suite 1681/0 (FA off) and
+2233/0 (FA on).
+
+HONEST RESULT — closes SOME of the gap, not enough to flip the default:
+DX12-only, RX 9070 XT, 1B Q8_0:
+| Path                    | pp512 | pp4096 |
+|--------------------------|------:|-------:|
+| mms_tiled (FA off, baseline) | 5435  |  4167  |
+| FA single-query (v1)     |  3291  |  1099  |
+| FA multi-query (TQ=4)    |  3221  |  1218  |
+
+TQ=4 gives +11% over single-query at pp4096 (the shape where FA's KV-reuse
+matters most) and is roughly noise-neutral at pp512 — a real but small
+win. It does NOT close the gap to mms_tiled: FA is still ~3-4x behind at
+every prefill length tested. Root cause: mms_tiled's LDS tile gives ~64x
+K/V reuse (its 64x64 output tile); TQ=4 gives only 4x. Matching mms_tiled's
+reuse would need TQ on the order of 64 — a full 2D-tiled flash-attention
+rewrite (BLOCK_M/BLOCK_N score tile in registers, closer to
+FlashAttention-2's structure) rather than a register-count bump. That is
+future work if someone wants FA competitive at prefill; the decode
+split-KV win from session 6 (tg64@d4096: 125.5 vs 101.8, +23%) is
+unaffected by any of this and remains the reason FA is worth keeping.
+DX12_ENABLE_FA stays opt-in — prefill is still faster through mms_tiled.
+
 ## STILL OPEN
 
 - FIX 1 step 5: structural GEMM (8x8 register tile / 128x128, TILE_K 64,
