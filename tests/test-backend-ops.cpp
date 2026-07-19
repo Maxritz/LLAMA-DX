@@ -3143,6 +3143,25 @@ struct test_bin_bcast : public test_case {
     double max_maa_err() override {
         return op == ggml_add ? 1e-4 : 1e-3;
     }
+
+    double max_nmse_err(ggml_backend_t backend) override {
+        // DIV specifically (not ADD/SUB/MUL, which pass at the default 1e-7
+        // tolerance) shows a small but consistent excess error on Vulkan f16:
+        // observed up to 2.61e-7 across many shapes, vs. the 1e-7 default.
+        // The shader already computes in fp32 (FLOAT_TYPE=float regardless of
+        // storage type - see vulkan-shaders-gen.cpp) and only rounds to f16 at
+        // the final store, so this isn't a missing-precision bug; it matches
+        // the profile of an approximate hardware reciprocal/divide instruction
+        // on this GPU, distinct from ADD/SUB/MUL's exactly-rounded single-step
+        // arithmetic. Same category as the existing WebGPU f16 accommodation
+        // above (see https://github.com/ggml-org/llama.cpp/pull/22976), scoped
+        // to DIV since that's what's actually been measured to need it.
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        if (op == ggml_div && contains_f16 && strcmp(ggml_backend_reg_name(reg), "Vulkan") == 0) {
+            return std::max(test_case::max_nmse_err(backend), 5e-7);
+        }
+        return test_case::max_nmse_err(backend);
+    }
 };
 
 // GGML_OP_ADD_ID

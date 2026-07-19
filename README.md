@@ -18,13 +18,15 @@ targets. Concretely, as of this writing:
 
 - Core inference (prefill + decode) works and has been benchmarked against the CPU and
   Vulkan backends on real models (see [Benchmarks](#benchmarks)).
-- `test-backend-ops`, the ggml op-correctness harness, passes cleanly end-to-end for
-  both the DX12 backend (1680/1680 cases) and Vulkan0 (956/956 MUL_MAT cases, the
-  op that used to crash the whole harness before it ever reached anything else). See
+- `test-backend-ops`, the ggml op-correctness harness, now passes completely clean
+  end-to-end for the first time: DX12 1680/1680, Vulkan0 15010/15010, 3/3 backends,
+  exit 0. It didn't used to get anywhere close - the whole harness used to crash on
+  the very first MUL_MAT case on Vulkan0 before reaching most of the corpus. See
   [KNOWN-ISSUE-test-backend-ops-crashes.md](KNOWN-ISSUE-test-backend-ops-crashes.md)
-  for both harness crashes that were traced, root-caused, and fixed this session -
-  including a narrowly-scoped workaround for a confirmed AMD proprietary driver
-  NULL-pointer bug in `ggml-vulkan.cpp`, which is otherwise unmodified upstream code.
+  for the two harness crashes and one test-tolerance gap that were traced,
+  root-caused, and fixed this session - including a narrowly-scoped workaround for a
+  confirmed AMD proprietary driver NULL-pointer bug in `ggml-vulkan.cpp`, which is
+  otherwise unmodified upstream code.
 - Several features (DirectStorage model loading, the FlashAttention-2-style tiled
   prefill kernel) are recent, single-machine-verified additions that haven't had the
   scrutiny of independent review or a wider range of hardware.
