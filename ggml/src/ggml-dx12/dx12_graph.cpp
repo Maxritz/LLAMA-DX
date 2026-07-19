@@ -889,6 +889,32 @@ static bool dx12_dispatch_mul_mat_strided(dx12_device* dev, dx12_command_list* c
                        (uint32_t)(dst->ne[2] * dst->ne[3]));
 }
 
+// FWHT fast path for MUL_MAT nodes hinted GGML_HINT_SRC0_IS_HADAMARD
+// (TurboQuant / DeepSeek rotation): src0 is a materialized orthonormal
+// Hadamard matrix, so dst = row-wise WHT(src1) * 1/sqrt(n) — O(n log n)
+// butterflies, src0 never read. Mirrors ggml-cuda/fwht.cu. Returns false
+// when the shape does not fit; caller falls through to the generic matmul,
+// which multiplies the materialized matrix and is equally correct.
+static bool dx12_dispatch_fwht(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
+    const ggml_tensor* b = dst->src[1];
+    if (b->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
+    if (!ggml_is_contiguous(b) || !ggml_is_contiguous(dst)) return false;
+    if (!ggml_are_same_shape(b, dst)) return false;
+    uint32_t n = (uint32_t)b->ne[0];
+    if (n < 2 || n > 1024 || (n & (n - 1)) != 0) return false;   // pow2, fits LDS
+    uint64_t rows64 = (uint64_t)ggml_nrows(b);
+    if (rows64 == 0 || rows64 > (uint64_t)DX12_MAX_GROUPS) return false;
+
+    struct { uint32_t n, rows; float scale; uint32_t pad; } p{};
+    p.n = n;
+    p.rows = (uint32_t)rows64;
+    p.scale = 1.0f / sqrtf((float)n);
+
+    return dx12_run_mm(dev, cmd, "fwht_row", &p, sizeof(p),
+                       b, nullptr, nullptr, dst,
+                       p.rows, 1, 1);
+}
+
 // MUL_MAT: matrix multiplication (the critical path)
 // C[t*N + o] = dot(A[o,:], B[t,:]) with A = src0 weights (N x K),
 // B = src1 activations (M x K, F32), C = dst (M x N, F32).
@@ -896,6 +922,12 @@ static bool dx12_dispatch_mul_mat_strided(dx12_device* dev, dx12_command_list* c
 bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
     ggml_tensor* a = dst->src[0];
     ggml_tensor* b = dst->src[1];
+
+    // Hinted Hadamard rotation: O(n log n) FWHT instead of the matmul
+    if (ggml_get_op_params_i32(dst, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+        dx12_dispatch_fwht(dev, cmd, dst)) {
+        return true;
+    }
 
     if (!dx12_mul_mat_is_fast2d(dst)) {
         return dx12_dispatch_mul_mat_strided(dev, cmd, dst);

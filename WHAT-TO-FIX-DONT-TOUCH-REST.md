@@ -139,6 +139,26 @@ sharing K/V loads) and a small-KV fast path. Note: shape-conditional
 op claims do NOT work as a dodge — a rejected shape falls back to CPU
 attention (far slower than our mms path), not to mms.
 
+## PROGRESS UPDATE 5 (2026-07-18 session 6b): TurboQuant FWHT fast path
+
+TurboQuant (github.com/TheTom/turboquant_plus, ICLR 2026 KV-cache
+compression) status in this tree:
+- The upstream llama.cpp/ggml half was ALREADY merged in: llama-kv-cache.cpp
+  generates orthonormal Walsh-Hadamard rotation tensors (DeepSeek lightning
+  indexers + rotated quantized KV) and tags the rotation matmul with
+  GGML_HINT_SRC0_IS_HADAMARD (op_params[1]); CUDA/Vulkan/CPU have dedicated
+  FWHT fast paths. The DX12 backend was already CORRECT here (it ran the
+  hinted node as a plain matmul of the materialized matrix) but slow.
+- NOW ADDED: shaders/fwht_row.hlsl + dx12_dispatch_fwht — O(n log n)
+  butterfly in LDS (pow2 n up to 1024, scale 1/sqrt(n) on load, pair
+  (p,q)->(p+q,p-q), semantics mirrored from ggml-cuda/fwht.cu), hooked at
+  the top of dx12_dispatch_mul_mat on the hint; any shape that does not fit
+  falls back to the generic matmul (still correct).
+- Gates: test-backend-ops MUL_MAT_HADAMARD 7/7, full suite 1681/0.
+- NOT in this tree from TurboQuant: nothing else missing on our side — the
+  Python research repo itself is not something to vendor; quantized KV cache
+  types for FA (q8_0/q4_0 KV) remain future FA work already listed below.
+
 ## STILL OPEN
 
 - FIX 1 step 5: structural GEMM (8x8 register tile / 128x128, TILE_K 64,

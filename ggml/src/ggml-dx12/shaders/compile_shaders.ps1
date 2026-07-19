@@ -138,6 +138,7 @@ $Shaders = @(
     @{Name="flash_attn_ext"; Threads=@{X=256;Y=1;Z=1}},
     @{Name="fa_split"; Threads=@{X=256;Y=1;Z=1}},
     @{Name="fa_combine"; Threads=@{X=256;Y=1;Z=1}},
+    @{Name="fwht_row"; Threads=@{X=256;Y=1;Z=1}},
     # GEMM (tile-based prefill, M>1)
     @{Name="mm_f32"; Threads=@{X=16;Y=16;Z=1}},
     @{Name="mm_f16"; Threads=@{X=16;Y=16;Z=1}},
