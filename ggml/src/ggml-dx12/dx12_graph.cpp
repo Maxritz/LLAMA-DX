@@ -1374,6 +1374,20 @@ bool dx12_dispatch_flash_attn_ext(dx12_device* dev, dx12_command_list* cmd, ggml
     if (n_split <= 1 || batch * n_split > (uint32_t)DX12_MAX_GROUPS) {
         p.n_split = 1;
 
+        // Large-prefill path: full 2D tiling (32x32 Q/KV tile, mms_tiled-
+        // style) gets ~32x K/V reuse vs the TQ=4 path's ~4x. Needs n_q large
+        // enough to amortize a 32-row tile (else most of the tile is padding
+        // and the smaller TQ=4 kernel wins on occupancy).
+        const uint32_t tiled_tile = 32;
+        uint32_t tiled_groups_x = (p.n_q + tiled_tile - 1) / tiled_tile;
+        bool tiled_disabled = getenv("DX12_FA_NO_TILED") != nullptr;
+        if (!tiled_disabled && p.n_q >= tiled_tile && tiled_groups_x <= (uint32_t)DX12_MAX_GROUPS) {
+            return dx12_run_mm(dev, cmd, "flash_attn_ext_tiled", &p, sizeof(p),
+                               q, k, v, dst,
+                               tiled_groups_x, p.n_head, batch,
+                               mask ? mask : q);
+        }
+
         // Prefill fast path: TQ=4 query rows/group share K (registers) and
         // V (LDS-staged) VRAM reads instead of re-reading them per query —
         // ~4x less K/V traffic, which is what makes prefill bandwidth-bound.

@@ -136,6 +136,7 @@ $Shaders = @(
     @{Name="mv_id"; Threads=@{X=256;Y=1;Z=1}},
     @{Name="flash_attn_ext"; Threads=@{X=256;Y=1;Z=1}},
     @{Name="flash_attn_ext_mq"; Threads=@{X=256;Y=1;Z=1}},
+    @{Name="flash_attn_ext_tiled"; Threads=@{X=16;Y=16;Z=1}},
     @{Name="fa_split"; Threads=@{X=256;Y=1;Z=1}},
     @{Name="fa_combine"; Threads=@{X=256;Y=1;Z=1}},
     @{Name="fwht_row"; Threads=@{X=256;Y=1;Z=1}},
