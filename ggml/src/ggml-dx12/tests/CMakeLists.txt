@@ -46,14 +46,19 @@ foreach(TEST_SRC ${TEST_SOURCES})
             ${CMAKE_CURRENT_SOURCE_DIR}/../dx12_ds.cpp
             ${CMAKE_CURRENT_BINARY_DIR}/../dx12_shader_registry.cpp
         )
-        target_compile_definitions(${TEST_NAME} PRIVATE GGML_BACKEND_DL GGML_BACKEND_BUILD GGML_BACKEND_SHARED)
+        target_compile_definitions(${TEST_NAME} PRIVATE GGML_BACKEND_DL GGML_BACKEND_BUILD GGML_BACKEND_SHARED
+            $<$<CONFIG:Debug>:DX12_DEBUG_LAYER>
+            $<$<CONFIG:Debug>:DX12_GPU_VALIDATION>
+            $<IF:$<BOOL:${DX12_FORCE_DEBUG_LAYER}>,DX12_DEBUG_LAYER,>
+            $<IF:$<BOOL:${DX12_FORCE_DEBUG_LAYER}>,DX12_GPU_VALIDATION,>
+        )
         target_include_directories(${TEST_NAME} PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/..
             ${CMAKE_CURRENT_SOURCE_DIR}/../..
             ${CMAKE_CURRENT_BINARY_DIR}/..
             E:/DXllama/ds14/native/include
         )
-        target_link_libraries(${TEST_NAME} PRIVATE ggml-base d3d12.lib dxgi.lib dxcompiler.lib d3dcompiler.lib dstorage.lib)
+        target_link_libraries(${TEST_NAME} PRIVATE ggml-base d3d12.lib dxgi.lib dxguid.lib dxcompiler.lib d3dcompiler.lib dstorage.lib)
         add_dependencies(${TEST_NAME} dx12_shaders)
     else()
         target_link_libraries(${TEST_NAME} PRIVATE ggml-dx12 d3dcompiler.lib)

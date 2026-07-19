@@ -218,6 +218,12 @@ void dx12_disable_debug_layer();
 void dx12_enable_gpu_validation();
 void dx12_set_info_queue_break_on_error(dx12_device* dev);
 
+// Dumps any still-alive D3D12/DXGI objects to the debug output (OutputDebugString,
+// visible via DebugView or an attached debugger). No-op unless the debug layer
+// was enabled. Call after every dx12_device has been destroyed to confirm process
+// teardown left nothing behind.
+void dx12_report_live_objects();
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Agility SDK Export
 // ═══════════════════════════════════════════════════════════════════════════════

@@ -250,6 +250,25 @@ static std::unordered_map<uint32_t, dx12_device*> g_dx12_device_cache;
 static std::mutex g_upload_batch_mutex;
 static std::unordered_map<dx12_device*, dx12_upload_batch> g_upload_batches;
 
+// The device cache is a process-lifetime singleton (see ggml_backend_dx12_free
+// below, BUG 4): nothing ever calls dx12_device_destroy on process exit, so
+// under -DDX12_FORCE_DEBUG_LAYER=ON the debug runtime's automatic teardown
+// report flags the still-live device/queue/heap as a leak. Registering one
+// atexit cleanup (once, on first device creation) releases them properly
+// without reintroducing BUG 4: this runs after main() returns, i.e. after
+// llama.cpp has already freed every backend and context that could use the
+// device.
+static bool g_dx12_atexit_registered = false;
+
+static void dx12_atexit_cleanup_devices() {
+    std::lock_guard<std::mutex> lk(g_dx12_device_cache_mutex);
+    for (auto& [idx, dev] : g_dx12_device_cache) {
+        dx12_device_destroy(dev);
+    }
+    g_dx12_device_cache.clear();
+    dx12_report_live_objects();
+}
+
 static dx12_device* dx12_get_or_create_device(uint32_t adapter_idx) {
     std::lock_guard<std::mutex> lk(g_dx12_device_cache_mutex);
     auto it = g_dx12_device_cache.find(adapter_idx);
@@ -272,6 +291,10 @@ static dx12_device* dx12_get_or_create_device(uint32_t adapter_idx) {
     dx12_result result = dx12_device_create((int32_t)adapter_idx, &dev);
     if (result != DX12_OK) return nullptr;
     g_dx12_device_cache[adapter_idx] = dev;
+    if (!g_dx12_atexit_registered) {
+        std::atexit(dx12_atexit_cleanup_devices);
+        g_dx12_atexit_registered = true;
+    }
     return dev;
 }
 

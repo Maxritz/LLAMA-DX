@@ -108,6 +108,7 @@ target_link_libraries(ggml-dx12
     PUBLIC
         d3d12.lib
         dxgi.lib
+        dxguid.lib
         dxcompiler.lib
         dstorage.lib
 )
@@ -177,18 +178,9 @@ set(DX12_SHADERS
     mul_mat_batched
     mul_mat_strided
     mm_f32
-    mm_f32_tiled
     mm_f16
-    mm_f16_tiled
     mm_q8_0
     mm_q4_0
-    mm_q5_0
-    mm_q4_0_prefill
-    mm_q5_0_prefill
-    mm_q8_0_prefill
-    mm_q4_k_prefill
-    mm_q5_k_prefill
-    mm_q6_k_prefill
     mm_tiled
     mms_f32
     mms_f16
@@ -260,9 +252,7 @@ set(DX12_SHADER_THREAD_GROUPS
     mul_mat_batched,8,8,4
     mul_mat_strided,16,16,1
     mm_f32,16,16,1
-    mm_f32_tiled,16,16,1
     mm_f16,16,16,1
-    mm_f16_tiled,16,16,1
     mm_q8_0,16,16,1
     mm_q4_0,16,16,1
     mms_f32,16,16,1
