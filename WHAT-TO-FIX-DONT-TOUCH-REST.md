@@ -159,6 +159,39 @@ compression) status in this tree:
   Python research repo itself is not something to vendor; quantized KV cache
   types for FA (q8_0/q4_0 KV) remain future FA work already listed below.
 
+## PROGRESS UPDATE 6 (2026-07-19 session 7): multi-query FA prefill tiles
+
+shaders/flash_attn_ext_mq.hlsl: TQ=4 query rows per group share one K/V
+stream — K rows read into registers once per group (not once per query)
+and dotted against all TQ queries; V rows staged through LDS once per KV
+chunk and reused by all TQ queries' accumulation. Selected automatically
+by the dispatcher whenever n_q >= 4 and the split-KV path isn't in play
+(i.e. prefill; decode's n_q==1 is unaffected). Debug override:
+DX12_FA_NO_MQ=1 forces the old single-query kernel for A/B testing.
+Gates: FLASH_ATTN_EXT suite 553/553, full suite 1681/0 (FA off) and
+2233/0 (FA on).
+
+HONEST RESULT — closes SOME of the gap, not enough to flip the default:
+DX12-only, RX 9070 XT, 1B Q8_0:
+| Path                    | pp512 | pp4096 |
+|--------------------------|------:|-------:|
+| mms_tiled (FA off, baseline) | 5435  |  4167  |
+| FA single-query (v1)     |  3291  |  1099  |
+| FA multi-query (TQ=4)    |  3221  |  1218  |
+
+TQ=4 gives +11% over single-query at pp4096 (the shape where FA's KV-reuse
+matters most) and is roughly noise-neutral at pp512 — a real but small
+win. It does NOT close the gap to mms_tiled: FA is still ~3-4x behind at
+every prefill length tested. Root cause: mms_tiled's LDS tile gives ~64x
+K/V reuse (its 64x64 output tile); TQ=4 gives only 4x. Matching mms_tiled's
+reuse would need TQ on the order of 64 — a full 2D-tiled flash-attention
+rewrite (BLOCK_M/BLOCK_N score tile in registers, closer to
+FlashAttention-2's structure) rather than a register-count bump. That is
+future work if someone wants FA competitive at prefill; the decode
+split-KV win from session 6 (tg64@d4096: 125.5 vs 101.8, +23%) is
+unaffected by any of this and remains the reason FA is worth keeping.
+DX12_ENABLE_FA stays opt-in — prefill is still faster through mms_tiled.
+
 ## STILL OPEN
 
 - FIX 1 step 5: structural GEMM (8x8 register tile / 128x128, TILE_K 64,

@@ -1373,6 +1373,21 @@ bool dx12_dispatch_flash_attn_ext(dx12_device* dev, dx12_command_list* cmd, ggml
 
     if (n_split <= 1 || batch * n_split > (uint32_t)DX12_MAX_GROUPS) {
         p.n_split = 1;
+
+        // Prefill fast path: TQ=4 query rows/group share K (registers) and
+        // V (LDS-staged) VRAM reads instead of re-reading them per query —
+        // ~4x less K/V traffic, which is what makes prefill bandwidth-bound.
+        // Decode's n_q==1 never qualifies (falls through to single-query).
+        const uint32_t mq_tile = 4;
+        uint32_t mq_groups_x = (p.n_q + mq_tile - 1) / mq_tile;
+        bool mq_disabled = getenv("DX12_FA_NO_MQ") != nullptr;
+        if (!mq_disabled && p.n_q >= mq_tile && mq_groups_x <= (uint32_t)DX12_MAX_GROUPS) {
+            return dx12_run_mm(dev, cmd, "flash_attn_ext_mq", &p, sizeof(p),
+                               q, k, v, dst,
+                               mq_groups_x, p.n_head, batch,
+                               mask ? mask : q);
+        }
+
         return dx12_run_mm(dev, cmd, "flash_attn_ext", &p, sizeof(p),
                            q, k, v, dst,
                            p.n_q, p.n_head, batch,

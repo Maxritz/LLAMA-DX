@@ -200,6 +200,7 @@ set(DX12_SHADERS
     mv_kq
     mv_id
     flash_attn_ext
+    flash_attn_ext_mq
     fa_split
     fa_combine
     fwht_row
@@ -274,6 +275,7 @@ set(DX12_SHADER_THREAD_GROUPS
     mv_kq,256,1,1
     mv_id,256,1,1
     flash_attn_ext,256,1,1
+    flash_attn_ext_mq,256,1,1
     fa_split,256,1,1
     fa_combine,256,1,1
     fwht_row,256,1,1
