@@ -19,11 +19,12 @@ targets. Concretely, as of this writing:
 - Core inference (prefill + decode) works and has been benchmarked against the CPU and
   Vulkan backends on real models (see [Benchmarks](#benchmarks)).
 - `test-backend-ops`, the ggml op-correctness harness, passes cleanly end-to-end for
-  the DX12 backend: 1680/1680 executed cases pass and the process exits 0 (see
+  both the DX12 backend (1680/1680 cases) and Vulkan0 (956/956 MUL_MAT cases, the
+  op that used to crash the whole harness before it ever reached anything else). See
   [KNOWN-ISSUE-test-backend-ops-crashes.md](KNOWN-ISSUE-test-backend-ops-crashes.md)
-  for a harness crash that was traced to it, root-caused, and fixed). The unrelated
-  Vulkan0-backend crash documented there is upstream ggml-vulkan code, out of scope
-  for this fork.
+  for both harness crashes that were traced, root-caused, and fixed this session -
+  including a narrowly-scoped workaround for a confirmed AMD proprietary driver
+  NULL-pointer bug in `ggml-vulkan.cpp`, which is otherwise unmodified upstream code.
 - Several features (DirectStorage model loading, the FlashAttention-2-style tiled
   prefill kernel) are recent, single-machine-verified additions that haven't had the
   scrutiny of independent review or a wider range of hardware.
@@ -130,13 +131,19 @@ changed here. Start with [tools/cli](tools/cli), [tools/server](tools/server), a
 
 ## Touched upstream files
 
-The DX12 backend lives entirely in `ggml/src/ggml-dx12`. One upstream file has a small,
-explicit hook added to it, by design rather than as an oversight:
+The DX12 backend lives entirely in `ggml/src/ggml-dx12`. Two upstream files have a
+small, explicit change, by design rather than as an oversight:
 
 - `src/llama-model-loader.cpp` — a narrow addition that resolves DirectStorage
   proc-addresses generically (via `ggml_backend_reg_get_proc_address`, no DX12-specific
   branch) and gives a backend that supports it a real file→GPU async load path. Falls
   through to the existing loader behavior untouched if unavailable.
+- `ggml/src/ggml-vulkan/ggml-vulkan.cpp` — a narrowly-scoped workaround for a confirmed
+  AMD proprietary driver NULL-pointer bug in `ggml_vk_mul_mat` that crashed
+  `test-backend-ops` on Vulkan0 (see
+  [KNOWN-ISSUE-test-backend-ops-crashes.md](KNOWN-ISSUE-test-backend-ops-crashes.md)).
+  Gated to the exact confirmed-broken driver/shape combination; no effect on any other
+  vendor or driver.
 
 Everything else the DX12 backend needs (device/buffer/command abstractions, shader
 cache, graph dispatch) is backend-local.

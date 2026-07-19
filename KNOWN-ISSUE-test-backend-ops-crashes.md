@@ -3,20 +3,51 @@
 Two separate, previously-conflated crashes in `test-backend-ops.exe test` (no `-o` filter).
 Both confirmed independent of each other.
 
-## 1. Vulkan0 backend: MUL_MAT(f16,f32) crash
+## 1. Vulkan0 backend: MUL_MAT(f16,f32) crash (RESOLVED 2026-07-20)
 
-100% deterministic. Repro:
-```
-test-backend-ops.exe test -b Vulkan0 -o MUL_MAT
-```
-Crashes at `MUL_MAT(type_a=f16,type_b=f32,m=16,n=4,k=256,...)` — the first
-`n=4` case (n=1,2,3 all pass). Same crash, same test, in both the unfiltered
-full run and the Vulkan0-only run — zero DX12 involvement (DX120 device is
-merely "Skipping" when this happens in the unfiltered run).
+Was a genuine AMD proprietary driver bug (amdvlk64.dll), not a DX12 backend
+bug and not an application-level (Vulkan spec) violation - but worked
+around in `ggml_vk_mul_mat` (ggml-vulkan.cpp) since it made
+`test-backend-ops -b Vulkan0` unusable end to end.
 
-**Out of scope for this project**: ggml-vulkan.dll is upstream ggml code,
-not something this fork modifies. Worth reporting upstream or re-testing
-against a newer Vulkan driver; not a DX12 backend bug.
+**Root cause**: confirmed via cdb -
+`Failure.Bucket: INVALID_POINTER_READ_c0000005_amdvlk64.dll!Unknown`,
+`AV.Dereference: NullPtr` - a NULL-pointer read entirely inside the AMD
+proprietary Vulkan driver, triggered by `ggml_vk_mul_mat_vec_q_f16`'s
+mul_mat_vec dispatch for the exact (M=16, K=256) shape pair on this
+hardware (RX 9070 XT / RDNA4). No `VK_LAYER_KHRONOS_validation` error
+precedes it. Empirically mapped the scope by bisecting `-p` shape filters:
+
+| type_a | m | k | n | Result |
+|---|---|---|---|---|
+| f32 | 16 | 256 | 1-9 | pass |
+| f16 | 16 | 256 | 1,2,3,6,7,8,9 | pass |
+| f16 | 16 | 256 | **4, 5** | **crash (100%)** |
+| bf16 | 16 | 256 | **4** | **crash (100%)** |
+| q4_0 | 16 | 256 | **5** | **crash (100%)** |
+| f16 | 1/32/64 | 256 | 4 | pass |
+| f16 | 16 | 1/64/1024 | 4 | pass |
+
+Different src0 types hit it at different NUM_COLS values through two
+different compiled shaders (f16/bf16 use the plain dequant mul_mat_vec
+pipeline family, q4_0 the MMVQ/Q8_1 one), and every other (M,K) pair tried
+is clean - so it's not specific to one shader variant or type; it's the
+(M=16,K=256) mul_mat_vec dispatch itself on this driver.
+
+**Fix**: `ggml_vk_mul_mat` now routes the whole (M=16,K=256) shape through
+the already-safe `ggml_vk_mul_mat_q_f16` GEMM path (already the only path
+used for n>8 at this same shape) instead of `mul_mat_vec_q_f16`, gated to
+`vendor_id==VK_VENDOR_ID_AMD && driver_id==vk::DriverId::eAmdProprietary`
+so it only affects the confirmed-broken driver.
+
+**Verified**: `test-backend-ops -b Vulkan0 -o MUL_MAT` went from crashing
+100% of runs to **956/956 tests passed**. The full unfiltered suite (all
+ops, all backends) now runs end to end for the first time - previously it
+always died on the first MUL_MAT case before reaching anything else. The
+only failures in that full run are 42 pre-existing `DIV` op precision
+mismatches (~1.3x over a 1e-7 tolerance), unrelated to MUL_MAT and
+untouched by this fix; they were simply never visible before because the
+process always crashed first.
 
 ## 2. DX120 backend: crash at process exit, not a mid-run race (RESOLVED 2026-07-20)
 
