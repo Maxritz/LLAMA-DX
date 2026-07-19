@@ -300,6 +300,27 @@ Instructions for adding support for new models: [HOWTO-add-model.md](docs/develo
 | [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
 | [Hexagon [In Progress]](docs/backend/snapdragon/README.md) | Snapdragon |
 | [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
+| DX12 (this fork) | Windows, any DX12 GPU (developed/verified on AMD RDNA4) |
+
+### DX12 backend benchmarks (this fork)
+
+Custom DirectX 12 backend (`ggml/src/ggml-dx12`), verified on an AMD Radeon RX 9070 XT.
+
+| Test | Result |
+| --- | --- |
+| `test-backend-ops` full suite | 1680/1680 executed cases passed (0 failures), cdb-verified |
+| `test-backend-ops -o FLASH_ATTN_EXT` | 0 failures across head dims, GQA ratios, KV lengths, masks, permutes |
+| pp2048, Llama-3.2-1B-Q8_0, no FlashAttention (`mms_tiled` GEMM) | 10925 t/s |
+| pp2048, Llama-3.2-1B-Q8_0, FlashAttention TQ=4 (multi-query prefill tile) | 6195 t/s |
+| pp2048, Llama-3.2-1B-Q8_0, FlashAttention 2D-tiled (FA-2 style, current) | **12197 t/s** |
+
+The FA-2 2D-tiled prefill kernel (`flash_attn_ext_tiled.hlsl`) is ~2x faster than the
+TQ=4 kernel it replaces and now outperforms the non-FlashAttention baseline. See
+[docs/PERF-DEEPDIVE-2026-07-18.md](docs/PERF-DEEPDIVE-2026-07-18.md) for the fuller
+performance history and root-cause analysis, and
+[KNOWN-ISSUE-test-backend-ops-crashes.md](KNOWN-ISSUE-test-backend-ops-crashes.md) for
+an open, intermittent test-harness crash unrelated to the above (documented, not yet
+root-caused).
 
 ## Obtaining and quantizing models
 
