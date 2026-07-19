@@ -258,6 +258,18 @@ static std::unordered_map<dx12_device*, dx12_upload_batch> g_upload_batches;
 // without reintroducing BUG 4: this runs after main() returns, i.e. after
 // llama.cpp has already freed every backend and context that could use the
 // device.
+//
+// DX12_DEBUG_LAYER-only: releasing the DXGI factory from this atexit callback
+// crashes on this driver. atexit runs during ntdll!LdrShutdownProcess (DLL
+// teardown already in progress); CDXGIFactory::FinalRelease detects that
+// restricted context and raises an uncaught exception (code 0x87a) instead of
+// completing, killing the process. Confirmed via cdb: 3/3 native
+// test-backend-ops runs crashed here, always right after the last test, with
+// APPLICATION_FAULT_87a_dxgi.dll!CDXGIFactory::FinalRelease at the top of the
+// stack. Default/release builds don't need this cleanup at all (the OS
+// reclaims the device at process exit); only debug-layer builds trade that
+// safety for an accurate live-object report.
+#ifdef DX12_DEBUG_LAYER
 static bool g_dx12_atexit_registered = false;
 
 static void dx12_atexit_cleanup_devices() {
@@ -268,6 +280,7 @@ static void dx12_atexit_cleanup_devices() {
     g_dx12_device_cache.clear();
     dx12_report_live_objects();
 }
+#endif
 
 static dx12_device* dx12_get_or_create_device(uint32_t adapter_idx) {
     std::lock_guard<std::mutex> lk(g_dx12_device_cache_mutex);
@@ -291,10 +304,12 @@ static dx12_device* dx12_get_or_create_device(uint32_t adapter_idx) {
     dx12_result result = dx12_device_create((int32_t)adapter_idx, &dev);
     if (result != DX12_OK) return nullptr;
     g_dx12_device_cache[adapter_idx] = dev;
+#ifdef DX12_DEBUG_LAYER
     if (!g_dx12_atexit_registered) {
         std::atexit(dx12_atexit_cleanup_devices);
         g_dx12_atexit_registered = true;
     }
+#endif
     return dev;
 }
 

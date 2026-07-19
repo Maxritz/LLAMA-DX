@@ -294,12 +294,6 @@ static ComPtr<ID3D12RootSignature> dx12_build_root_signature(dx12_device* dev,
     return root_sig;
 }
 
-ID3D12RootSignature* dx12_create_root_signature(dx12_device* dev,
-                                                 dx12_root_signature_type type) {
-    auto sig = dx12_build_root_signature(dev, type);
-    return sig.Get(); // Caller must AddRef if holding
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // Root Signature Cache
 // ═══════════════════════════════════════════════════════════════════════════════
