@@ -122,12 +122,25 @@ std::vector<dx12_adapter_info> dx12_enumerate_adapters() {
             info.vendor = DX12_VENDOR_UNKNOWN;
         }
 
-        // Check if D3D12 is supported
+        // Check if D3D12 is supported. Mirrors the fallback in
+        // dx12_device_create(): try 12_2 first, then 12_1 - a GPU/driver
+        // that only reports 12_1 (e.g. an older AMD driver on RDNA2
+        // hardware that otherwise supports DX12 Ultimate) is still usable,
+        // and this probe must not disagree with what device creation will
+        // actually accept or the adapter gets silently excluded from
+        // dx12_select_best_adapter() (VRAM=0.0GB, adapter never selected).
         ComPtr<ID3D12Device> test_device;
         info.supports_dx12 = SUCCEEDED(D3D12CreateDevice(
             adapter.Get(),
             D3D_FEATURE_LEVEL_12_2,
             IID_PPV_ARGS(&test_device)));
+        if (!info.supports_dx12) {
+            test_device.Reset();
+            info.supports_dx12 = SUCCEEDED(D3D12CreateDevice(
+                adapter.Get(),
+                D3D_FEATURE_LEVEL_12_1,
+                IID_PPV_ARGS(&test_device)));
+        }
 
         // Detect architecture from device ID
         info.architecture = dx12_detect_gpu_architecture(info.vendor, desc.DeviceId);
