@@ -84,6 +84,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_stablelm(params);
         case LLM_ARCH_MELLUM:
             return new llama_model_mellum(params);
+        case LLM_ARCH_LAGUNA:
+            return new llama_model_laguna(params);
         case LLM_ARCH_QWEN:
             return new llama_model_qwen(params);
         case LLM_ARCH_QWEN2:
@@ -793,6 +795,7 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_26B_A4B:       return "26B.A4B";
         case LLM_TYPE_30B_A3B:       return "30B.A3B";
         case LLM_TYPE_31B_A3_5B:     return "31B.A3.5B";
+        case LLM_TYPE_33B_A3B:       return "33B.A3B";
         case LLM_TYPE_35B_A3B:       return "35B.A3B";
         case LLM_TYPE_48B_A3B:       return "48B.A3B";
         case LLM_TYPE_80B_A3B:       return "80B.A3B";
@@ -1878,7 +1881,8 @@ void llama_model::print_info() const {
                 arch == LLM_ARCH_QWEN3MOE ||
                 arch == LLM_ARCH_OPENAI_MOE ||
                 arch == LLM_ARCH_QWEN3VLMOE ||
-                arch == LLM_ARCH_RND1) {
+                arch == LLM_ARCH_RND1 ||
+                arch == LLM_ARCH_LAGUNA) {
             LLAMA_LOG_INFO("%s: n_ff_exp              = %d\n",     __func__, hparams.n_ff_exp);
         }
 
@@ -2541,6 +2545,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_STEP35:
         case LLM_ARCH_TALKIE:
         case LLM_ARCH_MELLUM:
+        case LLM_ARCH_LAGUNA:
         case LLM_ARCH_DFLASH:
             return LLAMA_ROPE_TYPE_NEOX;
 

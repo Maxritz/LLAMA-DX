@@ -369,6 +369,52 @@ static void dx12_buf_set_tensor(ggml_backend_buffer_t buf, ggml_tensor* tensor,
      dx12_buf_set_tensor(tensor->buffer, tensor, data, offset, size);
  }
 
+// Live VRAM budget ceiling: refuse an allocation that would push this
+// adapter's committed usage past DX12_MAX_VRAM_PCT of its live budget
+// (default 92%). Without this, a single oversized loader can drive the GPU
+// to full VRAM exhaustion, which starves the OS compositor/desktop and can
+// contribute to a driver TDR instead of a clean, catchable allocation
+// failure. Fails open (allows the allocation) if the live query is
+// unavailable, so behavior is unchanged on adapters/drivers that don't
+// support DXGI's video memory query.
+static double dx12_vram_ceiling_fraction() {
+    static double frac = []() -> double {
+        const char* env = getenv("DX12_MAX_VRAM_PCT");
+        if (env) {
+            double v = atof(env);
+            if (v > 0.0 && v <= 1.0) return v;
+            dx12_log(DX12_LOG_WARN, "DX12_MAX_VRAM_PCT='%s' invalid (expect 0.0-1.0), using default 0.92", env);
+        }
+        return 0.92;
+    }();
+    return frac;
+}
+
+static bool dx12_vram_budget_allows(dx12_device* dev, size_t additional_bytes) {
+    if (!dev || !dev->adapter) return true; // fail open: no device/adapter to query
+
+    DXGI_QUERY_VIDEO_MEMORY_INFO mi{};
+    if (FAILED(dev->adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mi))) {
+        return true; // fail open: query unsupported on this driver/adapter
+    }
+
+    const double    ceiling_frac = dx12_vram_ceiling_fraction();
+    const uint64_t  ceiling      = (uint64_t)(mi.Budget * ceiling_frac);
+    const uint64_t  projected    = mi.CurrentUsage + (uint64_t)additional_bytes;
+
+    if (projected > ceiling) {
+        dx12_log(DX12_LOG_ERROR,
+                 "buft_alloc: VRAM budget exceeded - current=%.2fGB + requested=%.2fGB > ceiling=%.2fGB (budget=%.2fGB x %.0f%%)",
+                 mi.CurrentUsage / (1024.0 * 1024.0 * 1024.0),
+                 additional_bytes / (1024.0 * 1024.0 * 1024.0),
+                 ceiling / (1024.0 * 1024.0 * 1024.0),
+                 mi.Budget / (1024.0 * 1024.0 * 1024.0),
+                 ceiling_frac * 100.0);
+        return false;
+    }
+    return true;
+}
+
 static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     auto* btctx = (dx12_backend_buffer_type_context*)buft->context;
     uint32_t adapter_idx = (uint32_t)(uintptr_t)btctx->device->context;
@@ -376,6 +422,10 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
     dx12_device* d3d_dev = dx12_get_or_create_device(adapter_idx);
     if (!d3d_dev) {
         dx12_log(DX12_LOG_ERROR, "buft_alloc: failed to get device");
+        return nullptr;
+    }
+
+    if (!dx12_vram_budget_allows(d3d_dev, size)) {
         return nullptr;
     }
 
@@ -395,6 +445,8 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
 
     dx12_log(DX12_LOG_VERBOSE, "buft_alloc: idx=%u size=%zu heap=%s DONE", adapter_idx, size,
              heap == dx12_heap_type::upload ? "upload" : "default");
+
+    d3d_dev->vram_allocated_bytes.fetch_add(gpu_buf->size);
 
     auto* ctx = new dx12_backend_buffer_context();
     ctx->gpu_buffer = gpu_buf;
@@ -478,6 +530,9 @@ static ggml_backend_buffer_type_t dx12_backend_get_or_create_buffer_type(ggml_ba
 static void dx12_buf_free(ggml_backend_buffer_t buf) {
     auto* ctx = (dx12_backend_buffer_context*)buf->context;
     if (ctx) {
+        if (ctx->device && ctx->gpu_buffer) {
+            ctx->device->vram_allocated_bytes.fetch_sub(ctx->gpu_buffer->size);
+        }
         dx12_buffer_destroy(ctx->gpu_buffer);
         delete ctx;
     }
@@ -1134,7 +1189,12 @@ void ggml_backend_dx12_get_vram_usage(ggml_backend_t backend,
     if (!ctx || !ctx->device) return;
 
     if (total_bytes)     *total_bytes     = ctx->device->caps.dedicated_vram_bytes;
-    if (used_bytes)      *used_bytes      = ctx->vram_used;
+    if (used_bytes)      *used_bytes      = ctx->device->vram_allocated_bytes.load();
+    // model_bytes/kv_cache_bytes: not tracked separately from the aggregate
+    // above (dx12_buft_alloc_buffer doesn't currently know which category a
+    // given allocation belongs to). Left at their prior (always-0) values
+    // rather than duplicating used_bytes into both, which would misrepresent
+    // them as a real split.
     if (model_bytes)     *model_bytes     = ctx->vram_model;
     if (kv_cache_bytes)  *kv_cache_bytes  = ctx->vram_kv_cache;
 }
@@ -1253,7 +1313,13 @@ static bool dx12_query_vram_free(ggml_backend_dev_t dev, size_t* free_out) {
 
     DXGI_QUERY_VIDEO_MEMORY_INFO mi{};
     if (FAILED(d->adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mi))) return false;
-    *free_out = (mi.Budget > mi.CurrentUsage) ? (size_t)(mi.Budget - mi.CurrentUsage) : 0;
+
+    // Report free space against the same ceiling dx12_buft_alloc_buffer
+    // enforces, not the raw budget - otherwise -fitt/auto-fit logic can plan
+    // an allocation that the hard ceiling then rejects at load time instead
+    // of -fitt itself avoiding it up front.
+    const uint64_t ceiling = (uint64_t)(mi.Budget * dx12_vram_ceiling_fraction());
+    *free_out = (ceiling > mi.CurrentUsage) ? (size_t)(ceiling - mi.CurrentUsage) : 0;
     return true;
 }
 

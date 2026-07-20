@@ -124,6 +124,13 @@ struct dx12_device {
     // Deferred staging buffers: upload buffers kept alive until GPU queue is idle,
     // then destroyed. Prevents RDNA4 compute-queue driver crash (HOW-TO-FIX #10).
     std::vector<dx12_buffer*>       pending_staging;
+
+    // Aggregate bytes committed via dx12_buft_alloc_buffer (DEFAULT + fallback
+    // UPLOAD heap allocations). Checked against a live VRAM budget ceiling at
+    // allocation time so a single loader doesn't push this GPU to full VRAM
+    // exhaustion (which starves the OS compositor and can contribute to a
+    // driver TDR/reset instead of a clean allocation failure).
+    std::atomic<uint64_t>           vram_allocated_bytes{0};
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════

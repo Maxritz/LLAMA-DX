@@ -31,6 +31,13 @@ struct llama_cparams {
     float yarn_beta_fast;
     float yarn_beta_slow;
 
+    // Per-layer-type YaRN params for architectures with mixed RoPE
+    // (e.g. Laguna: YaRN global, plain SWA).
+    float yarn_ext_factor_swa  = 0.0f;
+    float yarn_attn_factor_swa = 1.0f;
+    float yarn_beta_fast_swa   = 32.0f;
+    float yarn_beta_slow_swa   =  1.0f;
+
     bool embeddings;
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
