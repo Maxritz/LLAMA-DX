@@ -9438,6 +9438,36 @@ static void ggml_vk_fwht(ggml_backend_vk_context * ctx, vk_context& subctx, cons
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf }, pc, { workgroups_x, 1, 1 });
 }
 
+// Workaround for a NULL-pointer dereference inside amdvlk64.dll (the AMD
+// proprietary Vulkan driver), confirmed via WinDbg/cdb on an RX 9070 XT
+// (RDNA4): Failure.Bucket = INVALID_POINTER_READ_c0000005_amdvlk64.dll,
+// AV.Dereference = NullPtr. No VK_LAYER_KHRONOS_validation error precedes
+// it, so this is not an application-level (spec) violation - it's a driver
+// bug in whatever internal path handles mul_mat_vec dispatches for this
+// exact (M,K) shape.
+//
+// Reproduced with test-backend-ops, all at m=16,k=256 (M/K pair held fixed):
+//   type_a=f16,  n=4: crash (100% of runs)
+//   type_a=f16,  n=5: crash (100% of runs)
+//   type_a=bf16, n=4: crash (100% of runs, same signature)
+//   type_a=q4_0, n=5: crash (100% of runs, same signature)
+// n=1,2,3,6,7,8 pass for f16/bf16 at this shape, and the same n=4/5 pass for
+// every other (m,k) pair tried (m=1/32/64, k=1/64/1024). n=9 at this same
+// (m=16,k=256) also passes - it already takes the ggml_vk_mul_mat_q_f16
+// GEMM path below instead of mul_mat_vec, since n > mul_mat_vec_max_cols.
+// Different src0 types hit it at different NUM_COLS values (f16/bf16 use
+// the plain dequant mul_mat_vec pipeline family, q4_0 the MMVQ/Q8_1 one -
+// two different compiled shaders), so this isn't specific to one pipeline
+// variant; it's the (M=16,K=256) mul_mat_vec dispatch itself on this
+// driver. Rather than risk missing another broken (type, NUM_COLS) pair,
+// route the whole shape through the GEMM path unconditionally - confirmed
+// safe (already the only path used for n>8 at this same shape).
+static bool ggml_vk_amd_proprietary_mmv_null_deref(const vk_device& device, uint32_t m, uint32_t k) {
+    return device->vendor_id == VK_VENDOR_ID_AMD &&
+           device->driver_id == vk::DriverId::eAmdProprietary &&
+           m == 16 && k == 256;
+}
+
 static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
@@ -9495,7 +9525,8 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
     // mul_mat_vec supports batching ne12*ne13 when ne11==1, or treating ne11 as the batch size (up to four)
     // when ne12 and ne13 are one.
     } else if ((dst->ne[1] == 1 || (dst->ne[1] <= mul_mat_vec_max_cols && src1->ne[2] * src1->ne[3] == 1)) &&
-               (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type))) {
+               (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type)) &&
+               !ggml_vk_amd_proprietary_mmv_null_deref(ctx->device, (uint32_t)src0->ne[1], (uint32_t)src0->ne[0])) {
         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx);
     } else {
         ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, false);
