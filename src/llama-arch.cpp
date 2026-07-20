@@ -140,6 +140,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_KIMI_LINEAR,      "kimi-linear"      },
     { LLM_ARCH_TALKIE,           "talkie"           },
     { LLM_ARCH_MELLUM,           "mellum"           },
+    { LLM_ARCH_LAGUNA,           "laguna"           },
     { LLM_ARCH_UNKNOWN,          "(unknown)"        },
 };
 
@@ -193,6 +194,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_EXPERT_GROUP_USED_COUNT,           "%s.expert_group_used_count"           },
     { LLM_KV_EXPERT_WEIGHTS_SCALE,              "%s.expert_weights_scale"              },
     { LLM_KV_EXPERT_WEIGHTS_NORM,               "%s.expert_weights_norm"               },
+    { LLM_KV_ATTENTION_GATE_PER_HEAD,           "%s.attention.gate_per_head"           },
     { LLM_KV_EXPERT_GATING_FUNC,                "%s.expert_gating_func"                },
     { LLM_KV_EXPERT_GROUP_SCALE,                "%s.expert_group_scale"                },
     { LLM_KV_EXPERTS_PER_GROUP,                 "%s.experts_per_group"                 },
@@ -239,6 +241,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_ATTENTION_RELATIVE_BUCKETS_COUNT,       "%s.attention.relative_buckets_count"       },
     { LLM_KV_ATTENTION_SLIDING_WINDOW,               "%s.attention.sliding_window"               },
     { LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN,       "%s.attention.sliding_window_pattern"       },
+    { LLM_KV_ATTENTION_LAYER_TYPES,                  "%s.attention.layer_types"                  },
     { LLM_KV_ATTENTION_SCALE,                        "%s.attention.scale"                        },
     { LLM_KV_ATTENTION_OUTPUT_SCALE,                 "%s.attention.output_scale"                 },
     { LLM_KV_ATTENTION_VALUE_SCALE,                  "%s.attention.value_scale"                  },

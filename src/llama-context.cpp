@@ -64,6 +64,13 @@ llama_context::llama_context(
     cparams.yarn_attn_factor        = params.yarn_attn_factor >= 0.0f ? params.yarn_attn_factor : hparams.yarn_attn_factor;
     cparams.yarn_beta_fast          = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
     cparams.yarn_beta_slow          = params.yarn_beta_slow   >= 0.0f ? params.yarn_beta_slow   : hparams.yarn_beta_slow;
+
+    // Per-layer-type YaRN params for architectures with mixed RoPE (e.g. Laguna).
+    cparams.yarn_ext_factor_swa     = hparams.yarn_ext_factor_swa;
+    cparams.yarn_attn_factor_swa    = hparams.yarn_attn_factor_swa;
+    cparams.yarn_beta_fast_swa      = hparams.yarn_beta_fast_swa;
+    cparams.yarn_beta_slow_swa      = hparams.yarn_beta_slow_swa;
+
     cparams.embeddings              = params.embeddings;
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
