@@ -23,12 +23,13 @@ dx12_gemm_path dx12_select_gemm_path(dx12_device* dev,
         return DX12_GEMM_STANDARD;
     }
 
-    // Allowed quant types for DXLA wave/TG path. Q4_0, Q4_K, and Q8_0 have
+    // Allowed quant types for DXLA wave/TG path. Q4_0, Q4_K, Q6_K, and Q8_0 have
     // dedicated wave-scope shaders that dequant in groupshared before Mat::Load.
     if (weight_quant == DX12_QUANT_F16 ||
         weight_quant == DX12_QUANT_F32 ||
         weight_quant == DX12_QUANT_Q4_0 ||
         weight_quant == DX12_QUANT_Q4_K ||
+        weight_quant == DX12_QUANT_Q6_K ||
         weight_quant == DX12_QUANT_Q8_0) {
         // Allowed for DXLA — proceed to dimension check
     } else {
@@ -163,13 +164,16 @@ bool dx12_gemm_dispatch_standard(dx12_device* dev,
 // ═══════════════════════════════════════════════════════════════════════════════
 
 bool dx12_gemm_dispatch_dxla_wave(dx12_device* dev,
-                                   dx12_command_list* cmd,
-                                   dx12_buffer* matrix_a,
-                                   dx12_buffer* matrix_b,
-                                   dx12_buffer* result,
-                                   const dx12_gemm_params* params) {
+                                     dx12_command_list* cmd,
+                                     dx12_buffer* matrix_a,
+                                     dx12_buffer* matrix_b,
+                                     dx12_buffer* result,
+                                     const dx12_gemm_params* params) {
     if (!dev || !dev->caps.dxla_wave) {
-        // Fallback to standard
+        // Fallback to TG or standard
+        if (dev && dev->caps.dxla_threadgroup) {
+            return dx12_gemm_dispatch_dxla_tg(dev, cmd, matrix_a, matrix_b, result, params);
+        }
         return dx12_gemm_dispatch_standard(dev, cmd, matrix_a, matrix_b, result, params);
     }
 
@@ -177,11 +181,9 @@ bool dx12_gemm_dispatch_dxla_wave(dx12_device* dev,
     switch (params->quant_a) {
         case DX12_QUANT_Q4_0: shader_name = "mul_mat_dxla_wave_q4_0_f16"; break;
         case DX12_QUANT_Q4_K: shader_name = "mul_mat_dxla_wave_q4_k_f16"; break;
+        case DX12_QUANT_Q6_K: shader_name = "mul_mat_dxla_wave_q6_k_f16"; break;
         case DX12_QUANT_Q8_0: shader_name = "mul_mat_dxla_wave_q8_0_f16"; break;
         default:
-            if (params->transposed_b) {
-                shader_name = "mul_mat_dxla_wave_f16_f16_trans";
-            }
             break;
     }
 
@@ -227,8 +229,13 @@ bool dx12_gemm_dispatch_dxla_wave(dx12_device* dev,
 
     dx12_buffer* srvs[2] = { matrix_a, matrix_b };
 
-    return dx12_shader_dispatch(dev, cmd, dispatch,
-                                &dc, sizeof(dc), srvs, 2, result);
+    bool ok = dx12_shader_dispatch(dev, cmd, dispatch,
+                                   &dc, sizeof(dc), srvs, 2, result);
+    if (!ok && dev->caps.dxla_threadgroup) {
+        dx12_log(DX12_LOG_WARN, "DXLA wave dispatch failed, falling back to TG for %s", shader_name);
+        return dx12_gemm_dispatch_dxla_tg(dev, cmd, matrix_a, matrix_b, result, params);
+    }
+    return ok;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -246,6 +253,9 @@ bool dx12_gemm_dispatch_dxla_tg(dx12_device* dev,
     }
 
     const char* shader_name = "mul_mat_dxla_tg_f16_f16";
+    switch (params->quant_a) {
+        case DX12_QUANT_Q6_K: shader_name = "mul_mat_dxla_tg_q6_k_f16"; break;
+    }
 
     dx12_buffer* bufs[3] = { matrix_a, matrix_b, result };
     D3D12_RESOURCE_STATES states[3] = {
@@ -255,7 +265,6 @@ bool dx12_gemm_dispatch_dxla_tg(dx12_device* dev,
     };
     dx12_buffer_transition_batch(cmd, bufs, states, 3);
 
-    // ThreadGroup: 32x32 tiles with 128 threads (4 waves of 32)
     uint32_t tile = 32;
     uint32_t dispatch_x = (params->N + tile - 1) / tile;
     uint32_t dispatch_y = (params->M + tile - 1) / tile;
@@ -280,8 +289,13 @@ bool dx12_gemm_dispatch_dxla_tg(dx12_device* dev,
 
     dx12_buffer* srvs[2] = { matrix_a, matrix_b };
 
-    return dx12_shader_dispatch(dev, cmd, dispatch,
-                                &tc, sizeof(tc), srvs, 2, result);
+    bool ok = dx12_shader_dispatch(dev, cmd, dispatch,
+                                  &tc, sizeof(tc), srvs, 2, result);
+    if (!ok) {
+        dx12_log(DX12_LOG_WARN, "DXLA TG dispatch failed, falling back to standard for %s", shader_name);
+        return dx12_gemm_dispatch_standard(dev, cmd, matrix_a, matrix_b, result, params);
+    }
+    return ok;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

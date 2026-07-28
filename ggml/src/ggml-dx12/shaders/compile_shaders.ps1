@@ -217,8 +217,11 @@ $DxlaShaders = @(
     @{Name="mul_mat_dxla_wave_f16_f16"; Threads=@{X=32;Y=1;Z=1}},
     @{Name="mul_mat_dxla_wave_f16_f16_trans"; Threads=@{X=32;Y=1;Z=1}},
     @{Name="mul_mat_dxla_wave_q4_0_f16"; Threads=@{X=32;Y=1;Z=1}},
+    @{Name="mul_mat_dxla_wave_q4_k_f16"; Threads=@{X=32;Y=1;Z=1}},
+    @{Name="mul_mat_dxla_wave_q6_k_f16"; Threads=@{X=32;Y=1;Z=1}},
     @{Name="mul_mat_dxla_wave_q8_0_f16"; Threads=@{X=32;Y=1;Z=1}},
     @{Name="mul_mat_dxla_tg_f16_f16"; Threads=@{X=256;Y=1;Z=1}},
+    @{Name="mul_mat_dxla_tg_q6_k_f16"; Threads=@{X=256;Y=1;Z=1}},
     @{Name="attn_qk_dxla"; Threads=@{X=256;Y=1;Z=1}},
     @{Name="attn_ov_dxla"; Threads=@{X=256;Y=1;Z=1}}
 )
@@ -240,8 +243,7 @@ if ((Test-Path $DxlaDxcPath) -and (Test-Path $DxlaIncludeDir)) {
             "-E", "main",
             "-enable-16bit-types",
             "-HV", "2021",
-            "-I", $ShaderDir,
-            "-I", $DxlaIncludeDir,
+            "-Vd",  # Disable validation (DXLA shaders have known issues with pointer types in linalg)
             "-Fo", $CsoFile,
             $HlslFile
         ) + $DebugFlags

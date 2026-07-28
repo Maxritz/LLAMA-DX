@@ -61,7 +61,7 @@ foreach(TEST_SRC ${TEST_SOURCES})
         target_link_libraries(${TEST_NAME} PRIVATE ggml-base d3d12.lib dxgi.lib dxguid.lib dxcompiler.lib d3dcompiler.lib dstorage.lib)
         add_dependencies(${TEST_NAME} dx12_shaders)
     else()
-        target_link_libraries(${TEST_NAME} PRIVATE ggml-dx12 d3dcompiler.lib)
+        target_link_libraries(${TEST_NAME} PRIVATE ggml-dx12 ggml-base d3dcompiler.lib)
     endif()
     target_link_options(${TEST_NAME} PRIVATE /DEF:${CMAKE_CURRENT_SOURCE_DIR}/agility_exports.def)
     target_include_directories(${TEST_NAME} PRIVATE

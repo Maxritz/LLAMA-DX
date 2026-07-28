@@ -285,11 +285,12 @@ set(DX12_SHADER_THREAD_GROUPS
     cpy_gen,256,1,1
     rope_f32,64,1,1
     set_rows_gen,256,1,1
-    mul_mat_dxla_wave_f16_f16,32,1,1
-    mul_mat_dxla_wave_f16_f16_trans,32,1,1
-    mul_mat_dxla_wave_q4_0_f16,32,1,1
-    mul_mat_dxla_wave_q4_k_f16,32,1,1
-    mul_mat_dxla_wave_q8_0_f16,32,1,1
+mul_mat_dxla_wave_f16_f16,32,1,1
+     mul_mat_dxla_wave_f16_f16_trans,32,1,1
+     mul_mat_dxla_wave_q4_0_f16,32,1,1
+     mul_mat_dxla_wave_q4_k_f16,32,1,1
+     mul_mat_dxla_wave_q6_k_f16,32,1,1
+     mul_mat_dxla_wave_q8_0_f16,32,1,1
     mul_mat_dxla_tg_f16_f16,256,1,1
     attn_qk_dxla,256,1,1
     attn_ov_dxla,256,1,1
@@ -324,8 +325,10 @@ set(DX12_SHADERS_DXLA
     mul_mat_dxla_wave_f16_f16_trans
     mul_mat_dxla_wave_q4_0_f16
     mul_mat_dxla_wave_q4_k_f16
+    mul_mat_dxla_wave_q6_k_f16
     mul_mat_dxla_wave_q8_0_f16
     mul_mat_dxla_tg_f16_f16
+    mul_mat_dxla_tg_q6_k_f16
     attn_qk_dxla
     attn_ov_dxla
 )
@@ -370,19 +373,18 @@ foreach(SHADER_NAME ${DX12_SHADERS_DXLA})
     
     add_custom_command(
         OUTPUT ${CSO_FILE}
-        COMMAND ${DXC_EXECUTABLE}
-            -T cs_6_10
-            -E main
-            -enable-16bit-types
-            -O3
-            -Zi
-            -Qembed_debug
-            -HV 2021
-            -I "${DX12_SHADER_DIR}"
-            -I "${DXC_INCLUDE_DIR}"
-            -Fo ${CSO_FILE}
-            ${HLSL_FILE}
-        DEPENDS ${HLSL_FILE} ${DX12_SHADER_DIR}/common.hlsli ${DX12_SHADER_DIR}/kquants.hlsli
+COMMAND ${DXC_EXECUTABLE}
+             -T cs_6_10
+             -E main
+             -enable-16bit-types
+             -O3
+             -Vd
+             -HV 2021
+             -I "${DX12_SHADER_DIR}"
+             -I "${DXC_INCLUDE_DIR}"
+             -Fo ${CSO_FILE}
+             ${HLSL_FILE}
+         DEPENDS ${HLSL_FILE} ${DX12_SHADER_DIR}/common.hlsli ${DX12_SHADER_DIR}/kquants.hlsli
         COMMENT "Compiling DXLA ${SHADER_NAME}.hlsl -> ${SHADER_NAME}.cso (cs_6_10)"
         VERBATIM
     )

@@ -63,6 +63,7 @@ const char* dx12_quant_gemm_shader_name(dx12_quant_type weight_quant,
         switch (weight_quant) {
             case DX12_QUANT_Q4_0: return "mul_mat_dxla_wave_q4_0_f16";
             case DX12_QUANT_Q8_0: return "mul_mat_dxla_wave_q8_0_f16";
+            case DX12_QUANT_Q6_K: return "mul_mat_dxla_tg_q6_k_f16";
             default: break;
         }
     }
@@ -71,9 +72,10 @@ const char* dx12_quant_gemm_shader_name(dx12_quant_type weight_quant,
     switch (weight_quant) {
         case DX12_QUANT_Q4_0: return "mul_mat_q4_0_f16";
         case DX12_QUANT_Q8_0: return "mul_mat_q8_0_f16";
+        case DX12_QUANT_Q6_K: return "mm_tiled";
         case DX12_QUANT_F16:  return "mul_mat_f16_f16";
         case DX12_QUANT_F32:  return "mul_mat_f16_f32";
-        default:              return "mul_mat_f16_f16"; // Safe fallback
+        default:              return "mm_tiled"; // Safe fallback for K-quants
     }
 }
 

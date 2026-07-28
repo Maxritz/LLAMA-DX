@@ -13,6 +13,7 @@
 #include <cstring>
 #include <cmath>
 #include <cstdint>
+#include <vector>
 
 typedef uint16_t half;
 
@@ -96,6 +97,42 @@ TEST(gemm_rectangular) {
     PASS();
 }
 
+TEST(gemm_q6_k) {
+    uint32_t M=256,N=256,K=256;
+    size_t sz_a=((size_t)M*K+255)/256*210,sz_b=N*K*2,sz_c=M*N*4;
+    auto* a=dx12_buffer_create(g_dev,sz_a,dx12_heap_type::upload);
+    auto* b=dx12_buffer_create(g_dev,sz_b,dx12_heap_type::upload);
+    auto* c=dx12_buffer_create(g_dev,sz_c,dx12_heap_type::default_);
+    ASSERT(a&&b&&c);
+    std::vector<uint8_t> qa(sz_a, 0xAB); // Q6_K pattern
+    std::vector<half> hb(N*K, (half)0x3C00u); // B = 1.0
+    dx12_buffer_upload(a,qa.data(),sz_a);dx12_buffer_upload(b,hb.data(),sz_b);
+
+    dx12_command_list* cmd=dx12_cmd_list_create(g_dev);
+    dx12_gemm_params p{};p.M=M;p.N=N;p.K=K;p.transposed_b=true;
+    p.quant_a=DX12_QUANT_Q6_K;p.quant_b=DX12_QUANT_F16;
+    bool ok=dx12_gemm_dispatch(g_dev,cmd,a,b,c,&p);
+    ASSERT(ok);
+    dx12_cmd_list_submit_and_wait(cmd);
+
+    auto* c_rb=dx12_buffer_create(g_dev,sz_c,dx12_heap_type::readback);
+    if(c_rb){
+        dx12_cmd_list_reset(cmd);
+        dx12_buffer_transition(cmd,c,D3D12_RESOURCE_STATE_COPY_SOURCE);
+        dx12_buffer_copy(cmd,c_rb,0,c,0,sz_c);
+        dx12_cmd_list_submit_and_wait(cmd);
+        float* result=(float*)dx12_buffer_map(c_rb);
+        if(result){
+            printf("(max=%.3f)", result[0]);
+            dx12_buffer_unmap(c_rb);
+        }
+        dx12_buffer_destroy(c_rb);
+    }
+    dx12_cmd_list_destroy(cmd);
+    dx12_buffer_destroy(a);dx12_buffer_destroy(b);dx12_buffer_destroy(c);
+    PASS();
+}
+
 TEST(pso_simple) {
     // PSO creation sanity: if add/copy PSOs fail, the SDK is broken.
     // If they pass, the issue is specific to mul_mat_f16_f16's CSO.
@@ -122,6 +159,7 @@ int main(){
     RUN(gemm_f16_small);
     RUN(gemm_path_selection);
     RUN(gemm_rectangular);
+    RUN(gemm_q6_k);
     dx12_device_destroy(g_dev);
     printf("\nResults: %d passed, %d failed\n",g_passed,g_failed);
     return g_failed>0?1:0;
