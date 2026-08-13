@@ -1,6 +1,7 @@
 set(TARGET llama-app)
 
 add_executable(${TARGET} llama.cpp download.cpp)
+target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/common ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/ggml/include ${CMAKE_SOURCE_DIR}/ggml/src)
 set_target_properties(${TARGET} PROPERTIES OUTPUT_NAME llama)
 
 target_link_libraries(${TARGET} PRIVATE
