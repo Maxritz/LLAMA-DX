@@ -197,3 +197,11 @@ build-trace.md
 graphify-out/
 dist/*.txt
 b.txt
+dist/
+bench_campaign.ps1
+CURRENT-STATUS.md
+DX-perf-trace.md
+DXLA_FIRST_PASS.md
+HOW-TO-FIX*.md
+WHAT-TO-FIX*.md
+WHAT-WE-ARE-FIXING.md
