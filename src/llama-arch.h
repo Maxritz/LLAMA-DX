@@ -143,7 +143,7 @@ enum llm_arch {
     LLM_ARCH_KIMI_LINEAR,
     LLM_ARCH_TALKIE,
     LLM_ARCH_MELLUM,
-    LLM_ARCH_LAGUNA,
+    LLM_ARCH_LAGUNA,   // REVERSE: ported from ROCM-Test for Laguna XS.2 model support
     LLM_ARCH_EAGLE3,
     LLM_ARCH_DFLASH,
     LLM_ARCH_UNKNOWN,
@@ -199,7 +199,7 @@ enum llm_kv {
     LLM_KV_EXPERT_GROUP_USED_COUNT,
     LLM_KV_EXPERT_WEIGHTS_SCALE,
     LLM_KV_EXPERT_WEIGHTS_NORM,
-    LLM_KV_ATTENTION_GATE_PER_HEAD,
+    LLM_KV_ATTENTION_GATE_PER_HEAD,  // REVERSE: added for Laguna gate shape detection
     LLM_KV_EXPERT_GATING_FUNC,
     LLM_KV_EXPERT_GROUP_SCALE,
     LLM_KV_EXPERTS_PER_GROUP,
@@ -246,7 +246,7 @@ enum llm_kv {
     LLM_KV_ATTENTION_RELATIVE_BUCKETS_COUNT,
     LLM_KV_ATTENTION_SLIDING_WINDOW,
     LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN,
-    LLM_KV_ATTENTION_LAYER_TYPES,
+    LLM_KV_ATTENTION_LAYER_TYPES,  // REVERSE: added for Laguna SWA detection
     LLM_KV_ATTENTION_SCALE,
     LLM_KV_ATTENTION_OUTPUT_SCALE,
     LLM_KV_ATTENTION_VALUE_SCALE,
@@ -357,6 +357,7 @@ enum llm_kv {
     LLM_KV_TARGET_LAYERS,
     LLM_KV_TARGET_HIDDEN_SIZE,
     LLM_KV_NORM_BEFORE_RESIDUAL,
+    LLM_KV_DECODER_ARCH,
 
     LLM_KV_SHORTCONV_L_CACHE,
 
@@ -566,6 +567,7 @@ enum llm_tensor {
     LLM_TENSOR_ENC_FFN_DOWN,
     LLM_TENSOR_ENC_FFN_UP,
     LLM_TENSOR_ENC_OUTPUT_NORM,
+    LLM_TENSOR_ENC_AUX_NORM,
     LLM_TENSOR_CLS,
     LLM_TENSOR_CLS_OUT,
     LLM_TENSOR_CLS_NORM,
@@ -613,6 +615,10 @@ enum llm_tensor {
     LLM_TENSOR_MASKED_EMBD_CENTROIDS,
     LLM_TENSOR_MASKED_EMBD_ORDERING,
     LLM_TENSOR_FC,
+    LLM_TENSOR_DFLASH_FC,
+    LLM_TENSOR_DFLASH_HIDDEN_NORM,
+    LLM_TENSOR_DFLASH_AUX_NORM,
+    LLM_TENSOR_CONFIDENCE_PROJ,
     LLM_TENSOR_D2T,
 };
 
@@ -625,8 +631,10 @@ enum llm_tensor_layer {
 
 struct LLM_KV {
     LLM_KV(llm_arch arch, const char * suffix = nullptr);
+    LLM_KV(llm_arch arch, const std::string & arch_name, const char * suffix = nullptr);
 
     llm_arch arch;
+    std::string arch_str;  // original arch name from GGUF (may differ from canonical LLM_ARCH_NAMES)
     const char * suffix;
 
     std::string operator()(llm_kv kv) const;

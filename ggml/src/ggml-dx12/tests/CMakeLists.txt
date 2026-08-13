@@ -24,6 +24,9 @@ set(TEST_SOURCES
     test_upload_bench.cpp
     test_ring_bench.cpp
     test_gpu_upload_bench.cpp
+    test_dx12_workgraph.cpp
+    test_dx12_execute_indirect.cpp
+    test_dx12_dot_kernels.cpp
 )
 
 foreach(TEST_SRC ${TEST_SOURCES})
@@ -44,6 +47,7 @@ foreach(TEST_SRC ${TEST_SOURCES})
             ${CMAKE_CURRENT_SOURCE_DIR}/../dx12_shader_cache.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/../dx12_profiler.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/../dx12_ds.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/../dx12_workgraph.cpp
             ${CMAKE_CURRENT_BINARY_DIR}/../dx12_shader_registry.cpp
         )
         target_compile_definitions(${TEST_NAME} PRIVATE GGML_BACKEND_DL GGML_BACKEND_BUILD GGML_BACKEND_SHARED
@@ -51,6 +55,7 @@ foreach(TEST_SRC ${TEST_SOURCES})
             $<$<CONFIG:Debug>:DX12_GPU_VALIDATION>
             $<IF:$<BOOL:${DX12_FORCE_DEBUG_LAYER}>,DX12_DEBUG_LAYER,>
             $<IF:$<BOOL:${DX12_FORCE_DEBUG_LAYER}>,DX12_GPU_VALIDATION,>
+            $<IF:$<BOOL:${DX12_AGILITY}>,DX12_AGILITY,>
         )
         target_include_directories(${TEST_NAME} PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/..
@@ -63,7 +68,9 @@ foreach(TEST_SRC ${TEST_SOURCES})
     else()
         target_link_libraries(${TEST_NAME} PRIVATE ggml-dx12 ggml-base d3dcompiler.lib)
     endif()
-    target_link_options(${TEST_NAME} PRIVATE /DEF:${CMAKE_CURRENT_SOURCE_DIR}/agility_exports.def)
+    if(DX12_AGILITY)
+        target_link_options(${TEST_NAME} PRIVATE /DEF:${CMAKE_CURRENT_SOURCE_DIR}/agility_exports.def)
+    endif()
     target_include_directories(${TEST_NAME} PRIVATE
         ${CMAKE_SOURCE_DIR}
         ${CMAKE_SOURCE_DIR}/shaders

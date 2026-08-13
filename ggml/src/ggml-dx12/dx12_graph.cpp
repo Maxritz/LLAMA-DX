@@ -61,7 +61,8 @@ bool dx12_op_supported(const ggml_tensor* node) {
             const ggml_tensor* b = node->src[1];
             if (!a || !b) return false;
             if (dx12_op_disabled("mulmat")) return false;
-            if (b->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32) return false;
+            if ((b->type != GGML_TYPE_F32 && b->type != GGML_TYPE_F16) ||
+                node->type != GGML_TYPE_F32) return false;
             if (!dx12_dims_fit_u32(a) || !dx12_dims_fit_u32(b) || !dx12_dims_fit_u32(node)) return false;
             if ((a->ne[1] + 15) / 16 > DX12_MAX_GROUPS) return false;
             if ((b->ne[1] + 15) / 16 > DX12_MAX_GROUPS) return false;
@@ -562,7 +563,7 @@ bool dx12_graph_compute(dx12_device* dev, dx12_command_list* cmd, ggml_cgraph* g
     }
 
     // Reset GPU timer for this sub-graph
-    if (dev->gpu_timer) dev->gpu_timer->reset();
+    if (dev->gpu_timer && dx12_profile_enabled()) dev->gpu_timer->reset();
 
     // Barrier tracker for cross-dispatch UAV barrier coalescing
     dx12_barrier_tracker barrier_tracker{};
@@ -592,6 +593,11 @@ bool dx12_graph_compute(dx12_device* dev, dx12_command_list* cmd, ggml_cgraph* g
     }();
     int nodes_since_submit = 0;
 
+    LARGE_INTEGER rec_freq, rec_start, rec_end;
+    QueryPerformanceFrequency(&rec_freq);
+    QueryPerformanceCounter(&rec_start);
+    const bool rec_time = getenv("DX12_PROFILE") != nullptr || getenv("DX12_TRACE_RECORD") != nullptr;
+
     // Execute each node in topological order
     for (int i = 0; i < graph->n_nodes; i++) {
         if (nodes_since_submit >= submit_chunk && i < graph->n_nodes - 1) {
@@ -616,7 +622,7 @@ bool dx12_graph_compute(dx12_device* dev, dx12_command_list* cmd, ggml_cgraph* g
         bool dispatched = true;
         bool is_fused = false;
 
-        bool record_timing = dev->gpu_timer &&
+        bool record_timing = dev->gpu_timer && dx12_profile_enabled() &&
             node->op != GGML_OP_VIEW && node->op != GGML_OP_RESHAPE &&
             node->op != GGML_OP_PERMUTE && node->op != GGML_OP_TRANSPOSE &&
             node->op != GGML_OP_NONE;
@@ -654,7 +660,14 @@ bool dx12_graph_compute(dx12_device* dev, dx12_command_list* cmd, ggml_cgraph* g
         }
 
         if (!is_fused) {
-            if (record_timing) dev->gpu_timer->begin(cmd, ggml_op_name(node->op));
+            const char* opn = ggml_op_name(node->op);
+            char mmname[64];
+            if (node->op == GGML_OP_MUL_MAT && node->src[0] && node->src[1]) {
+                snprintf(mmname, sizeof(mmname), "MM_N%u_K%u",
+                         (uint32_t)node->src[0]->ne[1], (uint32_t)node->src[0]->ne[0]);
+                opn = mmname;
+            }
+            if (record_timing) dev->gpu_timer->begin(cmd, opn);
 
             switch (node->op) {
                 case GGML_OP_MUL_MAT:       ok = dx12_dispatch_mul_mat(dev, cmd, node); break;
@@ -717,7 +730,14 @@ bool dx12_graph_compute(dx12_device* dev, dx12_command_list* cmd, ggml_cgraph* g
     }
 
     // Resolve GPU queries before submit (results are read after fence wait)
-    if (dev->gpu_timer) dev->gpu_timer->resolve(cmd);
+    if (dev->gpu_timer && dx12_profile_enabled()) dev->gpu_timer->resolve(cmd);
+
+    if (rec_time) {
+        QueryPerformanceCounter(&rec_end);
+        double rec_ms = (double)(rec_end.QuadPart - rec_start.QuadPart) * 1000.0 / rec_freq.QuadPart;
+        dx12_log(DX12_LOG_INFO, "[PROFILE] graph_record: %u nodes CPU=%.3fms (avg %.3fms/node)",
+                 graph->n_nodes, rec_ms, graph->n_nodes ? rec_ms / graph->n_nodes : 0.0);
+    }
 
     return true;
 }
@@ -842,6 +862,9 @@ static bool dx12_mul_mat_is_fast2d(const ggml_tensor* dst) {
     const ggml_tensor* b = dst->src[1];
     if (a->ne[2] != 1 || a->ne[3] != 1 || b->ne[2] != 1 || b->ne[3] != 1) return false;
     if (!ggml_is_contiguous(a) || !ggml_is_contiguous(b) || !ggml_is_contiguous(dst)) return false;
+    // Fast path (mv_*/mm_tiled) reads B as F32. F16 B (F16 KV cache, e.g. OV
+    // attention matmul) routes to the strided mms path with b_f16 instead.
+    if (b->type != GGML_TYPE_F32) return false;
     return a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16 ||
            a->type == GGML_TYPE_Q8_0 || a->type == GGML_TYPE_Q4_0 ||
            a->type == GGML_TYPE_Q4_K || a->type == GGML_TYPE_Q5_K ||
@@ -866,6 +889,7 @@ static bool dx12_dispatch_mul_mat_strided(dx12_device* dev, dx12_command_list* c
     p.ne2 = (uint32_t)dst->ne[2];
     p.r2 = (uint32_t)(b->ne[2] / a->ne[2]);
     p.r3 = (uint32_t)(b->ne[3] / a->ne[3]);
+    p.pad1 = (b->type == GGML_TYPE_F16) ? 1u : 0u; // b_f16 (F16 KV cache)
     p.anb0 = (uint32_t)a->nb[0]; p.anb1 = (uint32_t)a->nb[1];
     p.anb2 = (uint32_t)a->nb[2]; p.anb3 = (uint32_t)a->nb[3];
     p.bnb0 = (uint32_t)b->nb[0]; p.bnb1 = (uint32_t)b->nb[1];
@@ -974,16 +998,29 @@ bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor
     // GEMV (M == 1) keeps the per-type wave kernels. The old naive mm_*
     // per-output-element shaders and the broken mm_q*_k_prefill kernels are
     // no longer referenced (see WHAT-WE-ARE-FIXING.md).
+    // Wave-size experiment: default to wave64 when the device supports it
+    // (RDNA2 reports 32-64) — measured +25% decode on the 6700 XT.
+    // DX12_WAVE_SIZE=32/64 overrides; RDNA4 (wave32-only, min==max==32)
+    // stays wave32 via prefers_wave64.
+    static const int ws_override = []() {
+        const char* e = getenv("DX12_WAVE_SIZE");
+        return e ? atoi(e) : 0;
+    }();
+    bool use_w64 = ws_override == 64 || (ws_override == 0 && dev->caps.prefers_wave64);
+
     uint32_t kq_type = 0;
     const char* shader_name = nullptr;
     switch (a->type) {
-        case GGML_TYPE_F32:  shader_name = gemv ? "mv_f32"  : "mm_tiled"; kq_type = 0; break;
-        case GGML_TYPE_F16:  shader_name = gemv ? "mv_f16"  : "mm_tiled"; kq_type = 1; break;
-        case GGML_TYPE_Q8_0: shader_name = gemv ? "mv_q8_0" : "mm_tiled"; kq_type = 2; break;
-        case GGML_TYPE_Q4_0: shader_name = gemv ? "mv_q4_0" : "mm_tiled"; kq_type = 3; break;
-        case GGML_TYPE_Q4_K: shader_name = gemv ? "mv_kq" : "mm_tiled"; kq_type = 4; break;
-        case GGML_TYPE_Q5_K: shader_name = gemv ? "mv_kq" : "mm_tiled"; kq_type = 5; break;
-        case GGML_TYPE_Q6_K: shader_name = gemv ? "mv_kq" : "mm_tiled"; kq_type = 6; break;
+        case GGML_TYPE_F32:  shader_name = gemv ? (use_w64 ? "mv_f32_w64"  : "mv_f32")  : "mm_tiled"; kq_type = 0; break;
+        case GGML_TYPE_F16:  shader_name = gemv ? (use_w64 ? "mv_f16_w64"  : "mv_f16")  : "mm_tiled"; kq_type = 1; break;
+        case GGML_TYPE_Q8_0:
+            shader_name = gemv ? (use_w64 ? "mv_q8_0_w64" : "mv_q8_0") : "mm_tiled";
+            kq_type = 2;
+            break;
+        case GGML_TYPE_Q4_0: shader_name = gemv ? (use_w64 ? "mv_q4_0_w64" : "mv_q4_0") : "mm_tiled"; kq_type = 3; break;
+        case GGML_TYPE_Q4_K: shader_name = gemv ? (use_w64 ? "mv_kq_w64"   : "mv_kq")   : "mm_tiled"; kq_type = 4; break;
+        case GGML_TYPE_Q5_K: shader_name = gemv ? (use_w64 ? "mv_kq_w64"   : "mv_kq")   : "mm_tiled"; kq_type = 5; break;
+        case GGML_TYPE_Q6_K: shader_name = gemv ? (use_w64 ? "mv_kq_w64"   : "mv_kq")   : "mm_tiled"; kq_type = 6; break;
         default:
             dx12_log(DX12_LOG_ERROR, "MUL_MAT: unsupported weight type %s", ggml_type_name(a->type));
             return false;
@@ -1033,7 +1070,10 @@ bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor
 
     if (gemv) {
         struct { uint32_t M, N, K, qtype; } params = { M, N, K, kq_type };
-        dispatch.dispatch_x = (N + 7) / 8; // 8 rows per 256-thread group (32 lanes/row)
+        // Rows per 256-thread group: 8 for the wave32 kernel, 4 for wave64
+        // (each row mapped to one wave). Must match the shader's o mapping.
+         uint32_t rows_per_group = (gemv && use_w64) ? 4 : 8;
+        dispatch.dispatch_x = (N + rows_per_group - 1) / rows_per_group;
         dispatch.dispatch_y = 1;
         return dx12_shader_dispatch(dev, cmd, dispatch, &params, sizeof(params), srvs, 2, buf_c);
     }

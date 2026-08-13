@@ -297,6 +297,15 @@ llama_kv_cache::llama_kv_cache(
             }
         } else {
             buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
+            if (!buf) {
+                // VRAM exhausted (or buffer type failed): spill KV cache to system RAM
+                ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
+                if (buft != cpu_buft) {
+                    LLAMA_LOG_WARN("%s: %s KV buffer allocation failed, spilling KV cache to CPU\n",
+                            __func__, ggml_backend_buft_name(buft));
+                    buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), cpu_buft);
+                }
+            }
         }
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for kv cache");

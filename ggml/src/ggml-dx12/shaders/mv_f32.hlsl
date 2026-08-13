@@ -15,12 +15,17 @@ RWByteAddressBuffer C : register(u2);
 
 groupshared float B_lds[B_CHUNK];
 
-[WaveSize(32)]
+#ifndef DX12_WAVE_SIZE
+#define DX12_WAVE_SIZE 32
+#endif
+#define WAVES_PER_GROUP (256 / DX12_WAVE_SIZE)
+
+[WaveSize(DX12_WAVE_SIZE)]
 [numthreads(256, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
-    uint sub  = gtid.x >> 5;
-    uint lane = gtid.x & 31u;
-    uint o = gid.x * 8 + sub;
+    uint sub  = gtid.x / DX12_WAVE_SIZE;
+    uint lane = gtid.x % DX12_WAVE_SIZE;
+    uint o = gid.x * WAVES_PER_GROUP + sub;
     bool valid = o < params.N;
 
     float acc = 0.0f;
@@ -38,7 +43,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             uint k = chunk + lane;
             if (k < params.K) {
                 [loop]
-                for (; k < end; k += 32) {
+                for (; k < end; k += DX12_WAVE_SIZE) {
                     acc += asfloat(A.Load(row_b + k * 4)) * B_lds[k - chunk];
                 }
             }

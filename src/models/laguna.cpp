@@ -151,6 +151,8 @@ llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_para
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     for (int il = 0; il < n_layer; ++il) {
+        res->t_layer_inp[il] = inpL;
+
         ggml_tensor * inpSA = inpL;
 
         const uint32_t n_head_l    = hparams.n_head(il);
@@ -306,6 +308,8 @@ llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_para
     }
 
     cur = inpL;
+
+    res->t_layer_inp[n_layer] = cur;
 
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);

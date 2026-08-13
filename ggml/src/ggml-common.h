@@ -96,6 +96,10 @@ typedef sycl::half2 ggml_half2;
 #define QI1_0 (QK1_0 / 32)
 #define QR1_0 1
 
+// Q2_0 (PrismML/Bonsai): 4 elements packed per byte, 2 bits each. Each dequantize call
+// produces one adjacent pair of elements (matches QR1_0's convention), so QR = 1.
+#define QR2_0 1
+#define QR2_0_64 1
 
 #define QI4_0 (QK4_0 / (4 * QR4_0))
 #define QR4_0 2
@@ -278,6 +282,60 @@ typedef struct {
 static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
 
 //
+// TurboQuant KV-cache: Walsh-Hadamard rotation + PolarQuant (arXiv 2504.19874)
+// Block size 128, matches head_dim for direct rotation without reshape
+//
+
+// 2-bit: 2-bit PolarQuant indices only
+// Per block: norm(fp16) + 2-bit indices (32 bytes) = 34 bytes per 128 values = 2.125 bpw -> 6x compression vs fp16
+#define QK_TURBO2 128
+#define QK_TURBO2_GROUP 128
+typedef struct {
+    ggml_half  norm;
+    uint8_t    qs[QK_TURBO2 / 4];
+} block_turbo2_0;
+static_assert(sizeof(block_turbo2_0) == sizeof(ggml_half) + QK_TURBO2/4, "wrong turbo2_0 block size/padding");
+
+// 3-bit: lower 2 bits in qs[], upper 1 bit in signs[]
+// Per block: norm(fp16) + 2-bit indices (32 bytes) + 1-bit extra (16 bytes) = 50 bytes per 128 values = 3.125 bpw
+#define QK_TURBO3 128
+#define QK_TURBO3_GROUP 128
+typedef struct {
+    ggml_half  norm;
+    uint8_t    qs[QK_TURBO3 / 4];
+    uint8_t    signs[QK_TURBO3 / 8];
+} block_turbo3_0;
+static_assert(sizeof(block_turbo3_0) == sizeof(ggml_half) + QK_TURBO3/4 + QK_TURBO3/8, "wrong turbo3_0 block size/padding");
+
+// 4-bit: 4-bit PolarQuant indices, nibble packed
+// Per block: norm(fp16) + 4-bit indices (64 bytes) = 66 bytes per 128 values = 4.125 bpw
+#define QK_TURBO4 128
+#define QK_TURBO4_GROUP 128
+typedef struct {
+    ggml_half  norm;
+    uint8_t    qs[QK_TURBO4 / 2];
+} block_turbo4_0;
+static_assert(sizeof(block_turbo4_0) == sizeof(ggml_half) + QK_TURBO4/2, "wrong turbo4_0 block size/padding");
+
+// TQ3_1S: WHT-rotated 3-bit weight quantization (8-level Lloyd-Max)
+#define QK_TQ3_0 32
+typedef struct {
+    ggml_half d0;                       // 2 bytes: scale for first 16 elements
+    ggml_half d1;                       // 2 bytes: scale for last 16 elements
+    uint8_t   qs[QK_TQ3_0 * 3 / 8];    // 12 bytes: 3-bit indices packed (4 groups of 8 in 3 bytes)
+} block_tq3_1s;
+static_assert(sizeof(block_tq3_1s) == sizeof(ggml_half) * 2 + QK_TQ3_0 * 3 / 8, "wrong tq3_1s block size/padding");
+
+// TQ4_1S: WHT-rotated 4-bit weight quantization (16-level Lloyd-Max)
+#define QK_TQ4_1S 32
+typedef struct {
+    ggml_half d0;                       // 2 bytes: scale for first 16 elements
+    ggml_half d1;                       // 2 bytes: scale for last 16 elements
+    uint8_t   qs[QK_TQ4_1S / 2];       // 16 bytes: 4-bit indices nibble-packed
+} block_tq4_1s;
+static_assert(sizeof(block_tq4_1s) == sizeof(ggml_half) * 2 + QK_TQ4_1S / 2, "wrong tq4_1s block size/padding");
+
+//
 // Super-block quantization structures
 //
 
@@ -364,6 +422,36 @@ typedef struct {
     int16_t bsums[QK_K/16]; // sum of quants in groups of 16
 } block_q8_K;
 static_assert(sizeof(block_q8_K) == sizeof(float) + QK_K + QK_K/16*sizeof(int16_t), "wrong q8_K block size/padding");
+
+// Q2_0 quantization (standard GGUF format, block size 128 — PrismML/Bonsai canonical)
+#define QK2_0 128
+// One q8_1 dot-product chunk is 32 elements (QK8_1); a 128-element Q2_0 block has
+// 4 such chunks. Must match QK2_0/QK8_1 (mirrors QI1_0 = QK1_0/32), not the K-quant
+// style "QK/(4*4)" formula — that formula walks past the 32-byte qs[] array here.
+#define QI2_0 (QK2_0 / 32)  // 4
+typedef struct {
+    ggml_half d;          // delta
+    uint8_t qs[QK2_0/4]; // 2-bit weights (4 weights per byte)
+} block_q2_0;
+static_assert(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0/4, "wrong q2_0 block size/padding");
+
+// Q2_0_64 quantization (PrismML/Bonsai "_g64" variant, block size 64 — same 2-bit encoding as
+// Q2_0 but a smaller group size, so it is NOT byte-compatible with block_q2_0; GGUF tensors using
+// this layout must be declared with type id GGML_TYPE_Q2_0_64, not GGML_TYPE_Q2_0)
+#define QK2_0_64 64
+// See QI2_0 above: must be QK2_0_64/QK8_1, not the K-quant "QK/(4*4)" formula.
+#define QI2_0_64 (QK2_0_64 / 32)  // 2
+typedef struct {
+    ggml_half d;             // delta
+    uint8_t qs[QK2_0_64/4]; // 2-bit weights (4 weights per byte)
+} block_q2_0_64;
+static_assert(sizeof(block_q2_0_64) == sizeof(ggml_half) + QK2_0_64/4, "wrong q2_0_64 block size/padding");
+
+// FP8 E4M3FN (per-element, UFM custom kernels)
+typedef struct {
+    uint8_t x; // FP8 E4M3FN value
+} block_f8_e4m3fn;
+static_assert(sizeof(block_f8_e4m3fn) == sizeof(uint8_t), "wrong f8_e4m3fn block size/padding");
 
 // (Almost) "true" 2-bit quantization.
 // Due to the need to use blocks as per ggml design, it ends up using
@@ -1117,6 +1205,7 @@ GGML_TABLE_BEGIN(int8_t, kvalues_fp4, 16)
     0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
 GGML_TABLE_END()
 #define kvalues_mxfp4 kvalues_fp4
+#define kvalues_rocmfp4 kvalues_fp4
 
 #define NGRID_IQ1S 2048
 #define IQ1S_DELTA 0.125f

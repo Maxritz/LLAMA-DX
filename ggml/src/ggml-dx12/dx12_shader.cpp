@@ -6,7 +6,9 @@
 
 #include "dx12_shader.h"
 #include "dx12_buffer.h"
+#include "dx12_profiler.h"
 #include <cstring>
+#include <cstdio>
 #include <algorithm>
 #include <mutex>
 #include <unordered_map>
@@ -72,6 +74,15 @@ bool dx12_shader_dispatch(dx12_device* dev,
         dx12_log(DX12_LOG_ERROR, "Shader '%s' not found in registry", dispatch.shader_name);
         return false;
     }
+
+    // Single-line start/finish trace per kernel dispatch (CPU record cost).
+    // Gates on DX12_PROFILE like the rest of the profiler. GPU time is
+    // already captured per-node by dev->gpu_timer (dx12_graph.cpp); this adds
+    // the per-shader CPU attribution.
+    static char tbuf[64];
+    snprintf(tbuf, sizeof(tbuf), "dispatch:%s", dispatch.shader_name);
+    dx12_profile_scope ds(dev->gpu_timer, cmd, tbuf, false);
+    (void)ds;
 
     // Get or create PSO. Caches are per-device and process-lifetime so PSOs
     // and root signatures stay alive while command lists reference them

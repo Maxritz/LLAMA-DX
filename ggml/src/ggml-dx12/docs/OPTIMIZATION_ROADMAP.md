@@ -251,9 +251,15 @@ Per Amiga chip-RAM lesson: host-visible VRAM traffic contends.
 ## Lever 6: Occupancy / Wave Control
 
 ### Force wave width
-- `[WaveSize(32)]` attribute (SM6.6, SM6.8 adds min/max range form)
-- Pin wave32 at shader compile time — no scheduling-for-impossible-hardware ambiguity
-- Still branch on `WaveLaneCountMin` at pipeline-selection time for gfx1031 machine
+- `[WaveSize(N)]` attribute (SM6.6, SM6.8 adds min/max range form)
+- Shaders compile a variant per wave size via `-D DX12_WAVE_SIZE=<32|64>` (see `mv_q8_0.hlsl` + `compile_shaders.ps1` `Source=`/`Defines=` fields)
+- **Measured (RDNA2 / RX 6700 XT, decode tg64, Q8_0 GEMV): wave64 = 107.8 t/s vs wave32 = 86.0 t/s (+25%)** — RDNA2 is Wave32/64 capable and strongly prefers 64 for the GEMV.
+- **Auto-select**: `dx12_dispatch_mul_mat` picks `mv_q8_0_w64` when `dev->caps.prefers_wave64` is true (reported WaveLaneCountMin/Max spans 32-64). RDNA4 (wave32-only, min==max==32) stays wave32. `DX12_WAVE_SIZE=32|64` env overrides.
+- Dispatch grid must match the per-group row mapping (8 rows/group wave32, 4 rows/group wave64) — see the `rows_per_group` branch in `dx12_dispatch_mul_mat`.
+- **Two correctness bugs caught during validation**: (1) a second ternary statement overwrote the block-scale select with d7 for lanes t=0..3 — keep the whole scale chain in ONE expression per `#if`; (2) the hardcoded `(N+7)/8` grid left half the rows uncomputed when rows/group changed to 4.
+
+### Wave32-per-CU split (RDNA2, 40 CU)
+- RDNA2 executes wave64 as two 32-wide groups; a wave64 kernel's 2x lanes are not automatically 2x throughput (execution resources/occupancy dominate). Benchmark the actual kernel, not lane-count arithmetic — the +25% above is the empirical answer.
 
 ### SM6.10 wave topology
 - `GetGroupWaveIndex()` — direct wave-in-group index

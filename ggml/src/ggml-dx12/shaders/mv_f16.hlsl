@@ -21,12 +21,17 @@ RWByteAddressBuffer C : register(u2);  // output: N x 1 (F32)
 #define B_LDS_MAX 4096
 groupshared float B_lds[B_LDS_MAX];
 
-[WaveSize(32)]
+#ifndef DX12_WAVE_SIZE
+#define DX12_WAVE_SIZE 32
+#endif
+#define WAVES_PER_GROUP (256 / DX12_WAVE_SIZE)
+
+[WaveSize(DX12_WAVE_SIZE)]
 [numthreads(256, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
-    uint sub  = gtid.x >> 5;       // wave index 0..7
-    uint lane = gtid.x & 31u;      // lane index 0..31
-    uint row  = gid.x * 8 + sub;   // output row this wave computes
+    uint sub  = gtid.x / DX12_WAVE_SIZE;
+    uint lane = gtid.x % DX12_WAVE_SIZE;
+    uint row  = gid.x * WAVES_PER_GROUP + sub;
     bool valid = row < params.N;
 
     // Phase 1: All 256 threads cooperatively load B into LDS (single pass)
@@ -48,7 +53,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         uint row_offset = row * k_count * 2;  // byte offset to row in A (F16)
 
         [loop]
-        for (uint k = lane; k < k_count; k += 32) {
+        for (uint k = lane; k < k_count; k += DX12_WAVE_SIZE) {
             uint addr = row_offset + k * 2;
             uint w = A.Load(addr & ~3u);
             float a = f16tof32((addr & 2u) ? (w >> 16) : w);

@@ -109,14 +109,20 @@ struct ShaderCfg {
     uint32_t blk_elems;
     void (*fill)(uint8_t*,uint32_t N,uint32_t K,std::mt19937&);
     bool has_qtype;
+    uint32_t rows_per_group; // gemv rows per 256-thread group (wave32=8, wave64=4)
 };
 
 static const ShaderCfg kCfg[] = {
-    {"mv_f32",   0,  32, fill_f32,  false},
-    {"mv_f16",   0,  32, fill_f16,  false},
-    {"mv_q8_0", 34,  32, fill_q8_0, false},
-    {"mv_q4_0", 18,  32, fill_q4_0, false},
-    {"mv_kq",  144, 256, fill_q4_k, true},
+    {"mv_f32",       0,  32, fill_f32,  false, 8},
+    {"mv_f32_w64",   0,  32, fill_f32,  false, 4},
+    {"mv_f16",       0,  32, fill_f16,  false, 8},
+    {"mv_f16_w64",   0,  32, fill_f16,  false, 4},
+    {"mv_q8_0",     34,  32, fill_q8_0, false, 8},
+    {"mv_q8_0_w64", 34,  32, fill_q8_0, false, 4},
+    {"mv_q4_0",     18,  32, fill_q4_0, false, 8},
+    {"mv_q4_0_w64", 18,  32, fill_q4_0, false, 4},
+    {"mv_kq",      144, 256, fill_q4_k, true,  8},
+    {"mv_kq_w64",  144, 256, fill_q4_k, true,  4},
 };
 
 static size_t weight_bytes(uint32_t N, uint32_t K, const ShaderCfg& c) {
@@ -133,7 +139,7 @@ static bool run_one( dx12_device* dev, dx12_command_list* cmd,
     struct dx12_shader_dispatch d{};
     d.shader_name = c.name;
     d.sig_type = dx12_root_signature_type::mm;
-    d.dispatch_x = (N + 7) / 8;
+    d.dispatch_x = (N + c.rows_per_group - 1) / c.rows_per_group;
     d.dispatch_y = 1;
     d.dispatch_z = 1;
     d.srv_addr[0] = bufA->gpu_address;
@@ -166,7 +172,7 @@ int main(int argc, char* argv[]) {
     if(!all&&!name) {printf("-s or -a required\n"); return 1;}
 
     uint32_t minb=32;
-    for(int i=0;i<5;i++) if(kCfg[i].blk_elems>0&&kCfg[i].blk_elems<minb) minb=kCfg[i].blk_elems;
+    for(size_t i=0;i<sizeof(kCfg)/sizeof(kCfg[0]);i++) if(kCfg[i].blk_elems>0&&kCfg[i].blk_elems<minb) minb=kCfg[i].blk_elems;
     K = ((K+minb-1)/minb)*minb;
 
     printf("=== GEMV Perf | M=1 N=%u K=%u iters=%u ===\n\n",N,K,iters);
@@ -206,7 +212,15 @@ int main(int argc, char* argv[]) {
         for(uint32_t r=0;r<repeats;r++) {
             dx12_command_list* tc=dx12_cmd_list_create(dev); dx12_cmd_list_reset(tc);
             auto t0=std::chrono::high_resolution_clock::now();
-            for(uint32_t i=0;i<iters;i++) run_one(dev,tc,c,A,B,C,N,K,q);
+            for(uint32_t i=0;i<iters;i++) {
+                run_one(dev,tc,c,A,B,C,N,K,q);
+                if (getenv("DX12_PERF_BARRIERS")) {
+                    D3D12_RESOURCE_BARRIER b{};
+                    b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                    b.UAV.pResource = C->resource.Get();
+                    tc->d3d_list->ResourceBarrier(1, &b);
+                }
+            }
             dx12_cmd_list_submit_and_wait(tc);
             auto t1=std::chrono::high_resolution_clock::now();
             double gpu_us=(double)std::chrono::duration_cast<std::chrono::nanoseconds>(t1-t0).count()/1000.0;
@@ -334,8 +348,8 @@ int main(int argc, char* argv[]) {
     auto run = std::function<void(const ShaderCfg&,uint32_t)>(indirect_mode ? 
         std::function<void(const ShaderCfg&,uint32_t)>(bench_indirect) :
         std::function<void(const ShaderCfg&,uint32_t)>(bench));
-    if(all) {for(int i=0;i<5;i++) run(kCfg[i],kCfg[i].has_qtype?qt:0);}
-    else {for(int i=0;i<5;i++) if(!strcmp(kCfg[i].name,name)) run(kCfg[i],kCfg[i].has_qtype?qt:0);}
+    if(all) {for(size_t i=0;i<sizeof(kCfg)/sizeof(kCfg[0]);i++) run(kCfg[i],kCfg[i].has_qtype?qt:0);}
+    else {for(size_t i=0;i<sizeof(kCfg)/sizeof(kCfg[0]);i++) if(!strcmp(kCfg[i].name,name)) run(kCfg[i],kCfg[i].has_qtype?qt:0);}
 
     dx12_device_destroy(dev);
     return 0;

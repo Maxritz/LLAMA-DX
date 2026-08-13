@@ -16,7 +16,11 @@ endif()
 
 set(TARGET llama-bench)
 
-add_executable(${TARGET} main.cpp agility_shim.cpp)
+set(LLAMA_BENCH_SOURCES main.cpp)
+if(DX12_AGILITY)
+    list(APPEND LLAMA_BENCH_SOURCES agility_shim.cpp)
+endif()
+add_executable(${TARGET} ${LLAMA_BENCH_SOURCES})
 target_link_libraries(${TARGET} PRIVATE llama-bench-impl)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 

@@ -31,10 +31,15 @@
 
 // These exports tell the Windows loader to redirect D3D12 calls to the
 // D3D12Core.dll in our D3D12/ subdirectory instead of the system one.
+// Optional (DX12_AGILITY): without them the backend runs on the inbox
+// d3d12.dll (ID3D12GraphicsCommandList4 level, DXLA/Work-Graphs auto-off),
+// which is required on stable drivers / non-Agility systems (e.g. RDNA2).
+#ifdef DX12_AGILITY
 #pragma comment(linker, "/export:D3D12SDKVersion")
 #pragma comment(linker, "/export:D3D12SDKPath")
 extern "C" { __declspec(dllexport) extern const UINT D3D12SDKVersion = 721; }
 extern "C" { __declspec(dllexport) extern const char* D3D12SDKPath = ".\\D3D12\\"; }
+#endif
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Logging
@@ -130,17 +135,36 @@ std::vector<dx12_adapter_info> dx12_enumerate_adapters() {
         // actually accept or the adapter gets silently excluded from
         // dx12_select_best_adapter() (VRAM=0.0GB, adapter never selected).
         ComPtr<ID3D12Device> test_device;
-        info.supports_dx12 = SUCCEEDED(D3D12CreateDevice(
-            adapter.Get(),
-            D3D_FEATURE_LEVEL_12_2,
-            IID_PPV_ARGS(&test_device)));
+        HRESULT hr_probe = DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+        // D3D12CreateDevice can transiently return NOT_CURRENTLY_AVAILABLE
+        // (0x887E0003) when another session/app briefly holds the GPU (RDP,
+        // RGP/AMD service attach, RDNA2 session transitions). Retry a few
+        // times before declaring the adapter unsupported.
+        for (int attempt = 0; attempt < 4 && hr_probe == DXGI_ERROR_NOT_CURRENTLY_AVAILABLE; attempt++) {
+            if (attempt) Sleep(250);
+            hr_probe = D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_2, IID_PPV_ARGS(&test_device));
+        }
+        info.supports_dx12 = SUCCEEDED(hr_probe);
         if (!info.supports_dx12) {
             test_device.Reset();
-            info.supports_dx12 = SUCCEEDED(D3D12CreateDevice(
-                adapter.Get(),
-                D3D_FEATURE_LEVEL_12_1,
-                IID_PPV_ARGS(&test_device)));
+            hr_probe = DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+            for (int attempt = 0; attempt < 4 && hr_probe == DXGI_ERROR_NOT_CURRENTLY_AVAILABLE; attempt++) {
+                if (attempt) Sleep(250);
+                hr_probe = D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_1, IID_PPV_ARGS(&test_device));
+            }
+            info.supports_dx12 = SUCCEEDED(hr_probe);
         }
+        if (!info.supports_dx12) {
+            test_device.Reset();
+            hr_probe = DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+            for (int attempt = 0; attempt < 4 && hr_probe == DXGI_ERROR_NOT_CURRENTLY_AVAILABLE; attempt++) {
+                if (attempt) Sleep(250);
+                hr_probe = D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&test_device));
+            }
+            info.supports_dx12 = SUCCEEDED(hr_probe);
+        }
+        dx12_log(DX12_LOG_INFO, "adapter probe: %ls 12_2/12_1/12_0 -> %s (last hr=0x%08X)",
+                 desc.Description, info.supports_dx12 ? "YES" : "NO", hr_probe);
 
         // Detect architecture from device ID
         info.architecture = dx12_detect_gpu_architecture(info.vendor, desc.DeviceId);
@@ -190,6 +214,20 @@ uint32_t dx12_select_best_adapter(const std::vector<dx12_adapter_info>& adapters
 // ═══════════════════════════════════════════════════════════════════════════════
 // GPU Architecture Detection
 // ═══════════════════════════════════════════════════════════════════════════════
+//
+// HOW TO ADD A NEW RDNA GENERATION
+//
+// PCI device IDs follow AMD's Navi naming. Order matters — check newest first:
+//
+//   RDNA4: device_id & 0xFF00 == 0x7500  (Navi 4x, e.g. 0x7550 Navi 48)
+//   RDNA3: device_id & 0xFF00 == 0x7400  (Navi 3x, e.g. 0x7480 Navi 31)
+//   RDNA2: device_id & 0xFF00 == 0x7300  (Navi 2x, e.g. 0x73DF Navi 22 / 6700 XT)
+//          OR device_id & 0xFF00 == 0x6800 / 0x6900 (older Navi 1x rebrand)
+//
+// Add a new case *above* the RDNA2 check. After returning the arch, also set
+// prefers_wave64 in dx12_query_device_caps() (dx12_device.cpp:528).
+//
+// ═══════════════════════════════════════════════════════════════════════════════
 
 dx12_gpu_architecture dx12_detect_gpu_architecture(dx12_gpu_vendor vendor,
                                                     uint32_t device_id) {
@@ -199,9 +237,11 @@ dx12_gpu_architecture dx12_detect_gpu_architecture(dx12_gpu_vendor vendor,
             if ((device_id & 0xFF00) == 0x7500 || device_id == 0x7550) {
                 return DX12_ARCH_RDNA4;
             }
-            // RDNA3: Navi 31/32/33
-            if ((device_id & 0xFF00) == 0x7400 ||
-                (device_id & 0xFF00) == 0x7300) {
+            // RDNA3: Navi 31/32/33 (0x74xx). Do NOT check 0x73xx — that is
+            // Navi 21/22/23 (RDNA2). The 0x7300 check here was mis-detecting
+            // the 6700 XT (0x73DF, Navi 22) as RDNA3, which set
+            // prefers_wave64=false and dropped decode to 86 t/s.
+            if ((device_id & 0xFF00) == 0x7400) {
                 return DX12_ARCH_RDNA3;
             }
             // RDNA2: Navi 21/22/23/24
@@ -502,9 +542,11 @@ void dx12_detect_device_caps(dx12_device* dev) {
         case DX12_ARCH_RDNA4:
         case DX12_ARCH_RDNA3:
             c.optimal_gemm_tile = 32;
+            c.prefers_wave64 = false;
             break;
         case DX12_ARCH_RDNA2:
             c.optimal_gemm_tile = 32; // No WMMA, use standard tile GEMM
+            c.prefers_wave64 = true;  // RDNA2 supports wave64; measured +25% decode on 6700 XT
             break;
         case DX12_ARCH_ADA:
             c.optimal_gemm_tile = 64;
@@ -519,7 +561,6 @@ void dx12_detect_device_caps(dx12_device* dev) {
         default:
             c.optimal_gemm_tile = 32;
     }
-    c.prefers_wave64 = (c.wave_lane_count_max >= 64) && (c.wave_lane_count_max > c.wave_lane_count_min);
 
     dx12_log(DX12_LOG_INFO, "Device caps: WaveOps=%s WaveSize=%u-%u Native16bit=%s",
         c.wave_ops ? "YES" : "NO",
@@ -527,6 +568,7 @@ void dx12_detect_device_caps(dx12_device* dev) {
         c.native_16bit ? "YES" : "NO");
     dx12_log(DX12_LOG_INFO, "Device caps: WaveMMATier=%d (0=not sup, 10=tier1.0)",
         (int)dev->options9.WaveMMATier);
+    dx12_log(DX12_LOG_INFO, "Device caps: GPU_UPLOAD_heap=%s (ReBAR)", c.gpu_upload_heap ? "YES" : "NO");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -879,13 +921,29 @@ void dx12_device_wait_idle(dx12_device* dev) {
 
 void dx12_device_wait_for_fence(dx12_device* dev, uint64_t fence_value) {
     if (!dev || !dev->fence) return;
-    if (dev->fence->GetCompletedValue() < fence_value) {
-        dev->fence->SetEventOnCompletion(fence_value, dev->fence_event);
-        DWORD wr = WaitForSingleObject(dev->fence_event, 10000);
-        if (wr == WAIT_TIMEOUT) {
-            dx12_log(DX12_LOG_ERROR, "wait_for_fence: fence timeout (device removed: 0x%08X)",
-                     (unsigned)dev->device->GetDeviceRemovedReason());
-            dev->device_lost.store(true);
+    if (dev->fence->GetCompletedValue() >= fence_value) return;
+
+    // Fence waits are the hot path (multiple per token: ring acquires,
+    // synchronize drain). WaitForSingleObject on the completion event costs
+    // ~100-500us of kernel-transition latency on this driver even when the GPU
+    // already finished — the GPU work per wait is ~0.1ms, so the event wait
+    // dominates. User-mode spin with a timed-event fallback is the standard
+    // game frame-pacing pattern.
+    uint32_t spins = 0;
+    while (dev->fence->GetCompletedValue() < fence_value) {
+        if (++spins < 1000) {
+            YieldProcessor();
+        } else if (spins < 100000) {
+            Sleep(0);
+        } else {
+            dev->fence->SetEventOnCompletion(fence_value, dev->fence_event);
+            DWORD wr = WaitForSingleObject(dev->fence_event, 10000);
+            if (wr == WAIT_TIMEOUT) {
+                dx12_log(DX12_LOG_ERROR, "wait_for_fence: fence timeout (device removed: 0x%08X)",
+                         (unsigned)dev->device->GetDeviceRemovedReason());
+                dev->device_lost.store(true);
+            }
+            break;
         }
     }
 }

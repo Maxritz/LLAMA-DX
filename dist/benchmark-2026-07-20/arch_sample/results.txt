@@ -1,0 +1,45 @@
+=== llama / Vulkan0 ===
+| llama 8B Q8_0                  |   7.95 GiB |     8.03 B | Vulkan,DX12 |  99 | Vulkan0      |           pp512 |       3696.80 ± 0.00 |
+| llama 8B Q8_0                  |   7.95 GiB |     8.03 B | Vulkan,DX12 |  99 | Vulkan0      |           tg128 |         71.71 ± 0.00 |
+
+=== llama / DX120 ===
+| llama 8B Q8_0                  |   7.95 GiB |     8.03 B | Vulkan,DX12 |  99 | DX120        |           pp512 |        513.08 ± 0.00 |
+| llama 8B Q8_0                  |   7.95 GiB |     8.03 B | Vulkan,DX12 |  99 | DX120        |           tg128 |         49.65 ± 0.00 |
+
+=== gemma4 / Vulkan0 ===
+| gemma4 ?B Q6_K                 |   9.10 GiB |    11.91 B | Vulkan,DX12 |  99 | Vulkan0      |           pp512 |       1609.89 ± 0.00 |
+| gemma4 ?B Q6_K                 |   9.10 GiB |    11.91 B | Vulkan,DX12 |  99 | Vulkan0      |           tg128 |         54.22 ± 0.00 |
+
+=== gemma4 / DX120 ===
+| gemma4 ?B Q6_K                 |   9.10 GiB |    11.91 B | Vulkan,DX12 |  99 | DX120        |           pp512 |        292.78 ± 0.00 |
+| gemma4 ?B Q6_K                 |   9.10 GiB |    11.91 B | Vulkan,DX12 |  99 | DX120        |           tg128 |         33.76 ± 0.00 |
+
+=== qwen / Vulkan0 ===
+| qwen3 4B Q8_0                  |   3.98 GiB |     4.02 B | Vulkan,DX12 |  99 | Vulkan0      |           pp512 |       6260.78 ± 0.00 |
+| qwen3 4B Q8_0                  |   3.98 GiB |     4.02 B | Vulkan,DX12 |  99 | Vulkan0      |           tg128 |        122.60 ± 0.00 |
+
+=== qwen / DX120 ===
+| qwen3 4B Q8_0                  |   3.98 GiB |     4.02 B | Vulkan,DX12 |  99 | DX120        |           pp512 |       1120.92 ± 0.00 |
+| qwen3 4B Q8_0                  |   3.98 GiB |     4.02 B | Vulkan,DX12 |  99 | DX120        |           tg128 |         71.92 ± 0.00 |
+
+=== deepseek / Vulkan0 ===
+| deepseek2 16B Q4_K - Medium    |   9.65 GiB |    15.71 B | Vulkan,DX12 |  99 | Vulkan0      |           pp512 |       5887.59 ± 0.00 |
+| deepseek2 16B Q4_K - Medium    |   9.65 GiB |    15.71 B | Vulkan,DX12 |  99 | Vulkan0      |           tg128 |        236.82 ± 0.00 |
+
+=== deepseek / DX120 ===
+| deepseek2 16B Q4_K - Medium    |   9.65 GiB |    15.71 B | Vulkan,DX12 |  99 | DX120        |           pp512 |        132.20 ± 0.00 |
+| deepseek2 16B Q4_K - Medium    |   9.65 GiB |    15.71 B | Vulkan,DX12 |  99 | DX120        |           tg128 |         15.39 ± 0.00 |
+
+=== laguna / Vulkan0 ===
+| laguna 33B.A3B IQ4_XS - 4.25 bpw |  16.84 GiB |    33.44 B | Vulkan,DX12 |  -1 | Vulkan0      |       1024 |           pp512 |        854.44 ± 0.00 |
+| laguna 33B.A3B IQ4_XS - 4.25 bpw |  16.84 GiB |    33.44 B | Vulkan,DX12 |  -1 | Vulkan0      |       1024 |           tg128 |         66.00 ± 0.00 |
+
+=== large1_Qwen3.6-27B-AEON / Vulkan0 ===
+| qwen35 27B Q5_K - Medium       |  18.18 GiB |    27.32 B | Vulkan,DX12 |  -1 | Vulkan0      |       1024 |           pp512 |        525.90 ± 0.00 |
+| qwen35 27B Q5_K - Medium       |  18.18 GiB |    27.32 B | Vulkan,DX12 |  -1 | Vulkan0      |       1024 |           tg128 |          6.39 ± 0.00 |
+
+=== large2_Qwen3.5-35B-A3B / Vulkan0 ===
+| qwen35moe 35B.A3B Q4_K - Medium |  18.32 GiB |    34.66 B | Vulkan,DX12 |  -1 | Vulkan0      |       1024 |           pp512 |        548.78 ± 0.00 |
+| qwen35moe 35B.A3B Q4_K - Medium |  18.32 GiB |    34.66 B | Vulkan,DX12 |  -1 | Vulkan0      |       1024 |           tg128 |         50.64 ± 0.00 |
+
+DONE

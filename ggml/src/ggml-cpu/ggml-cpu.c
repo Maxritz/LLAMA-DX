@@ -6,6 +6,7 @@
 #include "traits.h"
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
+#include "ggml-quants.h" // for quantize_row_f8_e4m3fn
 #include "quants.h"
 #include "ggml-threading.h"
 #include "unary-ops.h"
@@ -401,6 +402,54 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = quantize_row_tq2_0,
         .vec_dot                  = ggml_vec_dot_tq2_0_q8_K,
         .vec_dot_type             = GGML_TYPE_Q8_K,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TQ3_1S] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TQ4_1S] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_Q2_0] = {
+        .from_float               = quantize_row_q2_0,
+        .vec_dot                  = ggml_vec_dot_q2_0_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_Q2_0_64] = {
+        .from_float               = quantize_row_q2_0_64,
+        .vec_dot                  = ggml_vec_dot_q2_0_64_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TURBO2_0] = {
+        .from_float               = (ggml_from_float_t) quantize_row_turbo2_0_ref,
+        .vec_dot                  = ggml_vec_dot_turbo2_0_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TURBO3_0] = {
+        .from_float               = (ggml_from_float_t) quantize_row_turbo3_0_ref,
+        .vec_dot                  = ggml_vec_dot_turbo3_0_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TURBO4_0] = {
+        .from_float               = (ggml_from_float_t) quantize_row_turbo4_0_ref,
+        .vec_dot                  = ggml_vec_dot_turbo4_0_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_F8_E4M3FN] = {
+        .from_float               = (ggml_from_float_t) quantize_row_f8_e4m3fn,
+        .vec_dot                  = ggml_vec_dot_f8_e4m3fn_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
     [GGML_TYPE_I32] = {
@@ -2054,6 +2103,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_gated_delta_net(params, tensor);
             } break;
+        case GGML_OP_TURBO_WHT:
+            {
+                ggml_compute_forward_turbo_wht(params, tensor);
+            } break;
+        case GGML_OP_HADAMARD:
+            {
+                ggml_compute_forward_hadamard(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2234,6 +2291,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_TURBO_WHT:
+        case GGML_OP_HADAMARD:
             {
                 n_tasks = n_threads;
             } break;
@@ -2519,7 +2578,7 @@ static bool ggml_thread_apply_priority(int32_t prio) {
         // Newer Windows 11 versions aggressively park (offline) CPU cores and often place
         // all our threads onto the first 4 cores which results in terrible performance with
         // n_threads > 4
-        #if _WIN32_WINNT >= 0x0602
+        #if _WIN32_WINNT >= 0x0602 && defined(_MSC_VER)
         THREAD_POWER_THROTTLING_STATE t;
         ZeroMemory(&t, sizeof(t));
         t.Version     = THREAD_POWER_THROTTLING_CURRENT_VERSION;

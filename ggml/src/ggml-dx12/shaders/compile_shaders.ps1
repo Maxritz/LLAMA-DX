@@ -129,10 +129,15 @@ $Shaders = @(
     @{Name="write_const"; Threads=@{X=256;Y=1;Z=1}},
     # GEMV (Wave32-native, 8 rows × 32 lanes)
     @{Name="mv_f32"; Threads=@{X=256;Y=1;Z=1}},
+    @{Name="mv_f32_w64"; Threads=@{X=256;Y=1;Z=1}; Source="mv_f32"; Defines=@("DX12_WAVE_SIZE=64")},
     @{Name="mv_f16"; Threads=@{X=256;Y=1;Z=1}},
+    @{Name="mv_f16_w64"; Threads=@{X=256;Y=1;Z=1}; Source="mv_f16"; Defines=@("DX12_WAVE_SIZE=64")},
     @{Name="mv_q8_0"; Threads=@{X=256;Y=1;Z=1}},
+    @{Name="mv_q8_0_w64"; Threads=@{X=256;Y=1;Z=1}; Source="mv_q8_0"; Defines=@("DX12_WAVE_SIZE=64")},
     @{Name="mv_q4_0"; Threads=@{X=256;Y=1;Z=1}},
+    @{Name="mv_q4_0_w64"; Threads=@{X=256;Y=1;Z=1}; Source="mv_q4_0"; Defines=@("DX12_WAVE_SIZE=64")},
     @{Name="mv_kq"; Threads=@{X=256;Y=1;Z=1}},
+    @{Name="mv_kq_w64"; Threads=@{X=256;Y=1;Z=1}; Source="mv_kq"; Defines=@("DX12_WAVE_SIZE=64")},
     @{Name="mv_id"; Threads=@{X=256;Y=1;Z=1}},
     @{Name="flash_attn_ext"; Threads=@{X=256;Y=1;Z=1}},
     @{Name="flash_attn_ext_mq"; Threads=@{X=256;Y=1;Z=1}},
@@ -170,7 +175,7 @@ $DebugFlags = if ($Configuration -eq "Debug") { @("-Zi", "-Qembed_debug", "-Od")
 
 foreach ($shader in $Shaders) {
     $Name = $shader.Name
-    $HlslFile = Join-Path $ShaderDir "$Name.hlsl"
+    $HlslFile = Join-Path $ShaderDir "$($shader.Source ?? $Name).hlsl"
     $CsoFile = Join-Path $OutputDir "$Name.cso"
 
     if (-not (Test-Path $HlslFile)) {
@@ -187,6 +192,12 @@ foreach ($shader in $Shaders) {
         "-Fo", $CsoFile,
         $HlslFile
     ) + $DebugFlags
+
+    if ($shader.Defines) {
+        foreach ($d in $shader.Defines) {
+            $args += "-D", $d
+        }
+    }
 
     try {
         $output = & $DxcExe @args 2>&1

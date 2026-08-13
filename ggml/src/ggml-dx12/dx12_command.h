@@ -22,7 +22,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 struct dx12_command_list {
-    ComPtr<ID3D12GraphicsCommandList10> d3d_list;
+    ComPtr<ID3D12GraphicsCommandList4> d3d_list;
     ComPtr<ID3D12CommandAllocator>      allocator;
     dx12_device*                        device = nullptr;
     uint64_t                            fence_value = 0;

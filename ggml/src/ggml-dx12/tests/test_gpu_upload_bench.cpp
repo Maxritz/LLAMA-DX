@@ -47,8 +47,8 @@ static void fill_random(void* buf, size_t size) {
     for (size_t i = 0; i < size; i++) p[i] = (uint8_t)d(rng);
 }
 
-// ── Transition + copy helpers that work on raw ID3D12GraphicsCommandList10 ──
-static void raw_transition(ID3D12GraphicsCommandList10* d3d,
+// ── Transition + copy helpers that work on raw ID3D12GraphicsCommandList4 ──
+static void raw_transition(ID3D12GraphicsCommandList4* d3d,
                            dx12_buffer* buf, D3D12_RESOURCE_STATES new_state) {
     if (buf->heap == dx12_heap_type::upload || 
         buf->heap == dx12_heap_type::gpu_upload ||
@@ -72,7 +72,7 @@ static void raw_transition(ID3D12GraphicsCommandList10* d3d,
     buf->state = new_state;
 }
 
-static void raw_copy(ID3D12GraphicsCommandList10* d3d,
+static void raw_copy(ID3D12GraphicsCommandList4* d3d,
                      dx12_buffer* dst, size_t dst_off,
                      dx12_buffer* src, size_t src_off, size_t size) {
     d3d->CopyBufferRegion(dst->resource.Get(), dst_off,

@@ -20,12 +20,17 @@ RWByteAddressBuffer C : register(u2);
 
 groupshared float B_lds[B_CHUNK];
 
-[WaveSize(32)]
+#ifndef DX12_WAVE_SIZE
+#define DX12_WAVE_SIZE 32
+#endif
+#define WAVES_PER_GROUP (256 / DX12_WAVE_SIZE)
+
+[WaveSize(DX12_WAVE_SIZE)]
 [numthreads(256, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
-    uint sub  = gtid.x >> 5;
-    uint lane = gtid.x & 31u;
-    uint o = gid.x * 8 + sub;
+    uint sub  = gtid.x / DX12_WAVE_SIZE;
+    uint lane = gtid.x % DX12_WAVE_SIZE;
+    uint o = gid.x * WAVES_PER_GROUP + sub;
     bool valid = o < params.N;
 
     float acc = 0.0f;
@@ -45,8 +50,10 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             block_end = (block_end + 31u) >> 5;
 
             [loop]
-            for (uint b = block_start; b < block_end; b++) {
-                uint base = row_base + b * 18u;
+            for (uint b = block_start; b < block_end; b += (DX12_WAVE_SIZE / 32)) {
+                uint blk = b + (lane >> 5);
+                if (blk >= block_end) continue;
+                uint base = row_base + blk * 18u;
 
                 float d = 0.0f;
                 if (lane == 0) {
@@ -62,7 +69,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
                 uint byte_val = (dword_val >> byte_shift) & 0xFFu;
                 float w = (float)((lane >= 16u) ? (byte_val >> 4) : (byte_val & 0xFu)) - 8.0f;
 
-                uint k = b * 32u + lane;
+                uint k = blk * 32u + (lane & 31u);
                 if (k < params.K) {
                     acc += d * w * B_lds[k - chunk];
                 }

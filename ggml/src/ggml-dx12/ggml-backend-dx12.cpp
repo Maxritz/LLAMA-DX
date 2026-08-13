@@ -162,8 +162,9 @@ struct dx12_upload_batch {
             return;
         }
         if (staging) dx12_buffer_destroy(staging);
-        // RDNA4 workaround: GPU_UPLOAD + CopyBufferRegion can cause Close
-        // failures. Use regular UPLOAD heap for staging until verified stable.
+        // Plain UPLOAD heap. GPU_UPLOAD (ReBAR) measured SLOWER here (52 vs
+        // 84 t/s decode) despite ReBAR=YES — the RDNA4 Close-failure workaround
+        // applies on RDNA2 too; flush()'s retry path masks it into a stall.
         dx12_heap_type heap_type = dx12_heap_type::upload;
         staging = dx12_buffer_create(dev, new_cap, heap_type);
         capacity = staging ? new_cap : 0;
@@ -633,6 +634,20 @@ static void dx12_buf_set_tensor(ggml_backend_buffer_t buf, ggml_tensor* tensor,
         ? (size_t)((const char*)tensor->data - (const char*)mapped)
         : (size_t)((uintptr_t)tensor->data - 0x1000);
 
+    // One-shot debug: log QKV/FFN weight offsets to check fusion contiguity.
+    static bool s_probe = getenv("DX12_FUSION_PROBE") != nullptr;
+    if (s_probe && tensor->name) {
+        const char* n = tensor->name;
+        if (strstr(n, "attn_q") || strstr(n, "attn_k") || strstr(n, "attn_v") ||
+            strstr(n, "attn_output") || strstr(n, "ffn_gate") || strstr(n, "ffn_up") ||
+            strstr(n, "ffn_down")) {
+            dx12_log(DX12_LOG_INFO, "FUSION probe: %s off=%zu type=%s ne=[%lld,%lld] nbytes=%zu",
+                     n, tensor_off, ggml_type_name(tensor->type),
+                     (long long)tensor->ne[0], (long long)tensor->ne[1],
+                     (size_t)ggml_nbytes(tensor));
+        }
+    }
+
     if (mapped) {
         bool ok = dx12_buffer_upload(ctx->gpu_buffer, data, size, tensor_off + offset);
         if (f16_buf) free(f16_buf);
@@ -689,7 +704,7 @@ static void dx12_buf_set_tensor(ggml_backend_buffer_t buf, ggml_tensor* tensor,
     }
 
     // Record GPU copy
-    auto* d3d_cmd = reinterpret_cast<ID3D12GraphicsCommandList10*>(batch.cmd->d3d_list.Get());
+    auto* d3d_cmd = reinterpret_cast<ID3D12GraphicsCommandList4*>(batch.cmd->d3d_list.Get());
     dx12_log(DX12_LOG_VERBOSE, "upload: copy size=%zu staging_off=%zu dst_off=%llu",
              size, batch.used, (unsigned long long)(tensor_off + offset));
     d3d_cmd->CopyBufferRegion(
@@ -926,11 +941,22 @@ void ggml_backend_dx12_synchronize(ggml_backend_t backend) {
     auto* ctx = (ggml_backend_dx12_context*)backend->context;
     if (!ctx || !ctx->device) return;
 
+    dx12_profile_scope syn(ctx->device->gpu_timer, nullptr, "backend_sync");
+    (void)syn;
+
     // Flush any pending staging uploads before sync
-    dx12_flush_uploads(ctx->device);
+    {
+        dx12_profile_scope up(ctx->device->gpu_timer, nullptr, "sync_uploads");
+        (void)up;
+        dx12_flush_uploads(ctx->device);
+    }
 
     // Wait for all in-flight ring submissions
-    dx12_ring_wait_idle(ctx->device->ring);
+    {
+        dx12_profile_scope rw(ctx->device->gpu_timer, nullptr, "ring_drain");
+        (void)rw;
+        dx12_ring_wait_idle(ctx->device->ring);
+    }
 
     // Dump GPU timings if DX12_PROFILE env var is set.
     // After ring_wait_idle, the GPU has completed the latest resolve.
@@ -1006,6 +1032,9 @@ static bool ggml_backend_dx12_supports_op(ggml_backend_t backend,
     // COMPONENT 5 (dx12_graph.cpp) provides this check
     return dx12_op_supported(op);
 }
+
+static void dx12_dev_event_record(ggml_backend_t backend, ggml_backend_event_t event);
+static void dx12_dev_event_wait(ggml_backend_t backend, ggml_backend_event_t event);
 
 static bool ggml_backend_dx12_supports_buft(ggml_backend_t backend,
                                             ggml_backend_buffer_type_t buft) {
@@ -1424,17 +1453,62 @@ static bool dx12_dev_offload_op(ggml_backend_dev_t dev, const struct ggml_tensor
     return false;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Events — D3D12 fence-based. Lets ggml_backend_sched defer the per-chunk
+// synchronize (ggml-backend.cpp:1706) instead of draining the ring every token.
+//   event_record:        queue->Signal(fence, val) — mark all prior work done
+//   event_wait:          queue->Wait(fence, val)   — GPU waits, CPU does NOT block
+//   event_synchronize:   dx12_device_wait_for_fence — blocking wait
+// ═══════════════════════════════════════════════════════════════════════════════
+
+struct dx12_event_context {
+    dx12_device* dev = nullptr;
+    uint64_t     fence_value = 0;
+};
+
 static ggml_backend_event_t dx12_dev_event_new(ggml_backend_dev_t dev) {
-    (void)dev;
-    return nullptr;
+    uint32_t adapter_idx = (uint32_t)(uintptr_t)dev->context;
+    dx12_device* dxdev = dx12_get_or_create_device(adapter_idx);
+    if (!dxdev) return nullptr;
+    auto* ev = new dx12_event_context;
+    ev->dev = dxdev;
+    auto* event = new ggml_backend_event;
+    event->device  = dev;
+    event->context = ev;
+    return event;
 }
 
 static void dx12_dev_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
-    (void)dev; (void)event;
+    (void)dev;
+    if (!event) return;
+    delete (dx12_event_context*)event->context;
+    delete event;
+}
+
+static void dx12_dev_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
+    auto* ev = (dx12_event_context*)event->context;
+    auto* ctx = (ggml_backend_dx12_context*)backend->context;
+    if (!ev || !ev->dev || !ctx || !ctx->device) return;
+    // Use the same monotonic fence counter as the ring/command path.
+    uint64_t val = ev->dev->fence_value.fetch_add(1);
+    ev->dev->command_queue->Signal(ev->dev->fence.Get(), val);
+    ev->fence_value = val;
+}
+
+static void dx12_dev_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
+    auto* ev = (dx12_event_context*)event->context;
+    auto* ctx = (ggml_backend_dx12_context*)backend->context;
+    if (!ev || !ev->dev || !ctx || !ctx->device || ev->fence_value == 0) return;
+    // GPU-side wait: the queue blocks on this fence before running later
+    // work, but the CPU does not block — the scheduler can record ahead.
+    ctx->device->command_queue->Wait(ev->dev->fence.Get(), ev->fence_value);
 }
 
 static void dx12_dev_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
-    (void)dev; (void)event;
+    (void)dev;
+    auto* ev = (dx12_event_context*)event->context;
+    if (!ev || !ev->dev || ev->fence_value == 0) return;
+    dx12_device_wait_for_fence(ev->dev, ev->fence_value);
 }
 
 // Device iface instance (value so we can copy into ggml_backend_device.iface)

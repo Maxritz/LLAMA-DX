@@ -48,12 +48,18 @@ uint byte_of(uint dw, uint n) {
     return (dw >> (n * 8u)) & 0xFFu;
 }
 
-[WaveSize(32)]
+#ifndef DX12_WAVE_SIZE
+#define DX12_WAVE_SIZE 32
+#endif
+#define WAVES_PER_GROUP (256 / DX12_WAVE_SIZE)
+#define HALF_WAVES (DX12_WAVE_SIZE / 32)
+
+[WaveSize(DX12_WAVE_SIZE)]
 [numthreads(256, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
-    uint sub  = gtid.x >> 5;
-    uint lane = gtid.x & 31u;
-    uint o = gid.x * 8 + sub;
+    uint sub  = gtid.x / DX12_WAVE_SIZE;
+    uint lane = gtid.x % DX12_WAVE_SIZE;
+    uint o = gid.x * WAVES_PER_GROUP + sub;
     bool valid = o < params.N;
 
     uint block_bytes =
@@ -62,12 +68,18 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         210u;
     uint row_base = o * (params.K >> 8) * block_bytes;
 
+    // wave64: 64 lanes split into two 32-lane halves, each handling a
+    // separate 256-element block (HALF_WAVES blocks per loop step). The
+    // lane geometry below is computed from the 32-lane sub-lane (sub_lane).
+    uint sub_lane = lane & 31u;
+    uint blk_off  = lane >> 5;            // 0 / 1 (wave64), always 0 (wave32)
+
     // Lane geometry (Q4_K/Q5_K): lane owns qs dword `lane` of the block
-    uint j64 = lane >> 3;          // 64-element chunk 0..3
-    uint l0  = (lane & 7u) * 4u;   // first of 4 consecutive l positions
+    uint j64 = sub_lane >> 3;          // 64-element chunk 0..3
+    uint l0  = (sub_lane & 7u) * 4u;   // first of 4 consecutive l positions
     // Lane geometry (Q6_K)
-    uint half_i = lane >> 4;       // 128-element half 0..1
-    uint s      = (lane >> 3) & 1u; // low/high 32 within the half-quarter pair
+    uint half_i = sub_lane >> 4;       // 128-element half 0..1
+    uint s      = (sub_lane >> 3) & 1u; // low/high 32 within the half-quarter pair
 
     float acc = 0.0f;
 
@@ -83,9 +95,11 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             uint blk_end = min(chunk + B_CHUNK, params.K) >> 8;
 
             [loop]
-            for (; blk < blk_end; blk++) {
-                uint base = row_base + blk * block_bytes;
-                uint lds0 = (blk << 8) - chunk;
+            for (; blk < blk_end; blk += HALF_WAVES) {
+                uint cb  = blk + blk_off;
+                if (cb >= blk_end) continue;
+                uint base = row_base + cb * block_bytes;
+                uint lds0 = (cb << 8) - chunk;
 
                 if (params.qtype == 6u) {
                     // ── Q6_K: ql[128]@0 qh[64]@128 scales i8[16]@192 d@208 ──
@@ -99,7 +113,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
                     float fd_lo = d * (float)sc_lo;
                     float fd_hi = d * (float)sc_hi;
 
-                    uint ql = ldw(base + lane * 4u);
+                    uint ql = ldw(base + sub_lane * 4u);
                     uint qh = ldw(base + 128u + half_i * 32u + l0);
 
                     uint r_lo = half_i * 128u + s * 32u + l0;
@@ -145,7 +159,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
                     float dsc1 = d * sc1, m1 = dmin * mn1;
 
                     bool q5 = params.qtype == 5u;
-                    uint qs = A.Load(base + (q5 ? 48u : 16u) + lane * 4u);
+                    uint qs = A.Load(base + (q5 ? 48u : 16u) + sub_lane * 4u);
                     uint qh = q5 ? A.Load(base + 16u + l0) : 0u;
 
                     uint r_lo = j64 * 64u + l0;

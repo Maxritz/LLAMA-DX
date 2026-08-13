@@ -236,8 +236,10 @@ void dx12_report_live_objects();
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // Required for Agility SDK - tells Windows to use our D3D12Core.dll
+#ifdef DX12_AGILITY
 extern "C" { __declspec(dllexport) extern const UINT D3D12SDKVersion; }
 extern "C" { __declspec(dllexport) extern const char* D3D12SDKPath; }
+#endif
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Constant Buffer Ring Buffer (for root signature CBV bindings)

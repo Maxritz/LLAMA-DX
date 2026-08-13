@@ -65,8 +65,16 @@ compute shaders:
 - A device-cache/PSO-cache/CBV-ring resource model tuned around several AMD
   RDNA4-preview-driver-specific quirks (documented inline where they bite — see e.g.
   `dx12_ring.cpp` and `dx12_command.h` for the `first_use` allocator-reset workaround).
+- A live VRAM-budget ceiling (`DX12_MAX_VRAM_PCT`, default 92%) on buffer allocation,
+  so an oversized model fails to load cleanly instead of driving the GPU to full VRAM
+  exhaustion. `-fitt`'s own free-memory query respects the same ceiling.
 - `DX12_ENABLE_FA`, `DX12_FORCE_DEBUG_LAYER`, `DX12_SUBMIT_CHUNK` and similar env/CMake
   switches for opting into newer or higher-overhead paths without changing defaults.
+- `LLM_ARCH_LAGUNA` (Laguna XS.2, a 256x2.2B-expert MoE architecture with mixed
+  SWA/YaRN attention and per-head/per-element attention output gating), ported from
+  [Maxritz/llama.cpp-ROCM-Test](https://github.com/Maxritz/llama.cpp-ROCM-Test).
+  Architecture-only — not DX12-specific, works on both backends (Vulkan recommended,
+  see [Known open issues](#known-open-issues)).
 
 Shader model 6.10 / experimental features stay available but **DXLA (DirectX Linear
 Algebra) wave-matrix paths stay off by default** — the AMD preview driver used for
@@ -92,6 +100,52 @@ performance history (kernel-by-kernel root-cause analysis of earlier bottlenecks
 [KNOWN-ISSUE-test-backend-ops-crashes.md](KNOWN-ISSUE-test-backend-ops-crashes.md) for
 the one open, intermittent test-harness issue.
 
+### Vulkan vs DX12, one model per architecture family (2026-07-20)
+
+`-p 512 -n 128 -r 1`, `-ngl 99` (all fit fully in VRAM at that setting — no CPU split,
+so DX12's known CPU-split crash below doesn't apply to any of these):
+
+| Model | Params | Backend | pp512 (t/s) | tg128 (t/s) |
+| --- | --- | --- | ---: | ---: |
+| llama 8B Q8_0 | 8.03B | Vulkan0 | 3696.80 | 71.71 |
+| | | DX120 | 513.08 | 49.65 |
+| gemma4 (v2) Q6_K | 11.91B | Vulkan0 | 1609.89 | 54.22 |
+| | | DX120 | 292.78 | 33.76 |
+| qwen3 4B Q8_0 | 4.02B | Vulkan0 | 6260.78 | 122.60 |
+| | | DX120 | 1120.92 | 71.92 |
+| deepseek2 16B Q4_K (Lite) | 15.71B | Vulkan0 | 5887.59 | 236.82 |
+| | | DX120 | 132.20 | 15.39 |
+
+Note the deepseek2 row: DX12 is disproportionately slower there (~44x/~15x) compared to
+the roughly 5-7x gap the other three architectures show — a `deepseek2`-specific issue,
+not the general DX12-vs-Vulkan baseline. See [Known open issues](#known-open-issues).
+
+### Large models (exceed VRAM, need `-fitt` auto-fit)
+
+Vulkan0 only — these need a CPU/GPU split to fit in 16GB, which is DX12's known
+crashing path (see [Known open issues](#known-open-issues)):
+
+| Model | Params | pp512 (t/s) | tg128 (t/s) |
+| --- | --- | ---: | ---: |
+| laguna 33B.A3B IQ4_XS | 33.44B | 854.44 | 66.00 |
+| Qwen3.6-27B-AEON Q5_K | 27.32B | 525.90 | 6.39 |
+| Qwen3.5-35B-A3B Q4_K (MoE) | 34.66B | 548.78 | 50.64 |
+
+## Known open issues
+
+- **DX12 crashes on CPU/GPU split models** (`-ncmoe`, `-fitt`, or manual `-ngl` that
+  leaves a large fraction of the model on CPU). Root-caused: DX12 weight buffers use a
+  fake `0x1000`-based sentinel pointer for internal bookkeeping; when the CPU backend
+  is handed one of these tensors directly (as happens once enough of the model is
+  CPU-resident), it dereferences that fake pointer as if it were real host memory.
+  `STATUS_ACCESS_VIOLATION`, 100% reproducible. Full writeup and fix options:
+  [KNOWN-ISSUE-dx12-moe-cpu-offload-crash.md](KNOWN-ISSUE-dx12-moe-cpu-offload-crash.md).
+  Workaround: use Vulkan0 for any model that doesn't fit fully in VRAM.
+- **`deepseek2` runs disproportionately slower on DX12** than the general
+  DX12-vs-Vulkan gap (~15-45x vs. the usual ~5-7x for other architectures) — likely a
+  `mul_mat_id` MoE-routing dispatch issue specific to that architecture. Not yet
+  investigated. Use Vulkan0 for DeepSeek-family models until this is looked at.
+
 ## Building
 
 Requires Windows, a DX12-capable GPU, and:
@@ -111,6 +165,10 @@ bugs, at a real performance cost). Env vars checked at runtime: `DX12_ENABLE_FA`
 (opt into FlashAttention), `DX12_FA_NO_MQ` / `DX12_FA_NO_TILED` (disable specific FA
 kernel tiers for A/B testing), `DX12_SUBMIT_CHUNK` (chunk size for pipelined graph
 submission, default 48).
+
+`DX12_WAVE_SIZE=32|64` overrides GEMV decode wave size. Defaults to auto: wave64 on
+RDNA2 (measured +25% decode on RX 6700 XT: 108 vs 86 t/s), wave32 on wave32-only RDNA4.
+See `ggml/src/ggml-dx12/README-DX12.md` for the full architecture/wave-size matrix.
 
 For everything else — general build options, other backends, Docker, packaged
 binaries — see upstream's [docs/build.md](docs/build.md); it applies unchanged here.

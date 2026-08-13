@@ -109,9 +109,17 @@ dist/dx12-bundle/
 
 The bundle requires:
 - Windows 11 (or Windows 10 with recent update)
-- AMD Radeon RX 9070 XT (or other RDNA4 GPU with WaveMMA Tier 1.0)
+- Any DirectX 12 (Feature Level 12_2) capable GPU. Developed and primarily
+  benchmarked on an AMD Radeon RX 9070 XT (RDNA4). WaveMMA/DXLA (SM 6.10
+  linear-algebra intrinsics) is an *optional* fast path gated on RDNA4-class
+  hardware — it is not a hard requirement. On RDNA2/RDNA3 GPUs (e.g. RX 6000/
+  7000 series) the backend runs the same standard compute-shader kernels
+  without WaveMMA acceleration; expect lower absolute throughput than the
+  RX 9070 XT numbers below, but correct output. See
+  [USAGE.md](USAGE.md) for switches and RDNA-generation-specific notes.
 - Agility SDK 1.721.1 (included in bundle)
-- DXC 1.10.2605.2 at `C:\Users\rr\Desktop\Notllama-loc\new-DXMLDXAL\dxc-1.10.2605.2\bin\x64\dxc.exe`
+- DXC 1.10.2605.2 (shaders are pre-compiled to `.cso` and included in
+  `shaders/` — DXC itself is only needed if rebuilding from source)
 
 ## Performance Summary (RX 9070 XT)
 

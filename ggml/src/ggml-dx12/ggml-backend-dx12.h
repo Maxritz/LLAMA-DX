@@ -69,6 +69,11 @@ typedef struct {
     // DirectX 12 Options 16 (GPU_UPLOAD heap / ReBAR, native enum since Agility SDK 1.613)
     bool     gpu_upload_heap;        // D3D12_HEAP_TYPE_GPU_UPLOAD (=5)
 
+    // DirectX 12 Options 21 (Work Graphs, Shader Model 6.8).
+    // Plain uint32: this C-compatible header must not depend on d3d12.h enums.
+    // Values: 0 = not supported, 10 = tier 1.0, 11 = tier 1.1.
+    uint32_t work_graphs_tier;
+
     // GPU Info
     char     adapter_name[128];      // Human-readable GPU name
     uint64_t dedicated_vram_bytes;   // Dedicated video memory

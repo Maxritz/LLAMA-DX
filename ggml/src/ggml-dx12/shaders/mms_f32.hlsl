@@ -20,6 +20,14 @@ RWByteAddressBuffer A : register(u0);
 RWByteAddressBuffer B : register(u1);
 RWByteAddressBuffer D : register(u2);
 
+float load_b(uint addr) {
+    if (p.pad1 != 0u) { // b_f16: F16 KV cache
+        uint w = B.Load(addr & ~3u);
+        return f16tof32((addr & 2u) ? (w >> 16) : w);
+    }
+    return asfloat(B.Load(addr));
+}
+
 [numthreads(16, 16, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
     uint o = tid.x;
@@ -35,7 +43,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     [loop]
     for (uint k = 0; k < p.K; k++) {
         float a = asfloat(A.Load(a_base + k * p.anb0));
-        float b = asfloat(B.Load(b_base + k * p.bnb0));
+        float b = load_b(b_base + k * p.bnb0);
         acc += a * b;
     }
     D.Store(o * p.dnb0 + t * p.dnb1 + i2 * p.dnb2 + i3 * p.dnb3, asuint(acc));

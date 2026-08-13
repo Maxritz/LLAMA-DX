@@ -11,6 +11,7 @@
 #include <string.h>
 #include <assert.h>
 #include <float.h>
+#include <math.h>   // for exp2f, NAN
 #include <stdlib.h> // for qsort
 #include <stdio.h>  // for GGML_ASSERT
 
@@ -112,10 +113,56 @@ void quantize_row_tq2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, 
     quantize_row_tq2_0_ref(x, y, k);
 }
 
+void quantize_row_q2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK2_0 == 0);
+    block_q2_0 * GGML_RESTRICT y = vy;
+    quantize_row_q2_0_ref(x, y, k);
+}
+
+void quantize_row_q2_0_64(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK2_0_64 == 0);
+    block_q2_0_64 * GGML_RESTRICT y = vy;
+    quantize_row_q2_0_64_ref(x, y, k);
+}
+
 //===================================== Q8_K ==============================================
 
 void quantize_row_q8_K_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q8_K_ref(x, y, k);
+}
+
+//===================================== F8_E4M3FN ==========================================
+
+static inline float ggml_cpu_f8_e4m3fn_to_f32(uint8_t v) {
+    uint32_t sign     = (v >> 7u) & 0x1u;
+    uint32_t exponent = (v >> 3u) & 0xFu;
+    uint32_t mantissa = v & 0x7u;
+    if (exponent == 0xFu && mantissa == 0x7u) {
+        return NAN;
+    }
+    float val;
+    if (exponent == 0u) {
+        val = (float) mantissa / 8.0f * exp2f(-6.0f);
+    } else {
+        val = (1.0f + (float) mantissa / 8.0f) * exp2f((float) exponent - 7.0f);
+    }
+    return sign ? -val : val;
+}
+
+// F8_E4M3FN is per-element (block size 1, not block-quantized) and its vec_dot_type is
+// F32, so this is a plain decode-and-multiply-accumulate against a float row, mirroring
+// how F16/BF16 are wired in type_traits_cpu rather than the block-quantized q*_q8 pattern.
+void ggml_vec_dot_f8_e4m3fn_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    UNUSED(bs); UNUSED(bx); UNUSED(by); UNUSED(nrc);
+
+    const uint8_t * GGML_RESTRICT x = vx;
+    const float   * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+    for (int i = 0; i < n; i++) {
+        sumf += ggml_cpu_f8_e4m3fn_to_f32(x[i]) * y[i];
+    }
+    *s = sumf;
 }
 
 //===================================== Dot products =================================

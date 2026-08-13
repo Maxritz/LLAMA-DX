@@ -153,7 +153,7 @@ target_compile_features(ggml-dx12 PRIVATE cxx_std_20)
 target_link_libraries(ggml-dx12 PUBLIC ggml-base)
 
 # Link DirectStorage library from ds14 SDK
-target_link_directories(ggml-dx12 PRIVATE E:/DXllama/ds14/native/lib/x64)
+target_link_directories(ggml-dx12 PUBLIC E:/DXllama/ds14/native/lib/x64)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Shader Compilation
@@ -169,6 +169,7 @@ set(DX12_SHADERS
     dequant_q6_k
     dequant_q4_k
     dequant_q5_k
+    ei_probe
     cast_f16_f32
     cast_bf16_f16
     mul_mat_f16_f16
@@ -185,12 +186,17 @@ set(DX12_SHADERS
     mms_f32
     mms_f16
     mms_tiled
-    mv_f32
-    mv_f16
-    mv_q8_0
-    mv_q4_0
-    mv_kq
-    mv_id
+     mv_f32
+     mv_f32_w64
+     mv_f16
+     mv_f16_w64
+     mv_q8_0
+     mv_q8_0_w64
+     mv_q4_0
+     mv_q4_0_w64
+     mv_kq
+     mv_kq_w64
+     mv_id
     flash_attn_ext
     flash_attn_ext_mq
     flash_attn_ext_tiled
@@ -241,6 +247,7 @@ set(DX12_SHADERS
 set(DX12_SHADER_THREAD_GROUPS
     dequant_q4_0,256,1,1
     dequant_q8_0,256,1,1
+    ei_probe,64,1,1
     dequant_q6_k,64,1,1
     dequant_q4_k,64,1,1
     dequant_q5_k,64,1,1
@@ -259,12 +266,17 @@ set(DX12_SHADER_THREAD_GROUPS
     mms_f32,16,16,1
     mms_f16,16,16,1
     mms_tiled,16,16,1
-    mv_f32,256,1,1
-    mv_f16,256,1,1
-    mv_q8_0,256,1,1
-    mv_q4_0,256,1,1
-    mv_kq,256,1,1
-    mv_id,256,1,1
+     mv_f32,256,1,1
+     mv_f32_w64,256,1,1
+     mv_f16,256,1,1
+     mv_f16_w64,256,1,1
+     mv_q8_0,256,1,1
+     mv_q8_0_w64,256,1,1
+     mv_q4_0,256,1,1
+     mv_q4_0_w64,256,1,1
+     mv_kq,256,1,1
+     mv_kq_w64,256,1,1
+     mv_id,256,1,1
     flash_attn_ext,256,1,1
     flash_attn_ext_mq,256,1,1
     flash_attn_ext_tiled,16,16,1
@@ -336,7 +348,18 @@ set(DX12_SHADERS_DXLA
 list(REMOVE_ITEM DX12_SHADERS ${DX12_SHADERS_DXLA})
 
 foreach(SHADER_NAME ${DX12_SHADERS})
-    set(HLSL_FILE ${DX12_SHADER_DIR}/${SHADER_NAME}.hlsl)
+    # _w64 suffix: compile the base .hlsl with DX12_WAVE_SIZE=64.
+    # Convention: mv_f32.hlsl + mv_f32_w64.hlsl source, but only mv_f32.hlsl
+    # exists — the _w64 variant compiles the SAME file with -D DX12_WAVE_SIZE=64.
+    # Runtime selection is in dx12_graph.cpp:1009 (use_w64 ? "name_w64" : "name").
+    if(SHADER_NAME MATCHES "^mv_.*_w64$")
+        string(REGEX REPLACE "_w64$" "" _BASE_NAME "${SHADER_NAME}")
+        set(HLSL_FILE ${DX12_SHADER_DIR}/${_BASE_NAME}.hlsl)
+        set(SHADER_DEFINES -D DX12_WAVE_SIZE=64)
+    else()
+        set(HLSL_FILE ${DX12_SHADER_DIR}/${SHADER_NAME}.hlsl)
+        set(SHADER_DEFINES "")
+    endif()
     set(CSO_FILE ${DX12_CSO_DIR}/${SHADER_NAME}.cso)
     
     add_custom_command(
@@ -349,6 +372,7 @@ foreach(SHADER_NAME ${DX12_SHADERS})
             -Zi
             -Qembed_debug
             -HV 2021
+            ${SHADER_DEFINES}
             -I "${DX12_SHADER_DIR}"
             -I "${DXC_INCLUDE_DIR}"
             -Fo ${CSO_FILE}
@@ -409,7 +433,7 @@ endforeach()
 file(WRITE "${TG_JSON}" "${TG_CONTENT}")
 
 add_custom_command(
-    OUTPUT ${REGISTRY_H}
+    OUTPUT ${REGISTRY_CPP} ${REGISTRY_H}
     COMMAND ${CMAKE_COMMAND}
         -DINPUT_DIR=${DX12_CSO_DIR}
         -DOUTPUT_CPP=${REGISTRY_CPP}
@@ -427,12 +451,21 @@ target_sources(ggml-dx12 PRIVATE ${REGISTRY_CPP})
 target_include_directories(ggml-dx12 PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Copy Agility SDK DLLs to output directory
+# DX12_AGILITY: ON = bundle Agility SDK D3D12Core.dll (D3D12SDKVersion export,
+# ID3D12GraphicsCommandList10 / DXLA / Work-Graphs surface). OFF = run on the
+# inbox d3d12.dll (ID3D12GraphicsCommandList4, DXLA/Work-Graphs auto-off) —
+# required on stable drivers / non-Agility systems (e.g. RDNA2 6700 XT).
 # ═══════════════════════════════════════════════════════════════════════════════
+option(DX12_AGILITY "Bundle Agility SDK D3D12Core (DXLA + Work-Graphs surface)" ON)
+if(DX12_AGILITY)
+    target_compile_definitions(ggml-dx12 PRIVATE DX12_AGILITY)
+endif()
+
+# Copy Agility SDK DLLs to output directory (Agility build only)
 set(D3D12_CORE_DLL ${AGILITY_SDK_DIR}/build/native/bin/x64/D3D12Core.dll)
 set(D3D12_SDK_LAYERS_DLL ${AGILITY_SDK_DIR}/build/native/bin/x64/d3d12SDKLayers.dll)
 
-if(EXISTS ${D3D12_CORE_DLL})
+if(DX12_AGILITY AND EXISTS ${D3D12_CORE_DLL})
     set(DX12_COPY_DLLS_COMMANDS
         COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:ggml>/D3D12"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -441,7 +474,7 @@ if(EXISTS ${D3D12_CORE_DLL})
     )
 endif()
 
-if(EXISTS ${D3D12_SDK_LAYERS_DLL})
+if(DX12_AGILITY AND EXISTS ${D3D12_SDK_LAYERS_DLL})
     list(APPEND DX12_COPY_DLLS_COMMANDS
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${D3D12_SDK_LAYERS_DLL}

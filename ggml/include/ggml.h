@@ -428,8 +428,19 @@ extern "C" {
         // GGML_TYPE_IQ4_NL_8_8 = 38,
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
-        GGML_TYPE_Q1_0    = 41,
-        GGML_TYPE_COUNT   = 42,
+        GGML_TYPE_Q1_0      = 41,
+        GGML_TYPE_Q2_0      = 42, // Q2_0 quantization (upstream GGUF standard)
+        GGML_TYPE_TURBO2_0 = 43, // TurboQuant 2-bit KV-cache: WHT + 2-bit PolarQuant
+        GGML_TYPE_TURBO3_0 = 44, // TurboQuant 3-bit KV-cache: WHT + 3-bit PolarQuant
+        GGML_TYPE_TURBO4_0 = 45, // TurboQuant 4-bit KV-cache: WHT + 4-bit PolarQuant
+        GGML_TYPE_TQ3_1S   = 46, // TurboQuant 3-bit weight: WHT-rotated 8-level Lloyd-Max, block_size=32
+        GGML_TYPE_TQ4_1S   = 47, // TurboQuant 4-bit weight: WHT-rotated 16-level Lloyd-Max, block_size=32
+        GGML_TYPE_Q2_0_64  = 48, // Q2_0, PrismML/Bonsai "_g64" variant: same 2-bit encoding, block_size=64
+        GGML_TYPE_F8_E4M3FN = 50, // FP8 E4M3FN (per-tensor scale, UFM custom kernels)
+        GGML_TYPE_Q4_0_ROCMFP4      = 100, // ROCmFP4 experimental UE4M3 scales + packed AMD FP4 blocks
+        GGML_TYPE_Q4_0_ROCMFP4_FAST = 101, // ROCmFP4 single-scale speed layout
+
+        GGML_TYPE_COUNT     = 102,
     };
 
     // precision
@@ -473,6 +484,8 @@ extern "C" {
         GGML_FTYPE_MOSTLY_MXFP4   = 25, // except 1d tensors
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX_LEAN = 106, // ROCmFP4 Strix Halo size-biased K/V recipe
+
     };
 
     // available tensor operations:
@@ -568,6 +581,8 @@ extern "C" {
         GGML_OP_RWKV_WKV7,
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
+        GGML_OP_TURBO_WHT,
+        GGML_OP_HADAMARD,
 
         GGML_OP_UNARY,
 
@@ -1718,6 +1733,11 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
 
+    // Scalable-Softmax (SSMax): softmax with dimension-aware scaling sqrt(dim)
+    GGML_API struct ggml_tensor * ggml_ss_max(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
     // in-place, returns view(a)
     GGML_API struct ggml_tensor * ggml_soft_max_inplace(
             struct ggml_context * ctx,
@@ -2572,6 +2592,20 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             int64_t               K);
+
+    // Fast Walsh-Hadamard Transform (TurboQuant KV-cache)
+    // Applies in-place butterfly WHT to a F32 tensor
+    GGML_API struct ggml_tensor * ggml_turbo_wht(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
+    // Hadamard transform (generalized WHT)
+    // Supports F32 and F16 input, output is always F32.
+    // n is the transform block size (64/128/256/512, power of 2).
+    GGML_API struct ggml_tensor * ggml_hadamard(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   n);
 
     // custom operators
 

@@ -779,8 +779,8 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     __m128 acc_3 = _mm_setzero_ps();
 
     for (; ib + 1 < nb; ib += 2) {
-        _mm_prefetch(&x[ib] + sizeof(block_q4_0), _MM_HINT_T0);
-        _mm_prefetch(&y[ib] + sizeof(block_q8_0), _MM_HINT_T0);
+        _mm_prefetch((const char *)&x[ib] + sizeof(block_q4_0), _MM_HINT_T0);
+        _mm_prefetch((const char *)&y[ib] + sizeof(block_q8_0), _MM_HINT_T0);
 
         // Compute combined scale for the block 0 and 1
         const __m128 d_0_1 = _mm_set1_ps( GGML_CPU_FP16_TO_FP32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d) );
@@ -797,8 +797,8 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
         bx_1 = _mm_sub_epi8(bx_1, off);
         const __m128i i32_1 = mul_sum_i8_pairs(bx_1, by_1);
 
-        _mm_prefetch(&x[ib] + 2 * sizeof(block_q4_0), _MM_HINT_T0);
-        _mm_prefetch(&y[ib] + 2 * sizeof(block_q8_0), _MM_HINT_T0);
+        _mm_prefetch((const char *)&x[ib] + 2 * sizeof(block_q4_0), _MM_HINT_T0);
+        _mm_prefetch((const char *)&y[ib] + 2 * sizeof(block_q8_0), _MM_HINT_T0);
 
         // Compute combined scale for the block 2 and 3
         const __m128 d_2_3 = _mm_set1_ps( GGML_CPU_FP16_TO_FP32(x[ib + 1].d) * GGML_CPU_FP16_TO_FP32(y[ib + 1].d) );
@@ -1761,6 +1761,132 @@ void ggml_vec_dot_q2_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
     UNUSED(nb);
     ggml_vec_dot_q2_K_q8_K_generic(n, s, bs, vx, bx, vy, by, nrc);
 #endif
+}
+
+void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK2_0;
+    const int nb = n / qk;
+    assert(n % qk == 0);
+    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
+
+    const block_q2_0 * x = vx;
+    const block_q8_0 * y = vy;
+    float sumf = 0.0f;
+
+#if defined(__AVX2__)
+    for (int i = 0; i < nb; i++) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
+        __m256 acc = _mm256_setzero_ps();
+        for (int k = 0; k < 4; k++) {
+            const block_q8_0 * yb = &y[i*4 + k];
+            const float d1 = GGML_CPU_FP16_TO_FP32(yb->d);
+            const __m256 vd1 = _mm256_set1_ps(d1);
+            const uint8_t * qs = &x[i].qs[k*8];
+            float tmp[32];
+            for (int b = 0; b < 8; b++) {
+                const uint8_t byte = qs[b];
+                tmp[b*4+0] = (float)(((int)(byte & 3) - 1));
+                tmp[b*4+1] = (float)(((int)((byte>>2) & 3) - 1));
+                tmp[b*4+2] = (float)(((int)((byte>>4) & 3) - 1));
+                tmp[b*4+3] = (float)(((int)((byte>>6) & 3) - 1));
+            }
+            for (int j = 0; j < 32; j += 8) {
+                __m256 fv = _mm256_loadu_ps(tmp + j);
+                __m128i q8 = _mm_loadl_epi64((const __m128i *)(yb->qs + j));
+                __m256i q32 = _mm256_cvtepi8_epi32(q8);
+                __m256 fq = _mm256_cvtepi32_ps(q32);
+                fq = _mm256_mul_ps(fq, vd1);
+                acc = _mm256_fmadd_ps(fv, fq, acc);
+            }
+        }
+        sumf += d0 * hsum_float_8(acc);
+    }
+#else
+    for (int i = 0; i < nb; i++) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
+        float sumi = 0.0f;
+        for (int k = 0; k < 4; k++) {
+            const block_q8_0 * yb = &y[i*4 + k];
+            const float d1 = GGML_CPU_FP16_TO_FP32(yb->d);
+            const uint8_t * qs = &x[i].qs[k*8];
+            const int8_t  * qy = yb->qs;
+            int sumb = 0;
+            for (int b = 0; b < 8; b++) {
+                const uint8_t byte = qs[b];
+                sumb += ((int)(byte & 3) - 1) * qy[b*4];
+                sumb += ((int)((byte>>2) & 3) - 1) * qy[b*4+1];
+                sumb += ((int)((byte>>4) & 3) - 1) * qy[b*4+2];
+                sumb += ((int)((byte>>6) & 3) - 1) * qy[b*4+3];
+            }
+            sumi += d1 * sumb;
+        }
+        sumf += d0 * sumi;
+    }
+#endif
+    *s = sumf;
+}
+
+void ggml_vec_dot_q2_0_64_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK2_0_64;
+    const int nb = n / qk;
+    assert(n % qk == 0);
+    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
+
+    const block_q2_0_64 * x = vx;
+    const block_q8_0 * y = vy;
+    float sumf = 0.0f;
+
+#if defined(__AVX2__)
+    for (int i = 0; i < nb; i++) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
+        __m256 acc = _mm256_setzero_ps();
+        for (int k = 0; k < 2; k++) {
+            const block_q8_0 * yb = &y[i*2 + k];
+            const float d1 = GGML_CPU_FP16_TO_FP32(yb->d);
+            const __m256 vd1 = _mm256_set1_ps(d1);
+            const uint8_t * qs = &x[i].qs[k*8];
+            float tmp[32];
+            for (int b = 0; b < 8; b++) {
+                const uint8_t byte = qs[b];
+                tmp[b*4+0] = (float)(((int)(byte & 3) - 1));
+                tmp[b*4+1] = (float)(((int)((byte>>2) & 3) - 1));
+                tmp[b*4+2] = (float)(((int)((byte>>4) & 3) - 1));
+                tmp[b*4+3] = (float)(((int)((byte>>6) & 3) - 1));
+            }
+            for (int j = 0; j < 32; j += 8) {
+                __m256 fv = _mm256_loadu_ps(tmp + j);
+                __m128i q8 = _mm_loadl_epi64((const __m128i *)(yb->qs + j));
+                __m256i q32 = _mm256_cvtepi8_epi32(q8);
+                __m256 fq = _mm256_cvtepi32_ps(q32);
+                fq = _mm256_mul_ps(fq, vd1);
+                acc = _mm256_fmadd_ps(fv, fq, acc);
+            }
+        }
+        sumf += d0 * hsum_float_8(acc);
+    }
+#else
+    for (int i = 0; i < nb; i++) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
+        float sumi = 0.0f;
+        for (int k = 0; k < 2; k++) {
+            const block_q8_0 * yb = &y[i*2 + k];
+            const float d1 = GGML_CPU_FP16_TO_FP32(yb->d);
+            const uint8_t * qs = &x[i].qs[k*8];
+            const int8_t  * qy = yb->qs;
+            int sumb = 0;
+            for (int b = 0; b < 8; b++) {
+                const uint8_t byte = qs[b];
+                sumb += ((int)(byte & 3) - 1) * qy[b*4];
+                sumb += ((int)((byte>>2) & 3) - 1) * qy[b*4+1];
+                sumb += ((int)((byte>>4) & 3) - 1) * qy[b*4+2];
+                sumb += ((int)((byte>>6) & 3) - 1) * qy[b*4+3];
+            }
+            sumi += d1 * sumb;
+        }
+        sumf += d0 * sumi;
+    }
+#endif
+    *s = sumf;
 }
 
 void ggml_vec_dot_q3_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {

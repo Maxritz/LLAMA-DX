@@ -22,7 +22,7 @@ static constexpr uint32_t DX12_RING_CAPACITY = 8;
 
 struct dx12_ring_slot {
     ComPtr<ID3D12CommandAllocator>      allocator;
-    ComPtr<ID3D12GraphicsCommandList10> d3d_list;
+    ComPtr<ID3D12GraphicsCommandList4> d3d_list;
     uint64_t                            fence_value = 0;
     bool                                in_flight = false;
     bool                                first_use = true;

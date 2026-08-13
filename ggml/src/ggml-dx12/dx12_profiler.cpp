@@ -73,12 +73,15 @@ double dx12_gpu_timer::get_time_ms(uint32_t query_idx) {
     if (query_idx >= current_query) return 0.0;
     uint64_t* data = nullptr;
     D3D12_RANGE range{};
-    range.Begin = query_idx * 2 * sizeof(uint64_t);
-    range.End = (query_idx * 2 + 2) * sizeof(uint64_t);
+    range.Begin = 0;
+    range.End = current_query * 2 * sizeof(uint64_t);
     HRESULT hr = readback_buf->Map(0, &range, reinterpret_cast<void**>(&data));
-    if (FAILED(hr)) return 0.0;
-    uint64_t begin = data[0];
-    uint64_t end = data[1];
+    if (FAILED(hr) || !data) return 0.0;
+    // D3D12 Map returns the base of the resource regardless of range; the
+    // ResolveQueryData layout is [q0.begin,q0.end,q1.begin,q1.end,...], so
+    // index past prior queries.
+    uint64_t begin = data[query_idx * 2 + 0];
+    uint64_t end   = data[query_idx * 2 + 1];
     readback_buf->Unmap(0, nullptr);
     return (double)(end - begin) * gpu_freq_ms;
 }

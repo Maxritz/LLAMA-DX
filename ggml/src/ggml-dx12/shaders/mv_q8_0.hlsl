@@ -15,6 +15,14 @@
  */
 #define B_CHUNK 1024
 
+#ifndef DX12_WAVE_SIZE
+#define DX12_WAVE_SIZE 32
+#endif
+
+// Blocks processed per quad iteration: WS/8 (32 lanes -> 4, 64 lanes -> 8)
+#define QBLK (DX12_WAVE_SIZE / 8)
+#define QUAD_ALIGN(n) ((n) & ~(QBLK - 1))
+
 struct MMParams {
     uint M, N, K, pad;
 };
@@ -32,12 +40,12 @@ float load_f16(uint addr) {
     return f16tof32((addr & 2u) ? (w >> 16) : (w & 0xFFFFu));
 }
 
-[WaveSize(32)]
+[WaveSize(DX12_WAVE_SIZE)]
 [numthreads(256, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
-    uint sub  = gtid.x >> 5;
-    uint lane = gtid.x & 31u;
-    uint o = gid.x * 8 + sub;
+    uint sub  = gtid.x / DX12_WAVE_SIZE;
+    uint lane = gtid.x % DX12_WAVE_SIZE;
+    uint o = gid.x * (256 / DX12_WAVE_SIZE) + sub;
     bool valid = o < params.N;
 
     float acc = 0.0f;
@@ -57,11 +65,11 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         if (valid) {
             uint block_start = chunk >> 5;
             uint block_end = (min(chunk + B_CHUNK, params.K) + 31u) >> 5;
-            uint quad_end = block_start + ((block_end - block_start) & ~3u);
+            uint quad_end = block_start + QUAD_ALIGN(block_end - block_start);
 
             uint b4 = block_start;
             [loop]
-            for (; b4 < quad_end; b4 += 4) {
+            for (; b4 < quad_end; b4 += QBLK) {
                 uint base0 = row_base + b4 * 34u;
 
                 // Block scales: wave-uniform addresses -> scalar loads
@@ -69,7 +77,19 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
                 float d1 = load_f16(base0 + 34u);
                 float d2 = load_f16(base0 + 68u);
                 float d3 = load_f16(base0 + 102u);
-                float dt = (t == 0u) ? d0 : (t == 1u) ? d1 : (t == 2u) ? d2 : d3;
+#if DX12_WAVE_SIZE == 64
+                float d4 = load_f16(base0 + 136u);
+                float d5 = load_f16(base0 + 170u);
+                float d6 = load_f16(base0 + 204u);
+                float d7 = load_f16(base0 + 238u);
+#endif
+                float dt;
+#if DX12_WAVE_SIZE == 64
+                dt = (t == 0u) ? d0 : (t == 1u) ? d1 : (t == 2u) ? d2 : (t == 3u) ? d3
+                   : (t == 4u) ? d4 : (t == 5u) ? d5 : (t == 6u) ? d6 : d7;
+#else
+                dt = (t == 0u) ? d0 : (t == 1u) ? d1 : (t == 2u) ? d2 : d3;
+#endif
 
                 // Packed quant dword: 4 int8 for elements 4j..4j+3 of block b4+t
                 uint qaddr = base0 + t * 34u + 2u + j * 4u;
@@ -92,18 +112,20 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
                 acc += dt * dot(float4(q), bv);
             }
 
-            // Tail: leftover 1-3 blocks (K not a multiple of 128)
+            // Tail: leftover <QBLK blocks (K not a multiple of 128)
             [loop]
-            for (uint b = b4; b < block_end; b++) {
-                uint base = row_base + b * 34u;
+            for (uint b = b4; b < block_end; b += (DX12_WAVE_SIZE / 32)) {
+                uint blk = b + (lane >> 5);
+                if (blk >= block_end) continue;
+                uint base = row_base + blk * 34u;
                 float d = load_f16(base);   // wave-uniform -> scalar load
 
-                uint byte_addr = base + 2u + lane;
+                uint byte_addr = base + 2u + (lane & 31u);
                 uint dword_val = A.Load(byte_addr & ~3u);
                 uint byte_val = (dword_val >> ((byte_addr & 3u) * 8u)) & 0xFFu;
                 float w = (float)((int)(byte_val << 24) >> 24);
 
-                uint k = b * 32u + lane;
+                uint k = blk * 32u + (lane & 31u);
                 if (k < params.K) {
                     acc += d * w * B_lds[k - chunk];
                 }

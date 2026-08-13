@@ -185,7 +185,7 @@ void dx12_buffer_copy(dx12_command_list* cmd,
                       size_t size) {
     if (!cmd || !dst || !src || size == 0) return;
 
-    auto* d3d_cmd = reinterpret_cast<ID3D12GraphicsCommandList10*>(cmd->d3d_list.Get());
+    auto* d3d_cmd = reinterpret_cast<ID3D12GraphicsCommandList4*>(cmd->d3d_list.Get());
 
     d3d_cmd->CopyBufferRegion(
         dst->resource.Get(), dst_offset,
@@ -253,7 +253,7 @@ void dx12_buffer_transition(dx12_command_list* cmd,
     barrier.Transition.StateAfter = new_state;
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 
-    auto* d3d_cmd = reinterpret_cast<ID3D12GraphicsCommandList10*>(cmd->d3d_list.Get());
+    auto* d3d_cmd = reinterpret_cast<ID3D12GraphicsCommandList4*>(cmd->d3d_list.Get());
     d3d_cmd->ResourceBarrier(1, &barrier);
 
     buf->state = new_state;
@@ -304,7 +304,7 @@ void dx12_buffer_transition_batch(dx12_command_list* cmd,
     }
 
     if (n > 0) {
-        auto* d3d_cmd = reinterpret_cast<ID3D12GraphicsCommandList10*>(cmd->d3d_list.Get());
+        auto* d3d_cmd = reinterpret_cast<ID3D12GraphicsCommandList4*>(cmd->d3d_list.Get());
         d3d_cmd->ResourceBarrier(n, barriers);
     }
 }
@@ -390,7 +390,7 @@ void dx12_barrier_pre_dispatch(dx12_command_list* cmd,
     }
 
     if (n > 0) {
-        auto* d3d_cmd = reinterpret_cast<ID3D12GraphicsCommandList10*>(cmd->d3d_list.Get());
+        auto* d3d_cmd = reinterpret_cast<ID3D12GraphicsCommandList4*>(cmd->d3d_list.Get());
         d3d_cmd->ResourceBarrier(n, barriers);
     }
 

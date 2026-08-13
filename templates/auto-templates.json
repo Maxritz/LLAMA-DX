@@ -1,0 +1,13 @@
+{
+  "_comment": "Auto-detect chat templates by GGUF filename. When a user launches llama-server/cli without --chat-template(-file), the wrapper injects the matching entry. 'template' = path to a .jinja file; 'builtin' = a builtin llama.cpp template name.",
+  "patterns": [
+    { "match": "laguna-xs2",         "template": "templates/laguna_xs2.jinja" },
+    { "match": "Laguna-XS.2",        "template": "templates/laguna_xs2.jinja" },
+    { "match": "laguna-s-2.1",       "template": "templates/laguna_s21.jinja" },
+    { "match": "laguna_s",           "template": "templates/laguna_s21.jinja" },
+    { "match": "gemma-4-12B",        "builtin": "gemma" },
+    { "match": "Gemma-4-12B",        "builtin": "gemma" },
+    { "match": "GIGABATEMAN",        "builtin": "llama3" },
+    { "match": "gigabateman",        "builtin": "llama3" }
+  ]
+}

@@ -160,3 +160,39 @@ ggml/ggml/src/ggml-dx12/build/
 ggml/ggml/src/ggml-dx12/generated/
 ggml/ggml/src/ggml-dx12/graphify-out/
 ggml/ggml/src/ggml-dx12/*.bak
+ggml/src/ggml-dx12/build/
+ggml/src/ggml-dx12/generated/
+ggml/src/ggml-dx12/graphify-out/
+ggml/src/ggml-dx12/*.bak
+
+# Stale/experimental compiled shader objects (.cso) in source tree — the
+# CMake build regenerates these into the build dir. Ignore all, then un-ignore
+# the two that test_dxla_wave* / test_sm610_dxla_probe load via hardcoded path.
+ggml/ggml/src/ggml-dx12/shaders/*.cso
+ggml/src/ggml-dx12/shaders/*.cso
+!ggml/ggml/src/ggml-dx12/shaders/mul_mat_dxla_wave_f16_f16.cso
+!ggml/ggml/src/ggml-dx12/shaders/mul_mat_dxla_wave_f16_f16_trans.cso
+!ggml/src/ggml-dx12/shaders/mul_mat_dxla_wave_f16_f16.cso
+!ggml/src/ggml-dx12/shaders/mul_mat_dxla_wave_f16_f16_trans.cso
+
+# Test shader compile artifacts (sm_tests, probe)
+ggml/ggml/src/ggml-dx12/tests/sm_tests/*.cso
+ggml/src/ggml-dx12/tests/sm_tests/*.cso
+
+# Trace / work-in-progress notes
+ggml/ggml/src/ggml-dx12/TRACE-*.md
+ggml/src/ggml-dx12/TRACE-*.md
+
+# DX12 build artifacts / scratch (this fork)
+*.cso
+bench_results/
+dist/*.zip
+recovered-context-*.md
+updated-context-*.md
+SESSION_CONTEXT.md
+bench*.txt
+GpuDebuggingLog.txt
+temp_reg.*
+build-trace.md
+graphify-out/
+dist/*.txt

@@ -75,6 +75,7 @@ Environment knobs (debugging):
 | Variable | Effect |
 |---|---|
 | `DX12_DISABLE_OPS=softmax,mms,rope,...` | Disable op families at runtime (CPU fallback) to bisect wrong-output issues without rebuilding. Families: `mulmat, mms, ewbin, scale, unary, glu, rms, softmax, rope, getrows, cpy, setrows` |
+| `DX12_WAVE_SIZE=32\|64` | Override the GEMV wave size. Default is auto: wave64 on RDNA2 (measured +25% decode: 108 vs 86 t/s), wave32 on wave32-only RDNA4. See `mv_q8_0_w64` shader variant |
 | `GGML_SCHED_DEBUG=2` (+ `-v`) | Print the scheduler's node-to-backend assignment and split boundaries |
 
 ### Verifying correctness
@@ -170,7 +171,7 @@ those weight tensors are placed in CPU buffers automatically by llama.cpp), MoE 
 
 | Model | Arch | Result |
 |---|---|---|
-| Llama-3.2-1B-Instruct Q8_0 | llama | llama-bench pp512 376 t/s, tg128 110 t/s; greedy output token-identical to CPU |
+| Llama-3.2-1B-Instruct Q8_0 | llama | llama-bench pp128 **230 t/s**, tg64 **110 t/s**; greedy output token-identical to CPU |
 | Llama-3-8B Q8_0 (8.5 GB) | llama | ~40 t/s decode |
 | Qwen2.5-Coder-3B Q8_0 | qwen2 | ~62 t/s decode |
 | Qwen3-4B Q8_0 | qwen3 | ~55 t/s decode |
@@ -186,6 +187,35 @@ K-quants (Q4_K / Q5_K / Q6_K) run on GPU via `mv_kq`/`mm_kq` (dequant ported bit
 from ggml-quants.c). Large prefill matmuls are chunked along M so no single dispatch
 can exceed the ~2s TDR window.
 
+### Wave-size note (RDNA2 vs RDNA4)
+
+The GEMV decode path compiles paired shaders: a wave32 variant (`mv_q8_0`) and a wave64
+variant (`mv_q8_0_w64`). The `_w64` suffix denotes the wave64 compile (DX12_WAVE_SIZE=64
+passed to DXC). At runtime, `dx12_graph.cpp:1009` selects the variant from
+`dev->caps.prefers_wave64`, which is set per-architecture in `dx12_device.cpp:534`:
+
+| Arch | PCI ID range | prefers_wave64 | Reason |
+|---|---|---|---|
+| RDNA2 (Navi 2x) | 0x73xx, 0x68xx, 0x69xx | `true` | Wave32/64 capable; wave64 measured +25% on 6700 XT |
+| RDNA3 (Navi 3x) | 0x74xx | `false` | Wave64 not beneficial |
+| RDNA4 (Navi 4x) | 0x75xx | `false` | Wave32-only (min==max==32) |
+
+**Measured (RX 6700 XT RDNA2, Llama-3.2-1B-Instruct Q8_0):** wave64 tg64 **108 t/s**
+vs wave32 **86 t/s** (+25%).
+**Measured (RX 9070 XT RDNA4, Llama-3.2-1B-Instruct Q8_0):** neutral (~230 t/s either
+way), stays wave32.
+
+`DX12_WAVE_SIZE=32|64` overrides auto-selection.
+
+**Adding a new wave-size pairing:**
+1. Create the `_w64` HLSL variant (copy the base, change `[numthreads]` to use
+   `WaveSize=64` via `DX12_WAVE_SIZE` — see `shaders/mv_f32.hlsl` vs `mv_f32_w64.hlsl`).
+2. Add the base name and the `_w64` name to `DX12_SHADERS` in `CMakeLists.txt`.
+   The CMake compile loop (`CMakeLists.txt:350`) auto-detects `_w64` names and passes
+   `-D DX12_WAVE_SIZE=64`.
+3. Wire the selection in `dx12_graph.cpp:1009` — add the `use_w64 ? "name_w64" : "name"`
+   ternary to the switch case for that op.
+
 Remaining perf work: shared-memory tiled prefill GEMM, wave-intrinsic reductions,
 FLASH_ATTN_EXT kernel, K-quant matmul kernels, quantized KV cache.
 
@@ -196,3 +226,8 @@ FLASH_ATTN_EXT kernel, K-quant matmul kernels, quantized KV cache.
 - Shaders in `shaders/*.hlsl` are compiled by CMake with DXC into `.cso` and embedded into
   the binary via a generated `dx12_shader_registry.cpp`. Add a shader = add the `.hlsl`
   file + append its name to `DX12_SHADERS` in `CMakeLists.txt`.
+  - For wave64 variants, append the `_w64` name too (the compile loop handles it
+    automatically — see above).
+- GPU architecture detection lives in `dx12_device.cpp:dx12_detect_gpu_architecture()`.
+  Device IDs are ordered newest-gen-first (RDNA4 → RDNA3 → RDNA2). See the comment block
+  above that function for the PCI ID table and how to add a new RDNA generation.
