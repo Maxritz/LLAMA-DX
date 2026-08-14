@@ -427,6 +427,12 @@ bool dx12_op_supported(const ggml_tensor* node) {
         case GGML_OP_TRANSPOSE:
         case GGML_OP_NONE:
             return true;
+
+        default:
+            // Any ggml_op with no case above has no DX12 kernel. Must return
+            // false (not garbage) so the scheduler routes it to CPU instead
+            // of dispatching to a backend that silently can't run it.
+            return false;
     }
 }
 

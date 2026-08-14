@@ -1606,6 +1606,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 }
             } else {
                 buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
+                if (buf == nullptr) {
+                    // VRAM exhausted (or buffer type failed): spill weights to system RAM,
+                    // same fallback already used for the KV cache (llama-kv-cache.cpp).
+                    ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
+                    if (buft != cpu_buft) {
+                        LLAMA_LOG_WARN("%s: %s weight buffer allocation failed, spilling weights to CPU\n",
+                                __func__, ggml_backend_buft_name(buft));
+                        buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, cpu_buft);
+                    }
+                }
             }
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));

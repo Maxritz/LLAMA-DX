@@ -1,3 +1,59 @@
+# DX12 backend: crash on CPU/DX12 split graphs (OPEN, WORSE 2026-08-14)
+
+**Update (2026-08-14) — crash is gone, replaced by silent data corruption,
+which is worse.** On current HEAD (`b80-7259f40`, RX 9070 XT):
+`qwable-v1-mxfp4_moe.gguf -dev DX120 -ncmoe 20 -n 128 -p "Explain how
+photosynthesis works in detail." -st` no longer crashes — but the output is
+incoherent garbage tokens, not an answer. Ruled out the model/quant itself:
+the identical model+prompt on `-dev none -ngl 0` (pure CPU, no split at all)
+produces a normal, coherent response. So the defect is still exactly what the
+root-cause section below describes (CPU reading a non-host DX12 pointer) —
+it's just no longer landing on an unmapped page, so it reads garbage instead
+of faulting. Initial "resolved" note (SESSION_FIXES.md #4 sounded like the
+same mechanism) was wrong — that fix only covers recurrent/hybrid layers
+(`create_memory`/`get_layer_buft_list`), it never touched `GGML_OP_MUL_MAT_ID`
+or the MoE expert-offload path. Do not close this until output correctness is
+verified, not just absence of a crash.
+
+**2026-08-14 deep trace, ruled out (checked via `GGML_SCHED_DEBUG=2 -v` dump +
+source reading, all confirmed correct — do not re-check these first)**:
+- Scheduler backend assignment for `MUL_MAT_ID`: correct. CPU-assigned nodes
+  (weight on CPU via `-ncmoe`) get proper `CPU#<src>` copy tensors for their
+  DX12-resident non-weight srcs (`attn_post_norm-N`, `ffn_moe_topk-N`), and
+  the DX12-assigned consumer of the CPU output gets a proper `DX12#<src>`
+  copy tensor back. Not a missing-copy bug.
+- `dx12_flush_uploads(dev, false)` runs at the top of every
+  `ggml_backend_dx12_graph_compute` (`ggml-backend-dx12.cpp:995`), so batched
+  CPU→DX12 uploads (`dx12_buf_set_tensor`'s deferred staging) are queued
+  before that split's own dispatches — same DIRECT queue, FIFO order holds.
+  Not a stale-upload bug.
+- `dx12_buf_get_tensor`'s DX12→CPU readback (`ggml-backend-dx12.cpp:772`)
+  submits via `dx12_cmd_list_submit_and_wait`, a real blocking fence wait
+  (`dx12_device_wait_for_fence`). Fence values are seeded at 1
+  (`dx12_device.cpp:709`), so the `if (fence > 0)` guard in
+  `dx12_cmd_list_submit_and_wait` is never skipped — not the "fence==0 never
+  waited" bug it looked like at first glance.
+- Ring-buffer compute submission (`dx12_ring_submit`) calls
+  `ExecuteCommandLists` synchronously on the CPU side before
+  `dx12_graph_compute_end` returns — GPU single-queue FIFO ordering should
+  hold between split N's compute and split N+1's readback without needing an
+  explicit cross-split wait.
+
+Output varies between runs on the same command (not the same garbage twice),
+consistent with reading uninitialized/stale memory rather than a fixed
+corrupted offset.
+
+**Next step for whoever picks this up**: needs a PIX for Windows GPU capture
+(or manual value-diffing instrumentation) comparing the CPU-computed
+`ffn_moe_down-N` bytes against what the DX12 `MUL` node actually reads for
+`DX12#ffn_moe_down-N#`, and separately what the CPU `MUL_MAT_ID` node reads
+for `CPU#attn_post_norm-N#`/`CPU#ffn_moe_topk-N#` vs what DX12 actually wrote.
+Static source reading of the scheduler/backend code is exhausted — every
+mechanism checked above is individually correct, so the bug is likely in
+something not visible from that level (a wrong byte offset/size for a
+specific op's output, or a genuine hardware/driver-level race that only a
+GPU capture tool can catch).
+
 # DX12 backend: crash on CPU/DX12 split graphs (OPEN 2026-07-20)
 
 **Scope correction #2 (2026-07-20, benchmark sweep)**: the "manual `-ngl`
