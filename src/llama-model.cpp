@@ -1608,9 +1608,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
                 if (buf == nullptr) {
                     // VRAM exhausted (or buffer type failed): spill weights to system RAM,
-                    // same fallback already used for the KV cache (llama-kv-cache.cpp).
+                    // same fallback already used for the KV cache (llama-kv-cache.cpp). Only
+                    // safe when this ctx spans a single allocator chunk (no tensor already
+                    // has data set) - if a later chunk failed after an earlier one
+                    // succeeded, ggml-alloc's cleanup already freed the earlier chunk's
+                    // buffer but left its tensors' data/buffer pointers dangling (non-null),
+                    // and a retry here can't detect or re-allocate them, causing a
+                    // use-after-free once their weights are written.
+                    bool any_tensor_allocated = false;
+                    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                        if (t->data != nullptr) { any_tensor_allocated = true; break; }
+                    }
                     ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
-                    if (buft != cpu_buft) {
+                    if (!any_tensor_allocated && buft != cpu_buft) {
                         LLAMA_LOG_WARN("%s: %s weight buffer allocation failed, spilling weights to CPU\n",
                                 __func__, ggml_backend_buft_name(buft));
                         buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, cpu_buft);
