@@ -1599,6 +1599,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         } else {
             ggml_backend_buffer_t buf;
+            bool spilled_zero_copy = false;
             if (ml.no_alloc) {
                 buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
                 for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
@@ -1623,22 +1624,62 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     if (!any_tensor_allocated && buft != cpu_buft) {
                         LLAMA_LOG_WARN("%s: %s weight buffer allocation failed, spilling weights to CPU\n",
                                 __func__, ggml_backend_buft_name(buft));
-                        buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, cpu_buft);
+
+                        // If the model is mmap'd, wrap the existing mmap'd bytes directly on the
+                        // CPU device (ggml_backend_dev_buffer_from_host_ptr, same call the mmap
+                        // branch above uses) instead of malloc + copy. load_all_data() already
+                        // handles this itself: for any tensor whose buft's buf_map entry is set
+                        // and ->data is still null, it calls ggml_backend_tensor_alloc() (pointer
+                        // assignment into the mmap'd bytes) instead of ggml_backend_tensor_set()
+                        // (a real copy) - see llama-model-loader.cpp's use_mmap branch. So all
+                        // that's needed here is populating bufs/buf_map correctly; the zero-copy
+                        // behavior downstream is automatic - just don't also run the malloc-path
+                        // bufs/buf_map bookkeeping below for this ctx.
+                        ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                        ggml_backend_dev_props cpu_props{};
+                        if (cpu_dev) {
+                            ggml_backend_dev_get_props(cpu_dev, &cpu_props);
+                        }
+                        if (ml.use_mmap && cpu_dev && cpu_props.caps.buffer_from_host_ptr) {
+                            spilled_zero_copy = true;
+                            for (uint32_t idx = 0; idx < ml.files.size() && spilled_zero_copy; idx++) {
+                                void * addr = nullptr;
+                                size_t first, last; // NOLINT
+                                ml.get_mapping_range(&first, &last, &addr, idx, ctx);
+                                if (first >= last) {
+                                    continue;
+                                }
+                                const size_t max_size = ggml_get_max_tensor_size(ctx);
+                                ggml_backend_buffer_t mbuf = ggml_backend_dev_buffer_from_host_ptr(
+                                        cpu_dev, (char *) addr + first, last - first, max_size);
+                                if (mbuf == nullptr) {
+                                    spilled_zero_copy = false;
+                                    break;
+                                }
+                                bufs.emplace_back(mbuf);
+                                buf_map.emplace(idx, mbuf);
+                            }
+                        }
+                        if (!spilled_zero_copy) {
+                            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, cpu_buft);
+                        }
                     }
                 }
             }
-            if (buf == nullptr) {
-                throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
-            }
-            if (use_mlock && ggml_backend_buffer_is_host(buf)) {
-                pimpl->mlock_bufs.emplace_back(new llama_mlock);
-                auto & mlock_buf = pimpl->mlock_bufs.back();
-                mlock_buf->init   (ggml_backend_buffer_get_base(buf));
-                mlock_buf->grow_to(ggml_backend_buffer_get_size(buf));
-            }
-            bufs.emplace_back(buf);
-            for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
-                buf_map.emplace(idx, buf);
+            if (!spilled_zero_copy) {
+                if (buf == nullptr) {
+                    throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+                }
+                if (use_mlock && ggml_backend_buffer_is_host(buf)) {
+                    pimpl->mlock_bufs.emplace_back(new llama_mlock);
+                    auto & mlock_buf = pimpl->mlock_bufs.back();
+                    mlock_buf->init   (ggml_backend_buffer_get_base(buf));
+                    mlock_buf->grow_to(ggml_backend_buffer_get_size(buf));
+                }
+                bufs.emplace_back(buf);
+                for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
+                    buf_map.emplace(idx, buf);
+                }
             }
         }
 
