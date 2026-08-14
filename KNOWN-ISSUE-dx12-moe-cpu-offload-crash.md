@@ -43,6 +43,19 @@ Output varies between runs on the same command (not the same garbage twice),
 consistent with reading uninitialized/stale memory rather than a fixed
 corrupted offset.
 
+**Not MXFP4-specific**: also reproduces on `Qwable-27b_Q4_K_M.gguf`
+(standard Q4_K_M, not MXFP4) with `-dev DX120 -ncmoe 20 -ngl 30` — different
+garbage shape (fragments of list/chat-turn formatting bleeding through
+rather than raw symbol noise, but still not a real answer). Confirms this is
+a general DX12 `-ncmoe` CPU/GPU split defect, not an MXFP4 dequant bug.
+
+Also found while testing this: the weight-buffer CPU-spill fallback (this
+session's earlier fix) could itself segfault on a multi-chunk allocation
+context (use-after-free via `ggml_backend_tensor_set` on a freed buffer,
+`0xFEEEFEEE` marker) — fixed separately, see git log. Unrelated to the
+corruption bug above; was a new regression from the spill fix, not a
+pre-existing defect.
+
 **Next step for whoever picks this up**: needs a PIX for Windows GPU capture
 (or manual value-diffing instrumentation) comparing the CPU-computed
 `ffn_moe_down-N` bytes against what the DX12 `MUL` node actually reads for
