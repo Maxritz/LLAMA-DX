@@ -32,6 +32,19 @@ MXFP4-specific defect that's still open. Re-scope any further MXFP4
 investigation as its own issue, separate from this one — don't assume it's
 the same root cause just because the trigger command looks identical.
 
+**2026-08-14, MXFP4 sub-trace, ruled out**: checked whether MXFP4 expert
+weights end up on a DX12 buffer despite DX12 having zero MXFP4 support
+(confirmed: not in `dx12_op_supported`'s MUL_MAT/MUL_MAT_ID type allowlist,
+not in any dequant/quantize kernel — `GGML_TYPE_MXFP4` appears nowhere in
+`ggml-dx12/*.cpp`). `GGML_SCHED_DEBUG=2 -v` on the actual failing run shows
+this ISN'T happening here: every MoE expert weight across all ~40 layers
+correctly lands on `[CPU]`, with proper `CPU#`-prefixed copy tensors for
+cross-backend inputs where needed. So the corruption is coming from
+somewhere else, not a backend/buffer placement mismatch. Needs live tensor
+value inspection (PIX, or manual value dumps comparing CPU vs whatever DX12
+touches) to actually find it — static scheduler tracing is exhausted for
+this one.
+
 # DX12 backend: crash on CPU/DX12 split graphs (OPEN, WORSE 2026-08-14, historical)
 
 **Update (2026-08-14) — crash is gone, replaced by silent data corruption,
