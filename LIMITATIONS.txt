@@ -1,0 +1,61 @@
+LLAMADX (DirectX 12 backend for llama.cpp) - Known Limitations
+================================================================
+Build date: 2026-08-14. See LLAMADX-Usage.md (repo root) for full usage docs
+and KNOWN-ISSUE-dx12-moe-cpu-offload-crash.md for the detailed trace behind
+the MoE issue below.
+
+1. MXFP4-quantized MoE models produce garbled/incoherent output
+   -----------------------------------------------------------
+   Models quantized as MXFP4 (e.g. some MoE releases) will load and run
+   without crashing under -ncmoe CPU offload, but generate incoherent
+   text (repeated characters or garbage tokens) instead of a real answer.
+   Confirmed NOT caused by the model file itself (CPU-only inference on
+   the same file is correct). Root cause not found - open issue.
+   Workaround: none currently. Avoid MXFP4 MoE models on this backend, or
+   use CPU-only inference (-dev none) for them.
+
+   Standard-quant MoE models (Q4_K_M, Q4_K_XL, etc.) with -ncmoe CPU
+   offload DO work correctly as of this build (verified on both RX 9070 XT
+   and RX 6700 XT).
+
+2. Some Qwen3.5-family dense models produce near-empty output at full GPU
+   offload
+   ------------------------------------------------------------------------
+   Example: Qwen3.5-9B variants with -ngl 99 may generate only a few
+   tokens (e.g. an empty "</think>" block) instead of a real answer, while
+   the identical model on CPU (-dev none) answers correctly. Flash
+   attention was ruled out as the cause. Root cause not found - open issue.
+   Workaround: none currently confirmed. Try -dev none (CPU) for affected
+   models if output looks truncated/empty.
+
+3. VRAM allocator failures - what to expect
+   ------------------------------------------
+   - Weight buffers and the KV cache automatically fall back ("spill") to
+     system RAM if they don't fit VRAM - you'll see "spilling weights to
+     CPU" / "spilling KV cache to CPU" in the log. This is expected and
+     not an error.
+   - Compute/activation buffers do NOT spill - if these don't fit, the
+     model load or a decode call fails cleanly with an error message
+     instead of crashing. Reduce -c (context size) or increase -ncmoe/
+     reduce -ngl if you hit this.
+   - A 92% VRAM budget ceiling is enforced before every allocation
+     (override with the DX12_MAX_VRAM_PCT env var, 0.0-1.0) to avoid
+     driver-level instability from over-committing VRAM.
+
+4. Heavy CPU offload uses significant system RAM
+   -----------------------------------------------
+   Loading a large model with substantial -ncmoe/-ngl CPU offload can use
+   noticeably more RAM than the model file size (mmap page cache + CPU-
+   resident tensors + KV cache + compute buffers). This is expected
+   behavior, not a bug, for the amount currently offloaded to CPU.
+
+General notes
+-------------
+- Use -st (--single-turn) for scripted/non-interactive runs, not -no-cnv -
+  the latter can silently no-op and spin in an infinite loop on closed
+  stdin.
+- -ncmoe N keeps the first N layers' MoE expert weights on CPU.
+- -ngl N controls how many dense/attention layers stay on GPU.
+- -fitt lets the auto-fit logic pick a split automatically instead of
+  guessing -ngl/-ncmoe by hand.
+- Run "llama-cli.exe --list-devices" to see available GPUs.
