@@ -108,15 +108,22 @@ cleanly instead.
   ~336 ROPE-related CPU splits) — `dx12_op_supported`'s `GGML_OP_ROPE` case
   (`dx12_graph.cpp:244`) rejects odd `n_dims` (partial rotary), which this
   model family likely uses. The resulting CPU/DX12 crossings looked
-  structurally correct on spot-check, so root cause isn't confirmed — needs
-  live tensor-value tracing, not more static reading.
-- **CPU weight-spill uses ~3x file size in RAM during load** (e.g. 16.5GB
-  model → ~52GB RAM briefly). The spill fallback (`llama-model.cpp`) does a
-  real `malloc` + copy from the mmap'd GGUF instead of reusing this
-  codebase's existing zero-copy `buffer_from_host_ptr` path (already used
-  for the normal CPU-default-buft mmap case). Efficiency issue, not
-  correctness — real fix exists but risky to bolt onto a same-session change
-  without a full test pass budgeted.
+  structurally correct on spot-check. **Ruled out**: flash attention
+  (`DX12_DISABLE_OPS=flashattn` — same broken output). Still open, root
+  cause not confirmed — needs live tensor-value tracing, not more static
+  reading.
+- **CPU weight-spill fallback now uses zero-copy when mmap'd** (fixed) —
+  wraps the mmap'd bytes directly via `ggml_backend_dev_buffer_from_host_ptr`
+  instead of malloc + copy, matching how `load_all_data()` already handles
+  the normal mmap case. **Important**: the ~52GB-RAM-for-a-16.5GB-model
+  observation that prompted this fix was independently confirmed to **not**
+  be caused by the spill path at all — `spilling weights to CPU` never
+  appeared in any log from that session, including the run that showed it.
+  That RAM usage is normal cost of placing a large `-ncmoe`/`-ngl`-selected
+  portion of a big model on CPU (mmap page cache + KV cache + compute
+  buffers), not a spill-fallback bug. This fix is still a real correctness
+  improvement for the actual VRAM-OOM-fallback case, but don't expect it to
+  change RAM usage in the common heavy-offload case.
 
 ## Known issues
 
