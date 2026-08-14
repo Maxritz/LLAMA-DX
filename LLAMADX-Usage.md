@@ -124,6 +124,19 @@ cleanly instead.
   buffers), not a spill-fallback bug. This fix is still a real correctness
   improvement for the actual VRAM-OOM-fallback case, but don't expect it to
   change RAM usage in the common heavy-offload case.
+  **2026-08-14 follow-up**: could not get a live trigger of this zero-copy
+  branch this session despite 3 attempts under real VRAM pressure (8GB free
+  down to a forced 30% ceiling, two different models) — every attempt hit
+  the *multi-chunk* safe-throw path instead (task #17's guard; clean fail,
+  no crash, as designed). That suggests multi-chunk buft groups (a layer's
+  tensors exceeding one allocator chunk's max size) may be the *common* case
+  for OOM in practice on these models, not the single-chunk case this fix
+  targets. If so, the higher-value follow-up isn't this zero-copy path at
+  all - it's teaching the multi-chunk case to recover instead of clean-fail
+  (a materially harder, riskier change - see task #17's fix commit for why
+  the current guard exists). Confidence in the zero-copy fix itself remains
+  reasoning-based only (matches `load_all_data()`'s existing mechanism
+  exactly, builds clean, no regressions) - not empirically observed.
 
 ## Known issues
 
