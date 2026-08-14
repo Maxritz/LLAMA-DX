@@ -99,6 +99,25 @@ cleanly instead.
 | `DX12_FORCE_DEBUG_LAYER` | Turn on the D3D12 debug layer (catches API misuse the driver doesn't). |
 | `DX12_WAVE_SIZE` | Override detected wave size (32/64). |
 
+## Known issues (2026-08-14 additions, not fixed this session)
+
+- **9B/Qwen3.5-family dense models, full GPU offload, near-empty output**
+  (e.g. `Qwen3.5-9b-Sushi-Coder-RL.Q4_K_M.gguf -dev DX120 -ngl 99` → just
+  `</think>` and nothing else, while `-dev none` is coherent). Lead: ROPE is
+  forced to CPU for every attention layer (`GGML_SCHED_DEBUG=2 -v` shows
+  ~336 ROPE-related CPU splits) — `dx12_op_supported`'s `GGML_OP_ROPE` case
+  (`dx12_graph.cpp:244`) rejects odd `n_dims` (partial rotary), which this
+  model family likely uses. The resulting CPU/DX12 crossings looked
+  structurally correct on spot-check, so root cause isn't confirmed — needs
+  live tensor-value tracing, not more static reading.
+- **CPU weight-spill uses ~3x file size in RAM during load** (e.g. 16.5GB
+  model → ~52GB RAM briefly). The spill fallback (`llama-model.cpp`) does a
+  real `malloc` + copy from the mmap'd GGUF instead of reusing this
+  codebase's existing zero-copy `buffer_from_host_ptr` path (already used
+  for the normal CPU-default-buft mmap case). Efficiency issue, not
+  correctness — real fix exists but risky to bolt onto a same-session change
+  without a full test pass budgeted.
+
 ## Known issues
 
 - `KNOWN-ISSUE-dx12-moe-cpu-offload-crash.md`: `-ncmoe`-driven CPU/DX12 MoE
