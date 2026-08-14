@@ -41,6 +41,11 @@ float load_f16(RWByteAddressBuffer B, uint addr) {
     return f16tof32((addr & 2u) ? (w >> 16) : (w & 0xFFFFu));
 }
 
+float2 load_f16x2(RWByteAddressBuffer B, uint addr) {
+    uint w = B.Load(addr);
+    return float2(f16tof32(w & 0xFFFFu), f16tof32(w >> 16u));
+}
+
 [WaveSize(32)]
 [numthreads(256, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
@@ -80,8 +85,9 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         float part = 0.0f;
         if (kv < kv_hi) {
             uint k_row = k_head + kv * p.knb1;
-            for (uint i = lane; i < p.dk; i += 32u) {
-                part += q_s[i] * load_f16(K, k_row + i * 2u);
+            for (uint i = lane * 2u; i < p.dk; i += 64u) {
+                float2 kv2 = load_f16x2(K, k_row + i * 2u);
+                part += q_s[i] * kv2.x + q_s[i + 1u] * kv2.y;
             }
         }
         float s = WaveActiveSum(part);
@@ -111,16 +117,20 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         l_run = l_run * corr + wsum;
         m_run = m_new;
 
-        for (uint i = tid; i < p.dv; i += 256u) {
-            float o = o_s[i] * corr;
+        for (uint i = tid * 2u; i < p.dv; i += 256u) {
+            float o0 = o_s[i] * corr;
+            float o1 = o_s[i + 1u] * corr;
             [unroll]
             for (uint j = 0; j < 8; j++) {
                 uint kvj = kv0 + j;
                 if (kvj < kv_hi && w[j] != 0.0f) {
-                    o += w[j] * load_f16(V, v_head + kvj * p.vnb1 + i * 2u);
+                    float2 v2 = load_f16x2(V, v_head + kvj * p.vnb1 + i * 2u);
+                    o0 += w[j] * v2.x;
+                    o1 += w[j] * v2.y;
                 }
             }
-            o_s[i] = o;
+            o_s[i] = o0;
+            o_s[i + 1u] = o1;
         }
         GroupMemoryBarrierWithGroupSync();
     }

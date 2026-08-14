@@ -167,6 +167,27 @@ static ComPtr<ID3D12RootSignature> dx12_build_root_signature(dx12_device* dev,
             break;
         }
 
+        case dx12_root_signature_type::gdn: {
+            // Param 0: root 32-bit constants — 32 DWORDs (GDN params).
+            CD3DX12_ROOT_PARAMETER1 root_const;
+            root_const.InitAsConstants(
+                32, 0, 0,
+                D3D12_SHADER_VISIBILITY_ALL);
+            params.push_back(root_const);
+
+            // Params 1-7: root UAVs u0..u6. q,k,v,g,beta,state at u0..u5,
+            // dst at u6. 32 + 7*2 = 46 <= 64-dword root limit.
+            for (uint32_t i = 0; i < 7; i++) {
+                CD3DX12_ROOT_PARAMETER1 uav_param;
+                uav_param.InitAsUnorderedAccessView(
+                    i, 0,
+                    D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                    D3D12_SHADER_VISIBILITY_ALL);
+                params.push_back(uav_param);
+            }
+            break;
+        }
+
         case dx12_root_signature_type::reduction: {
             // Param 0: CBV dimensions
             CD3DX12_ROOT_PARAMETER1 cbv_param;

@@ -1296,12 +1296,38 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
-        // Recurrent (scan/SSM) layers must stay on CPU: backends without the
-        // fused/scan ops (e.g. dx12) would fall back per-op, and an in-place
-        // cross-backend op (GGML_OP_SET) then writes into a GPU-resident buffer.
+        // Recurrent (scan/SSM) layers only go to CPU when the offload device
+        // cannot run the fused/scan ops (e.g. a backend without GDN/SSM_SCAN
+        // shaders would fall back per-op, and an in-place cross-backend op
+        // then writes into a GPU-resident buffer). Probe the primary offload
+        // device; if it claims the op the layer can live on GPU.
         if (il < n_layer_all && hparams.is_recr(il)) {
-            LLAMA_LOG_DEBUG("load_tensors: layer %3d is recurrent, assigned to device %s\n", il, ggml_backend_dev_name(cpu_dev));
-            return {cpu_dev, &pimpl->cpu_buft_list};
+            const llm_arch arch = this->arch;
+            const bool needs_ssm_scan = llm_arch_is_recurrent(arch);
+            const bool needs_gdn =
+                (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
+                 arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_KIMI_LINEAR ||
+                 arch == LLM_ARCH_GRANITE_HYBRID);
+            bool can_gpu = false;
+            if (!devices.empty()) {
+                ggml_context * probe_ctx = ggml_init({ 16*1024*1024, nullptr, true });
+                auto probe_supported = [&](enum ggml_op op) -> bool {
+                    ggml_tensor * t = ggml_new_tensor_1d(probe_ctx, GGML_TYPE_F32, 16);
+                    t->op = op;
+                    t->src[0] = ggml_new_tensor_1d(probe_ctx, GGML_TYPE_F16, 16);
+                    return ggml_backend_dev_supports_op(devices[0].dev, t);
+                };
+                if (needs_ssm_scan) {
+                    can_gpu = probe_supported(GGML_OP_SSM_SCAN);
+                } else if (needs_gdn) {
+                    can_gpu = probe_supported(GGML_OP_GATED_DELTA_NET);
+                }
+                ggml_free(probe_ctx);
+            }
+            if (!can_gpu) {
+                LLAMA_LOG_DEBUG("load_tensors: layer %3d is recurrent, assigned to device %s\n", il, ggml_backend_dev_name(cpu_dev));
+                return {cpu_dev, &pimpl->cpu_buft_list};
+            }
         }
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
@@ -2100,7 +2126,19 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             t->src[0] = ggml_new_tensor_1d(probe_ctx, GGML_TYPE_F16, 16);
                             return ggml_backend_dev_supports_op(devices[0].dev, t);
                         };
-                        if (!probe_supported(GGML_OP_SSM_SCAN) || !probe_supported(GGML_OP_GATED_DELTA_NET) || !probe_supported(GGML_OP_GATED_LINEAR_ATTN)) {
+                        // Only require the fused/scan ops the model's arch actually
+                        // emits: qwen35/qwen3next hybrids use GATED_DELTA_NET,
+                        // mamba-style recurrent models use SSM_SCAN. Requiring all
+                        // three (as before) kept qwen35 state on CPU even when the
+                        // backend implements GDN but not the others.
+                        const bool needs_ssm_scan =
+                            llm_arch_is_recurrent(arch);
+                        const bool needs_gdn =
+                            (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
+                             arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_KIMI_LINEAR ||
+                             arch == LLM_ARCH_GRANITE_HYBRID);
+                        if ((needs_ssm_scan && !probe_supported(GGML_OP_SSM_SCAN)) ||
+                            (needs_gdn && !probe_supported(GGML_OP_GATED_DELTA_NET))) {
                             state_offload = false;
                         }
                         ggml_free(probe_ctx);

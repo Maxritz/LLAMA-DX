@@ -27,6 +27,9 @@ set(TEST_SOURCES
     test_dx12_workgraph.cpp
     test_dx12_execute_indirect.cpp
     test_dx12_dot_kernels.cpp
+    test_dx12_gdn.cpp
+    test_dx12_gdn2.cpp
+    test_dx12_l2norm.cpp
 )
 
 foreach(TEST_SRC ${TEST_SOURCES})

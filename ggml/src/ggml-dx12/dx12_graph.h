@@ -93,6 +93,14 @@ bool dx12_dispatch_get_rows  (dx12_device* dev, dx12_command_list* cmd, ggml_ten
 bool dx12_dispatch_permute   (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
 bool dx12_dispatch_cpy       (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
 bool dx12_dispatch_set_rows  (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
+bool dx12_run_mm_public(dx12_device* dev, dx12_command_list* cmd,
+                        const char* shader, const void* cbv, size_t cbv_size,
+                        dx12_buffer* s0, dx12_buffer* s1, dx12_buffer* s2,
+                        dx12_buffer* dst, uint32_t dx, uint32_t dy, uint32_t dz);
+bool dx12_dispatch_ssm_conv  (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
+bool dx12_dispatch_concat    (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
+bool dx12_dispatch_l2_norm   (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
+bool dx12_dispatch_gated_delta_net(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
 bool dx12_dispatch_none      (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
 bool dx12_dispatch_count     (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
 

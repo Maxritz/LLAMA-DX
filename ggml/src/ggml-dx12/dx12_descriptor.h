@@ -50,6 +50,11 @@ enum class dx12_root_signature_type {
     // and hangs this driver. Used for: mm_* mul_mat shaders.
     mm,
 
+    // GDN: 32 root-constant dwords (u<..>) + 7 root UAVs (u0..u6:
+    // q,k,v,g,beta,state,dst). Gated Delta Net has 6 sources + 1 dst, one
+    // more than mm's u0..u4. 32 + 7*2 = 46 <= 64-dword root limit.
+    gdn,
+
     // Custom: built from description at runtime
     custom,
 };

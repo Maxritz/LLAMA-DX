@@ -12,6 +12,7 @@
 #include "dx12_ring.h"
 #include "ggml-backend-dx12.h"
 #include <ggml-impl.h>
+#include <atomic>
 #include <cstring>
 #include <cstdio>
 
@@ -107,13 +108,14 @@ bool dx12_op_supported(const ggml_tensor* node) {
             if (!q || !k || !v) return false;
             if (node->src[4]) return false; // attention sinks
             if (dx12_op_disabled("flashattn")) return false;
-            // OPT-IN for now (DX12_ENABLE_FA=1): the kernel passes all 553
-            // claimed test-backend-ops cases, but the v1 single-group-per-
-            // query design underfills the GPU at decode (n_q=1 -> n_head
-            // groups only: tg64@d4096 = 38 t/s vs 98 t/s on the mms path).
-            // Claiming the op would make "-fa auto" pick the slower path by
-            // default. v2 needs split-KV partials + a combine pass.
-            static const bool fa_enabled = getenv("DX12_ENABLE_FA") != nullptr;
+            // GPU FA kernel (flash_attn_ext family) is faster than the CPU
+            // fallback and faster than the non-fused path on decode. Default
+            // ON; set DX12_ENABLE_FA=0 to opt out and keep FA on CPU.
+            static const bool fa_enabled = []() {
+                const char* e = getenv("DX12_ENABLE_FA");
+                if (e) return e[0] != '0';
+                return true;
+            }();
             if (!fa_enabled) return false;
             float max_bias, logit_softcap;
             memcpy(&max_bias,      (const char*)node->op_params + 4, sizeof(float));
@@ -130,6 +132,7 @@ bool dx12_op_supported(const ggml_tensor* node) {
             }
             if (q->ne[0] != k->ne[0]) return false;          // dk
             if (q->ne[0] > 256 || v->ne[0] > 256) return false;
+            if ((q->ne[0] & 1) || (v->ne[0] & 1)) return false; // f16x2 dword loads
             if (k->ne[1] != v->ne[1]) return false;          // n_kv
             if (k->ne[2] != v->ne[2]) return false;          // kv heads
             if (q->ne[2] % k->ne[2] != 0) return false;      // GQA
@@ -302,6 +305,85 @@ bool dx12_op_supported(const ggml_tensor* node) {
             return dx12_dims_fit_u32(a) && dx12_dims_fit_u32(node);
         }
 
+        case GGML_OP_SSM_CONV: {
+            if (dx12_op_disabled("ssmconv")) return false;
+            const ggml_tensor* x = node->src[0];
+            const ggml_tensor* w = node->src[1];
+            if (!x) return false;
+            // probe tensor (src[0] only): accept if F32/F16 so recurrent
+            // layers get routed to this backend when a kernel exists.
+            if (!w) return x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_F16;
+            if (x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32) return false;
+            if (node->type != GGML_TYPE_F32) return false;
+            if (w->ne[0] > 16) return false;          // d_conv taps fit the shader ring
+            if (x->ne[1] != w->ne[1]) return false;   // d_inner
+            if (x->nb[0] != 4 || w->nb[0] != 4) return false;
+            if (x->ne[2] > DX12_MAX_GROUPS) return false;
+            return dx12_dims_fit_u32(x) && dx12_dims_fit_u32(w) && dx12_dims_fit_u32(node);
+        }
+
+        case GGML_OP_CONCAT: {
+            if (dx12_op_disabled("concat")) return false;
+            const ggml_tensor* a = node->src[0];
+            const ggml_tensor* b = node->src[1];
+            if (!a) return false;
+            if (!b) return a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16; // probe
+            if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32) return false;
+            if (node->type != GGML_TYPE_F32) return false;
+            if (ggml_get_op_params_i32(node, 0) != 0) return false; // axis 0 only
+            // nb[0] may be >4 (transposed src view, e.g. qkv_mixed); the
+            // shader handles arbitrary byte strides via nb00/nb10.
+            if (a->ne[1] > DX12_MAX_GROUPS || node->ne[1] > DX12_MAX_GROUPS) return false;
+            if (node->ne[2] * node->ne[3] > DX12_MAX_GROUPS) return false;
+            return dx12_dims_fit_u32(a) && dx12_dims_fit_u32(b) && dx12_dims_fit_u32(node);
+        }
+
+        case GGML_OP_L2_NORM: {
+            if (dx12_op_disabled("l2norm")) return false;
+            const ggml_tensor* a = node->src[0];
+            if (!a) return false;
+            if (a->type != GGML_TYPE_F32 && a->type != GGML_TYPE_F16) return false;
+            if (node->type != GGML_TYPE_F32 && node->type != GGML_TYPE_F16) return false;
+            if (a->nb[0] != 4 && a->nb[0] != 2) return false;
+            if (a->ne[0] > 256) return false;          // group-shared reduction
+            if (a->ne[1] * a->ne[2] * a->ne[3] > DX12_MAX_GROUPS) return false;
+            return dx12_dims_fit_u32(a) && dx12_dims_fit_u32(node);
+        }
+
+        case GGML_OP_GATED_DELTA_NET: {
+            if (dx12_op_disabled("gdn")) return false;
+            const ggml_tensor* q    = node->src[0];
+            const ggml_tensor* k    = node->src[1];
+            const ggml_tensor* v    = node->src[2];
+            const ggml_tensor* g    = node->src[3];
+            const ggml_tensor* beta = node->src[4];
+            const ggml_tensor* state= node->src[5];
+            if (!q) return false;
+            // Backend support probe (ggml_backend_dev_supports_op) builds a
+            // minimal tensor with only src[0] set — accept it so the sched
+            // routes recurrent layers to this backend when a GDN kernel exists.
+            if (!k || !v || !g || !beta || !state) {
+                return q->type == GGML_TYPE_F32 || q->type == GGML_TYPE_F16;
+            }
+            if (ggml_get_op_params_i32(node, 0) != 1) return false; // K=1 only (no snapshots)
+            if (g->ne[0] != 1) return false;           // scalar gate (non-KDA)
+            if (beta->ne[0] != 1) return false;
+            if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F32 ||
+                v->type != GGML_TYPE_F32 || g->type != GGML_TYPE_F32 ||
+                beta->type != GGML_TYPE_F32 || state->type != GGML_TYPE_F32) return false;
+            if (node->type != GGML_TYPE_F32) return false;
+            if (v->ne[0] % 32 != 0 || v->ne[0] > 128) return false; // ROWS_PER_LANE=4 covers <=128
+            if (v->ne[2] % q->ne[2] != 0 || v->ne[3] % q->ne[3] != 0) return false;
+            if (v->ne[1] % q->ne[1] != 0) return false;  // H_v % H_k == 0
+            if (state->ne[0] != v->ne[0] || state->ne[1] != v->ne[0]) return false;
+            if (state->ne[2] != v->ne[1] || state->ne[3] != v->ne[3]) return false;
+            if (v->ne[1] > DX12_MAX_GROUPS || v->ne[3] > DX12_MAX_GROUPS ||
+                v->ne[0] / 32 > DX12_MAX_GROUPS) return false;
+            return dx12_dims_fit_u32(q) && dx12_dims_fit_u32(k) && dx12_dims_fit_u32(v) &&
+                   dx12_dims_fit_u32(g) && dx12_dims_fit_u32(beta) &&
+                   dx12_dims_fit_u32(state) && dx12_dims_fit_u32(node);
+        }
+
         // View ops: no data movement, dispatched as no-ops
         case GGML_OP_VIEW:
         case GGML_OP_RESHAPE:
@@ -309,10 +391,6 @@ bool dx12_op_supported(const ggml_tensor* node) {
         case GGML_OP_TRANSPOSE:
         case GGML_OP_NONE:
             return true;
-
-        // Everything else is unverified on DX12 — CPU fallback.
-        default:
-            return false;
     }
 }
 
@@ -673,6 +751,10 @@ bool dx12_graph_compute(dx12_device* dev, dx12_command_list* cmd, ggml_cgraph* g
                 case GGML_OP_MUL_MAT:       ok = dx12_dispatch_mul_mat(dev, cmd, node); break;
                 case GGML_OP_MUL_MAT_ID:    ok = dx12_dispatch_mul_mat_id(dev, cmd, node); break;
                 case GGML_OP_FLASH_ATTN_EXT: ok = dx12_dispatch_flash_attn_ext(dev, cmd, node); break;
+                case GGML_OP_SSM_CONV:      ok = dx12_dispatch_ssm_conv(dev, cmd, node); break;
+                case GGML_OP_CONCAT:        ok = dx12_dispatch_concat(dev, cmd, node); break;
+                case GGML_OP_L2_NORM:       ok = dx12_dispatch_l2_norm(dev, cmd, node); break;
+                case GGML_OP_GATED_DELTA_NET: ok = dx12_dispatch_gated_delta_net(dev, cmd, node); break;
             case GGML_OP_ADD:           ok = dx12_dispatch_add(dev, cmd, node); break;
             case GGML_OP_MUL:           ok = dx12_dispatch_mul(dev, cmd, node); break;
             case GGML_OP_SCALE:         ok = dx12_dispatch_scale(dev, cmd, node); break;
@@ -753,6 +835,44 @@ static uint32_t tensor_nelements(const ggml_tensor* t) {
 
 // Run one mm-signature dispatch: up to 4 source tensors + dst, all bound as
 // root UAVs with explicit per-tensor GPU VAs (tensors may share one buffer).
+// Public wrapper for tests: run an mm-sig shader with raw buffers.
+bool dx12_run_mm_public(dx12_device* dev, dx12_command_list* cmd,
+                        const char* shader, const void* cbv, size_t cbv_size,
+                        dx12_buffer* s0, dx12_buffer* s1, dx12_buffer* s2,
+                        dx12_buffer* dst, uint32_t dx, uint32_t dy, uint32_t dz) {
+    dx12_buffer* srvs[3] = { s0, s1, s2 };
+    struct dx12_shader_dispatch dispatch{};
+    dispatch.shader_name = shader;
+    dispatch.sig_type = dx12_root_signature_type::mm;
+    if (s0) dispatch.srv_addr[0] = s0->gpu_address;
+    if (s1) dispatch.srv_addr[1] = s1->gpu_address;
+    if (s2) dispatch.srv_addr[2] = s2->gpu_address;
+    if (dst) dispatch.uav_addr = dst->gpu_address;
+    dispatch.dispatch_x = dx;
+    dispatch.dispatch_y = dy;
+    dispatch.dispatch_z = dz;
+    // Barrier all buffers to UAV before dispatch (matches dx12_run_mm).
+    dx12_buffer* bufs[4] = { s0, s1, s2, dst };
+    D3D12_RESOURCE_STATES states[4] = {
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+    };
+    uint64_t rlo[4] = { s0 ? s0->gpu_address : 0, s1 ? s1->gpu_address : 0, s2 ? s2->gpu_address : 0, dst ? dst->gpu_address : 0 };
+    uint64_t rhi[4];
+    for (int i = 0; i < 4; i++) rhi[i] = bufs[i] ? (rlo[i] + bufs[i]->size) : rlo[i];
+    uint32_t nbuf = 0;
+    for (int i = 0; i < 4; i++) if (bufs[i]) nbuf++;
+    // dst is always index 3 in bufs[]; write_mask bit 3 marks it the writer.
+    dx12_barrier_pre_dispatch(cmd, cmd->barrier_tracker, bufs, states, 4, rlo, rhi, 1u << 3);
+    // Count real sources so the dst lands on the register the shader expects
+    // (mm sig binds dst at u<num_srvs>).
+    uint32_t nsrc = 0;
+    if (s0) nsrc++;
+    if (s1) nsrc++;
+    if (s2) nsrc++;
+    return dx12_shader_dispatch(dev, cmd, dispatch, cbv, cbv_size, srvs, nsrc, dst);
+}
+
 static bool dx12_run_mm(dx12_device* dev, dx12_command_list* cmd,
                         const char* shader, const void* cbv, size_t cbv_size,
                         const ggml_tensor* s0, const ggml_tensor* s1, const ggml_tensor* s2,
@@ -1403,7 +1523,8 @@ bool dx12_dispatch_flash_attn_ext(dx12_device* dev, dx12_command_list* cmd, ggml
     // Split KV when the slot count alone underfills the GPU. Each split
     // should keep >= 128 KV rows; cap at fa_combine's MAX_SPLIT (16).
     uint32_t n_split = 1;
-    if (slots < 256 && p.n_kv >= 256) {
+    bool no_split = getenv("DX12_FA_NO_SPLIT") != nullptr;
+    if (!no_split && slots < 256 && p.n_kv >= 256) {
         n_split = (256 + slots - 1) / slots;
         uint32_t max_by_kv = p.n_kv / 128;
         if (n_split > max_by_kv) n_split = max_by_kv;
@@ -1631,6 +1752,165 @@ bool dx12_dispatch_layer_norm(dx12_device* dev, dx12_command_list* cmd, ggml_ten
 
     return dx12_shader_dispatch_simple(dev, cmd, "layer_norm",
         &params, sizeof(params), buf_s, nullptr, buf_d, n);
+}
+
+// SSM_CONV: causal 1D conv. x [d_conv-1+n_t, d_inner, n_seqs], w [d_conv, d_inner]
+bool dx12_dispatch_ssm_conv(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
+    const ggml_tensor* x = dst->src[0];
+    const ggml_tensor* w = dst->src[1];
+
+    struct {
+        uint32_t d_inner, d_conv, n_t, n_seqs;
+        uint32_t x1, x2, w1, d1, d2, pad;
+    } p{};
+    p.d_inner = (uint32_t)x->ne[1];
+    p.d_conv  = (uint32_t)w->ne[0];
+    p.n_t     = (uint32_t)dst->ne[1];
+    p.n_seqs  = (uint32_t)dst->ne[2];
+    p.x1      = (uint32_t)(x->nb[1] / 4);
+    p.x2      = (uint32_t)(x->nb[2] / 4);
+    p.w1      = (uint32_t)(w->nb[1] / 4);
+    p.d1      = (uint32_t)(dst->nb[1] / 4);
+    p.d2      = (uint32_t)(dst->nb[2] / 4);
+
+    return dx12_run_mm(dev, cmd, "ssm_conv", &p, sizeof(p),
+                       x, w, nullptr, dst,
+                       (p.d_inner + 255) / 256, p.n_seqs, 1);
+}
+
+// CONCAT: dst = [src0; src1] along ne[0] (axis 0)
+bool dx12_dispatch_concat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
+    const ggml_tensor* a = dst->src[0];
+    const ggml_tensor* b = dst->src[1];
+
+    struct {
+        uint32_t ne0, ne1, ne2, ne3;
+        uint32_t ne00;
+        uint32_t nb00, nb10;
+        uint32_t n01, n02, n03;
+        uint32_t n11, n12, n13;
+        uint32_t dnb1, dnb2, dnb3;
+        uint32_t pad;
+    } p{};
+    p.ne0 = (uint32_t)dst->ne[0]; p.ne1 = (uint32_t)dst->ne[1];
+    p.ne2 = (uint32_t)dst->ne[2]; p.ne3 = (uint32_t)dst->ne[3];
+    p.ne00 = (uint32_t)a->ne[0];
+    p.nb00 = (uint32_t)a->nb[0]; p.nb10 = (uint32_t)b->nb[0];
+    p.n01 = (uint32_t)(a->nb[1]); p.n02 = (uint32_t)(a->nb[2]); p.n03 = (uint32_t)(a->nb[3]);
+    p.n11 = (uint32_t)(b->nb[1]); p.n12 = (uint32_t)(b->nb[2]); p.n13 = (uint32_t)(b->nb[3]);
+    p.dnb1 = (uint32_t)(dst->nb[1]); p.dnb2 = (uint32_t)(dst->nb[2]); p.dnb3 = (uint32_t)(dst->nb[3]);
+
+    return dx12_run_mm(dev, cmd, "concat", &p, sizeof(p),
+                       a, b, nullptr, dst,
+                       (p.ne0 + 255) / 256, p.ne1, p.ne2 * p.ne3);
+}
+
+// L2_NORM: row-wise L2 normalize over ne[0]
+bool dx12_dispatch_l2_norm(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
+    const ggml_tensor* a = dst->src[0];
+    float eps;
+    memcpy(&eps, (const char*)dst->op_params, sizeof(float));
+
+    struct {
+        uint32_t ne0, ne1, ne2, ne3;
+        uint32_t nb01, nb02, nb03;
+        uint32_t dnb1, dnb2, dnb3;
+        float eps;
+        uint32_t pad;
+    } p{};
+    p.ne0 = (uint32_t)a->ne[0]; p.ne1 = (uint32_t)a->ne[1];
+    p.ne2 = (uint32_t)a->ne[2]; p.ne3 = (uint32_t)a->ne[3];
+    p.nb01 = (uint32_t)(a->nb[1] / 4); p.nb02 = (uint32_t)(a->nb[2] / 4); p.nb03 = (uint32_t)(a->nb[3] / 4);
+    p.dnb1 = (uint32_t)(dst->nb[1] / 4); p.dnb2 = (uint32_t)(dst->nb[2] / 4); p.dnb3 = (uint32_t)(dst->nb[3] / 4);
+    p.eps = eps;
+
+    uint32_t n_rows = (uint32_t)(p.ne1 * p.ne2 * p.ne3);
+    return dx12_run_mm(dev, cmd, "l2_norm", &p, sizeof(p),
+                       a, nullptr, nullptr, dst,
+                       n_rows, 1, 1);
+}
+
+// GATED_DELTA_NET (AR, decode): gated delta rule, warp-per-column scan.
+// See gdn_ar.hlsl. Requires 6 sources + dst -> dedicated gdn root signature.
+bool dx12_dispatch_gated_delta_net(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
+    const ggml_tensor* q    = dst->src[0];
+    const ggml_tensor* k    = dst->src[1];
+    const ggml_tensor* v    = dst->src[2];
+    const ggml_tensor* g    = dst->src[3];
+    const ggml_tensor* beta = dst->src[4];
+    const ggml_tensor* state= dst->src[5];
+
+    struct {
+        uint32_t S_v, H_v, n_k_head, n_tokens, n_seqs;
+        uint32_t sq1, sq2, sq3;
+        uint32_t sv1, sv2, sv3;
+        uint32_t sg1, sg2, sg3;
+        uint32_t sb1, sb2, sb3;
+        uint32_t d1, d2, d3;
+        float scale;
+        uint32_t pad;
+    } p{};
+    p.S_v      = (uint32_t)v->ne[0];
+    p.H_v      = (uint32_t)v->ne[1];
+    p.n_k_head = (uint32_t)q->ne[1];
+    p.n_tokens = (uint32_t)v->ne[2];
+    p.n_seqs   = (uint32_t)v->ne[3];
+    p.sq1 = (uint32_t)(q->nb[1] / 4); p.sq2 = (uint32_t)(q->nb[2] / 4); p.sq3 = (uint32_t)(q->nb[3] / 4);
+    p.sv1 = (uint32_t)(v->nb[1] / 4); p.sv2 = (uint32_t)(v->nb[2] / 4); p.sv3 = (uint32_t)(v->nb[3] / 4);
+    p.sg1 = (uint32_t)(g->nb[1] / 4); p.sg2 = (uint32_t)(g->nb[2] / 4); p.sg3 = (uint32_t)(g->nb[3] / 4);
+    p.sb1 = (uint32_t)(beta->nb[1] / 4); p.sb2 = (uint32_t)(beta->nb[2] / 4); p.sb3 = (uint32_t)(beta->nb[3] / 4);
+    // dst is a flat [S_v*H_v, n_tokens*n_seqs + state_rows] tensor; the
+    // attention output view has fixed strides (see build_delta_net_fused).
+    p.d1 = p.S_v;
+    p.d2 = p.S_v * p.H_v;
+    p.d3 = p.S_v * p.H_v * p.n_tokens;
+    p.scale = 1.0f / sqrtf((float)p.S_v);
+
+    // 6 sources + 1 dst.
+    const ggml_tensor* srcs[6] = { q, k, v, g, beta, state };
+    dx12_buffer* bufs[7] = {};
+    dx12_buffer* srv_bufs[6] = {};
+    struct dx12_shader_dispatch dispatch{};
+    for (uint32_t i = 0; i < 6; i++) {
+        srv_bufs[i] = dx12_backend_buffer_from_tensor(srcs[i]);
+        dispatch.srv_addr[i] = dx12_backend_tensor_gpu_addr(srcs[i]);
+        if (!srv_bufs[i] || !dispatch.srv_addr[i]) {
+            dx12_log(DX12_LOG_ERROR, "gdn: source %u not bound", i);
+            return false;
+        }
+        bufs[i] = srv_bufs[i];
+    }
+    dx12_buffer* buf_d = dx12_backend_buffer_from_tensor(dst);
+    dispatch.uav_addr = dx12_backend_tensor_gpu_addr(dst);
+    if (!buf_d || !dispatch.uav_addr) {
+        dx12_log(DX12_LOG_ERROR, "gdn: dst not bound");
+        return false;
+    }
+    bufs[6] = buf_d;
+
+    D3D12_RESOURCE_STATES states[7] = {
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+    };
+    uint64_t rlo[7], rhi[7];
+    for (uint32_t i = 0; i < 6; i++) {
+        rlo[i] = dispatch.srv_addr[i];
+        rhi[i] = rlo[i] + ggml_nbytes(srcs[i]);
+    }
+    rlo[6] = dispatch.uav_addr;
+    rhi[6] = rlo[6] + ggml_nbytes(dst);
+    dx12_barrier_pre_dispatch(cmd, cmd->barrier_tracker, bufs, states, 7,
+                              rlo, rhi, 1u << 6);
+
+    dispatch.shader_name = "gdn_ar";
+    dispatch.sig_type = dx12_root_signature_type::gdn;
+    dispatch.dispatch_x = (p.S_v + 3) / 4;   // 4 waves per group, S_v/4 column blocks
+    dispatch.dispatch_y = p.H_v;
+    dispatch.dispatch_z = p.n_seqs;
+
+    return dx12_shader_dispatch(dev, cmd, dispatch, &p, sizeof(p), srv_bufs, 6, buf_d);
 }
 
 // ROPE: F32, modes NORMAL/NEOX, YaRN + optional freq factors (src2)

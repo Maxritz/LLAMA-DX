@@ -69,7 +69,8 @@ struct dx12_shader_dispatch {
     // Optional explicit GPU VAs per binding (0 = use the buffer's gpu_address).
     // Needed when several tensors share one dx12_buffer: mutating the shared
     // buffer's gpu_address makes every binding point at the last tensor.
-    D3D12_GPU_VIRTUAL_ADDRESS   srv_addr[4];
+    // GDN binds 6 sources (q,k,v,g,beta,state) via srv_addr[0..5].
+    D3D12_GPU_VIRTUAL_ADDRESS   srv_addr[6];
     D3D12_GPU_VIRTUAL_ADDRESS   uav_addr;
 };
 

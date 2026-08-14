@@ -121,12 +121,13 @@ bool dx12_shader_dispatch(dx12_device* dev,
     // unbound gives the GPU VA 0, which causes a GPU page fault (0xC0000005).
     // When no constants are provided, bind a zero-filled CBV of minimum size.
     static const uint32_t zero_cbv[64] = {}; // 256 bytes = min CBV allocation
-    if (dispatch.sig_type == dx12_root_signature_type::mm) {
+    if (dispatch.sig_type == dx12_root_signature_type::mm ||
+        dispatch.sig_type == dx12_root_signature_type::gdn) {
         if (constants && constants_size > 0) {
             uint32_t num_constants = constants_size / 4;
             cmd->d3d_list->SetComputeRoot32BitConstants(0, num_constants, constants, 0);
         }
-        // mm type with no constants: root constants default to zero, no bind needed
+        // mm/gdn type with no constants: root constants default to zero, no bind needed
     } else {
         const void* cbv_data = (constants && constants_size > 0) ? constants : zero_cbv;
         uint32_t cbv_size = (constants && constants_size > 0) ? (uint32_t)constants_size : (uint32_t)sizeof(zero_cbv);
@@ -142,17 +143,28 @@ bool dx12_shader_dispatch(dx12_device* dev,
         }
     }
 
-    // Bind inputs (root params 1+). The mm signature declares them as root
+    // Bind inputs (root params 1+). The mm/gdn signature declares them as root
     // UAVs (inputs may alias the output's resource); all others as root SRVs.
     for (uint32_t i = 0; i < num_srvs && i < 4; i++) {
         if (srvs[i]) {
             D3D12_GPU_VIRTUAL_ADDRESS addr =
                 dispatch.srv_addr[i] ? dispatch.srv_addr[i] : srvs[i]->gpu_address;
-            if (dispatch.sig_type == dx12_root_signature_type::mm) {
+            if (dispatch.sig_type == dx12_root_signature_type::mm ||
+                dispatch.sig_type == dx12_root_signature_type::gdn) {
                 dx12_cmd_list_set_compute_root_unordered_access_view(cmd, 1 + i, addr);
             } else {
                 dx12_cmd_list_set_compute_root_shader_resource_view(cmd, 1 + i, addr);
             }
+        }
+    }
+
+    // GDN: 6 sources bound via srv_addr[0..5] (spans past the 4-slot struct —
+    // set by the dispatcher directly on the command list), dst at u6.
+    if (dispatch.sig_type == dx12_root_signature_type::gdn && num_srvs > 4) {
+        for (uint32_t i = 4; i < num_srvs; i++) {
+            D3D12_GPU_VIRTUAL_ADDRESS addr =
+                dispatch.srv_addr[i] ? dispatch.srv_addr[i] : srvs[i]->gpu_address;
+            dx12_cmd_list_set_compute_root_unordered_access_view(cmd, 1 + i, addr);
         }
     }
 
@@ -164,14 +176,17 @@ bool dx12_shader_dispatch(dx12_device* dev,
             case dx12_root_signature_type::attention: uav_slot = 4; break;
             // mm: dst register = u<num_srcs> (root param 1 + num_srcs)
             case dx12_root_signature_type::mm: uav_slot = 1 + num_srvs; break;
+            // gdn: dst at u6 (root param 1 + 6)
+            case dx12_root_signature_type::gdn: uav_slot = 7; break;
             default: uav_slot = 3; break;
         }
         D3D12_GPU_VIRTUAL_ADDRESS dst_addr =
             dispatch.uav_addr ? dispatch.uav_addr : uav->gpu_address;
         dx12_cmd_list_set_compute_root_unordered_access_view(cmd, uav_slot, dst_addr);
-        if (dispatch.sig_type == dx12_root_signature_type::mm) {
+        if (dispatch.sig_type == dx12_root_signature_type::mm ||
+            dispatch.sig_type == dx12_root_signature_type::gdn) {
             // Fill spare UAV params so no root descriptor is left unset
-            for (uint32_t p = uav_slot + 1; p <= 5; p++) {
+            for (uint32_t p = uav_slot + 1; p <= 6; p++) {
                 dx12_cmd_list_set_compute_root_unordered_access_view(cmd, p, dst_addr);
             }
         }

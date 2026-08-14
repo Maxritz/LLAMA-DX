@@ -216,6 +216,10 @@ set(DX12_SHADERS
     cpy_gen
     rope_f32
     set_rows_gen
+    ssm_conv
+    concat
+    l2_norm
+    gdn_ar
     # DXLA shaders — SM 6.10 (dx::linalg cooperative matrix)
     mul_mat_dxla_wave_f16_f16
     mul_mat_dxla_wave_q4_0_f16
@@ -297,6 +301,10 @@ set(DX12_SHADER_THREAD_GROUPS
     cpy_gen,256,1,1
     rope_f32,64,1,1
     set_rows_gen,256,1,1
+    ssm_conv,256,1,1
+    concat,256,1,1
+    l2_norm,256,1,1
+    gdn_ar,128,1,1
 mul_mat_dxla_wave_f16_f16,32,1,1
      mul_mat_dxla_wave_f16_f16_trans,32,1,1
      mul_mat_dxla_wave_q4_0_f16,32,1,1
