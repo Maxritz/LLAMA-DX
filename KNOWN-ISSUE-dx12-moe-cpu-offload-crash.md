@@ -18,6 +18,11 @@ correct, on-topic responses via the CPU/DX12 split. `test_dx12_layer`/
 `test_dx12_e2e` regression-clean. **Not yet verified on the 6700 XT (RDNA2,
 macx)** — do that before fully trusting it there.
 
+**Also confirmed on the 6700 XT (RDNA2, `macx`)**:
+`Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf -dev DX120 -ncmoe 30 -ngl 15 -st` (the
+model from the original benchmark request) produces coherent output via the
+CPU/DX12 split there too — fix isn't RDNA4-specific.
+
 **But `qwable-v1-mxfp4_moe.gguf` (MXFP4) is still broken** with the same
 `-ncmoe 20 -ngl 20` split — different symptom now though: instead of random
 garbage tokens, it degenerates into a long run of repeated `"` characters.
