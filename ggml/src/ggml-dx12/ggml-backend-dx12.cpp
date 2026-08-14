@@ -855,12 +855,20 @@ dx12_buffer* dx12_backend_buffer_from_tensor(const ggml_tensor* tensor) {
 // resource's base address alone silently aliases every tensor onto the
 // same bytes.
 static size_t dx12_backend_tensor_buffer_offset(const ggml_tensor* tensor, dx12_buffer* buf) {
+    // For a view, re-derive from view_src->data + view_offs instead of trusting
+    // tensor->data directly - matches the (working) Vulkan backend's
+    // vk_tensor_offset(), which does the same for the same reason: view_src is
+    // ggml's authoritative, freshly-allocated tensor, so this is never wrong
+    // even if a view's own ->data was set once and not refreshed since.
+    const void* addr = tensor->view_src ? tensor->view_src->data : tensor->data;
+    size_t view_off = tensor->view_src ? tensor->view_offs : 0;
+
     void* mapped = dx12_buffer_map(buf);
     if (mapped) {
-        return (const char*)tensor->data - (const char*)mapped;
+        return (const char*)addr - (const char*)mapped + view_off;
     }
     if (buf->heap == dx12_heap_type::default_) {
-        return (uintptr_t)tensor->data - 0x1000;
+        return (uintptr_t)addr - 0x1000 + view_off;
     }
     return 0;
 }

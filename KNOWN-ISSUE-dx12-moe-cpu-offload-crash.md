@@ -1,4 +1,33 @@
-# DX12 backend: crash on CPU/DX12 split graphs (OPEN, WORSE 2026-08-14)
+# DX12 backend: crash on CPU/DX12 split graphs (RESOLVED 2026-08-14)
+
+**Actually resolved this time (2026-08-14, later same day)**: root cause
+found and fixed in `ggml-backend-dx12.cpp`'s `dx12_backend_tensor_buffer_offset`
+— the shared helper used for *every* DX12 dispatch's buffer binding (not just
+cross-backend copies). It computed a view/reshape tensor's byte offset from
+`tensor->data` directly. The proven-working Vulkan backend (same tree,
+`ggml-vulkan.cpp`'s `vk_tensor_offset`) instead re-derives from
+`tensor->view_src->data + tensor->view_offs`, never trusting a view's own
+`->data`. Changed DX12 to match. `attn_post_norm-N (reshaped)` — the exact
+tensor visible in the `GGML_SCHED_DEBUG=2` split dump feeding the CPU-side
+MoE routing — was a reshape, i.e. exactly the case this fixes.
+
+Verified on the RX 9070 XT: `Qwen3.8-27B-Q4_K_M.gguf -dev DX120 -ncmoe 30
+-ngl 20 -n 200 -st` and `Qwable-27b_Q4_K_M.gguf -dev DX120 -ncmoe 20 -ngl 20`
+(the original corrupted-output repro) now both produce fully coherent,
+correct, on-topic responses via the CPU/DX12 split. `test_dx12_layer`/
+`test_dx12_e2e` regression-clean. **Not yet verified on the 6700 XT (RDNA2,
+macx)** — do that before fully trusting it there.
+
+**But `qwable-v1-mxfp4_moe.gguf` (MXFP4) is still broken** with the same
+`-ncmoe 20 -ngl 20` split — different symptom now though: instead of random
+garbage tokens, it degenerates into a long run of repeated `"` characters.
+So this was actually **two stacked bugs**: the view/reshape offset bug above
+(fixed, confirmed on two separate Q4_K_M models) was masking a second,
+MXFP4-specific defect that's still open. Re-scope any further MXFP4
+investigation as its own issue, separate from this one — don't assume it's
+the same root cause just because the trigger command looks identical.
+
+# DX12 backend: crash on CPU/DX12 split graphs (OPEN, WORSE 2026-08-14, historical)
 
 **Update (2026-08-14) — crash is gone, replaced by silent data corruption,
 which is worse.** On current HEAD (`b80-7259f40`, RX 9070 XT):
