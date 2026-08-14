@@ -35,6 +35,9 @@ void main(uint3 tid : SV_DispatchThreadID) {
         y = 0.5f * x * (1.0f + tanh(0.79788456080286535588f * (x + 0.044715f * x3)));
     } else if (p.op == 2) {
         y = tanh(x);
+    } else if (p.op == 4) {
+        // clamp(x, p0, p1)
+        y = min(max(x, p.p0), p.p1);
     } else {
         y = x * p.p0 + p.p1;
     }

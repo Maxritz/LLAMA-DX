@@ -220,6 +220,8 @@ set(DX12_SHADERS
     concat
     l2_norm
     gdn_ar
+    argsort_desc
+    sum_rows
     # DXLA shaders — SM 6.10 (dx::linalg cooperative matrix)
     mul_mat_dxla_wave_f16_f16
     mul_mat_dxla_wave_q4_0_f16
@@ -305,6 +307,8 @@ set(DX12_SHADER_THREAD_GROUPS
     concat,256,1,1
     l2_norm,256,1,1
     gdn_ar,128,1,1
+    argsort_desc,256,1,1
+    sum_rows,256,1,1
 mul_mat_dxla_wave_f16_f16,32,1,1
      mul_mat_dxla_wave_f16_f16_trans,32,1,1
      mul_mat_dxla_wave_q4_0_f16,32,1,1

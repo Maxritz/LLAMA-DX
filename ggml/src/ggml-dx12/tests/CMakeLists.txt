@@ -30,6 +30,7 @@ set(TEST_SOURCES
     test_dx12_gdn.cpp
     test_dx12_gdn2.cpp
     test_dx12_l2norm.cpp
+    test_dx12_argsort.cpp
 )
 
 foreach(TEST_SRC ${TEST_SOURCES})

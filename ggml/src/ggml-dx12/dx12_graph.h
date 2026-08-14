@@ -78,6 +78,7 @@ void dx12_graph_optimize(struct ggml_backend* backend, struct ggml_cgraph* graph
 
 bool dx12_dispatch_add       (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
 bool dx12_dispatch_mul       (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
+bool dx12_dispatch_div       (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
 bool dx12_dispatch_mul_mat   (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
 bool dx12_dispatch_mul_mat_id(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
 bool dx12_dispatch_flash_attn_ext(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
@@ -101,6 +102,9 @@ bool dx12_dispatch_ssm_conv  (dx12_device* dev, dx12_command_list* cmd, ggml_ten
 bool dx12_dispatch_concat    (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
 bool dx12_dispatch_l2_norm   (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
 bool dx12_dispatch_gated_delta_net(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
+bool dx12_dispatch_argsort    (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
+bool dx12_dispatch_sum_rows   (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
+bool dx12_dispatch_clamp      (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
 bool dx12_dispatch_none      (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
 bool dx12_dispatch_count     (dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
 

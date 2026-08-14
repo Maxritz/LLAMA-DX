@@ -144,7 +144,8 @@ bool dx12_op_supported(const ggml_tensor* node) {
         }
 
         case GGML_OP_ADD:
-        case GGML_OP_MUL: {
+        case GGML_OP_MUL:
+        case GGML_OP_DIV: {
             if (dx12_op_disabled("ewbin")) return false;
             const ggml_tensor* a = node->src[0];
             const ggml_tensor* b = node->src[1];
@@ -382,6 +383,41 @@ bool dx12_op_supported(const ggml_tensor* node) {
             return dx12_dims_fit_u32(q) && dx12_dims_fit_u32(k) && dx12_dims_fit_u32(v) &&
                    dx12_dims_fit_u32(g) && dx12_dims_fit_u32(beta) &&
                    dx12_dims_fit_u32(state) && dx12_dims_fit_u32(node);
+        }
+
+        case GGML_OP_ARGSORT: {
+            if (dx12_op_disabled("argsort")) return false;
+            const ggml_tensor* a = node->src[0];
+            if (!a) return false;
+            if (a->type != GGML_TYPE_F32) return false;
+            if (node->type != GGML_TYPE_I32) return false;
+            if (a->ne[0] > 256) return false;           // odd-even in one group
+            const int32_t order = ggml_get_op_params_i32(node, 0);
+            if (order != GGML_SORT_ORDER_ASC && order != GGML_SORT_ORDER_DESC) return false;
+            if (a->nb[0] != 4) return false;
+            if (ggml_nrows(a) > DX12_MAX_GROUPS) return false;
+            return dx12_dims_fit_u32(a) && dx12_dims_fit_u32(node);
+        }
+
+        case GGML_OP_SUM_ROWS: {
+            if (dx12_op_disabled("sumrows")) return false;
+            const ggml_tensor* a = node->src[0];
+            if (!a) return false;
+            if (a->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32) return false;
+            if (a->nb[0] != 4) return false;
+            if (a->ne[0] > 256) return false;           // one-group reduction
+            if (ggml_nrows(a) > DX12_MAX_GROUPS) return false;
+            return dx12_dims_fit_u32(a) && dx12_dims_fit_u32(node);
+        }
+
+        case GGML_OP_CLAMP: {
+            if (dx12_op_disabled("clamp")) return false;
+            const ggml_tensor* a = node->src[0];
+            if (!a) return false;
+            if (a->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32) return false;
+            if (a->nb[0] != 4) return false;
+            if (a->ne[0] > DX12_MAX_GROUPS) return false;
+            return dx12_dims_fit_u32(a) && dx12_dims_fit_u32(node);
         }
 
         // View ops: no data movement, dispatched as no-ops
@@ -755,8 +791,12 @@ bool dx12_graph_compute(dx12_device* dev, dx12_command_list* cmd, ggml_cgraph* g
                 case GGML_OP_CONCAT:        ok = dx12_dispatch_concat(dev, cmd, node); break;
                 case GGML_OP_L2_NORM:       ok = dx12_dispatch_l2_norm(dev, cmd, node); break;
                 case GGML_OP_GATED_DELTA_NET: ok = dx12_dispatch_gated_delta_net(dev, cmd, node); break;
+                case GGML_OP_ARGSORT:       ok = dx12_dispatch_argsort(dev, cmd, node); break;
+                case GGML_OP_SUM_ROWS:      ok = dx12_dispatch_sum_rows(dev, cmd, node); break;
+                case GGML_OP_CLAMP:         ok = dx12_dispatch_clamp(dev, cmd, node); break;
             case GGML_OP_ADD:           ok = dx12_dispatch_add(dev, cmd, node); break;
             case GGML_OP_MUL:           ok = dx12_dispatch_mul(dev, cmd, node); break;
+            case GGML_OP_DIV:           ok = dx12_dispatch_div(dev, cmd, node); break;
             case GGML_OP_SCALE:         ok = dx12_dispatch_scale(dev, cmd, node); break;
             case GGML_OP_UNARY:
                 switch (ggml_get_unary_op(node)) {
@@ -974,6 +1014,11 @@ bool dx12_dispatch_add(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* ds
 // MUL: elementwise multiplication (F32, broadcast src1)
 bool dx12_dispatch_mul(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
     return dx12_dispatch_ew_bin(dev, cmd, dst, 1);
+}
+
+// DIV: elementwise division
+bool dx12_dispatch_div(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
+    return dx12_dispatch_ew_bin(dev, cmd, dst, 2);
 }
 
 // Is this mul_mat eligible for the fast contiguous 2D path?
@@ -1752,6 +1797,59 @@ bool dx12_dispatch_layer_norm(dx12_device* dev, dx12_command_list* cmd, ggml_ten
 
     return dx12_shader_dispatch_simple(dev, cmd, "layer_norm",
         &params, sizeof(params), buf_s, nullptr, buf_d, n);
+}
+
+// ARGSORT: per-row index sort of F32 src by ASC/DESC (MoE top-k router).
+bool dx12_dispatch_argsort(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
+    const ggml_tensor* a = dst->src[0];
+    const int32_t order = ggml_get_op_params_i32(dst, 0);
+
+    struct {
+        uint32_t ne0, n_rows;
+        uint32_t src_nb1, dst_nb1;
+        uint32_t order, pad[3];
+    } p{};
+    p.ne0      = (uint32_t)a->ne[0];
+    p.n_rows   = (uint32_t)ggml_nrows(a);
+    p.src_nb1  = (uint32_t)a->nb[1];
+    p.dst_nb1  = (uint32_t)dst->nb[1];
+    p.order    = (uint32_t)order;
+
+    // one 256-thread group per row
+    return dx12_run_mm(dev, cmd, "argsort_desc", &p, sizeof(p),
+                       a, nullptr, nullptr, dst,
+                       1, p.n_rows, 1);
+}
+
+// SUM_ROWS: reduce each ne0-row to a scalar at [0,i1,i2,i3]
+bool dx12_dispatch_sum_rows(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
+    const ggml_tensor* a = dst->src[0];
+
+    struct {
+        uint32_t ne0, ne1, ne2, ne3;
+        uint32_t nb01, nb02, nb03;
+        uint32_t dnb1, dnb2, dnb3;
+        uint32_t pad[2];
+    } p{};
+    p.ne0 = (uint32_t)a->ne[0]; p.ne1 = (uint32_t)a->ne[1];
+    p.ne2 = (uint32_t)a->ne[2]; p.ne3 = (uint32_t)a->ne[3];
+    p.nb01 = (uint32_t)(a->nb[1]); p.nb02 = (uint32_t)(a->nb[2]); p.nb03 = (uint32_t)(a->nb[3]);
+    p.dnb1 = (uint32_t)(dst->nb[1]); p.dnb2 = (uint32_t)(dst->nb[2]); p.dnb3 = (uint32_t)(dst->nb[3]);
+
+    uint32_t n_rows = (uint32_t)(p.ne1 * p.ne2 * p.ne3);
+    return dx12_run_mm(dev, cmd, "sum_rows", &p, sizeof(p),
+                       a, nullptr, nullptr, dst,
+                       n_rows, 1, 1);
+}
+
+// CLAMP: dst = clamp(a, min, max) via ew_unary op 4. In-place (dst is a view
+// of src), same buffer read+write; handled by the barrier/aliasing in dx12_run_mm.
+bool dx12_dispatch_clamp(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst) {
+    const ggml_tensor* a = dst->src[0];
+    float minv, maxv;
+    memcpy(&minv, (const char*)dst->op_params, sizeof(float));
+    memcpy(&maxv, (const char*)dst->op_params + 4, sizeof(float));
+    return dx12_dispatch_unary_impl(dev, cmd, dst, 4, minv, maxv);
 }
 
 // SSM_CONV: causal 1D conv. x [d_conv-1+n_t, d_inner, n_seqs], w [d_conv, d_inner]

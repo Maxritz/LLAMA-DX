@@ -32,6 +32,6 @@ void main(uint3 tid : SV_DispatchThreadID) {
     float a = asfloat(A.Load(i0 * p.nb00 + i1 * p.nb01 + i2 * p.nb02 + i3 * p.nb03));
     float b = asfloat(B.Load((i0 % p.ne10) * p.nb10 + (i1 % p.ne11) * p.nb11 +
                              (i2 % p.ne12) * p.nb12 + (i3 % p.ne13) * p.nb13));
-    float d = (p.op == 1) ? (a * b) : (a + b);
+    float d = (p.op == 1) ? (a * b) : (p.op == 2) ? (a / b) : (a + b);
     D.Store(i0 * p.dnb0 + i1 * p.dnb1 + i2 * p.dnb2 + i3 * p.dnb3, asuint(d));
 }
