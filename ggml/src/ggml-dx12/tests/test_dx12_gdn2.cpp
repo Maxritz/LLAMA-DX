@@ -10,6 +10,7 @@
 #include "dx12_command.h"
 #include "dx12_shader.h"
 #include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -108,7 +109,7 @@ static bool run_gdn(const std::vector<float>& q,const std::vector<float>& k,cons
     return ok;
 }
 
-int main() {
+int main(int argc, char** argv) {
     setvbuf(stdout,NULL,_IONBF,0);
     printf("\n=== DX12 GDN ROUND-TRIP Test ===\n");
     dx12_result r=dx12_device_create(-1,&g_dev);
@@ -118,20 +119,25 @@ int main() {
     const int S_v=128,H_v=32,H_k=16,nseq=1;
     std::mt19937 rng(99);
     std::uniform_real_distribution<float> d(-0.5f,0.5f);
-    int nt_pre=2, nt_dec=1;
+    int nt_pre=8, nt_dec=1;
+    if (argc > 1) nt_pre = atoi(argv[1]);
     auto mk = [&](size_t n){ std::vector<float> v(n); for(auto&x:v)x=d(rng); return v; };
 
     // ---- CPU reference chain ----
     std::vector<float> cq=mk(S_v*H_k*nt_pre*nseq),ck=mk(S_v*H_k*nt_pre*nseq),
         cv=mk(S_v*H_v*nt_pre*nseq),cg=mk(H_v*nt_pre*nseq),cb=mk(H_v*nt_pre*nseq),
         cstate=mk(S_v*S_v*H_v*nseq), cout;
+    const std::vector<float> cstate_init = cstate;  // GPU chain starts from same state
     ref_step(cq,ck,cv,cg,cb,cstate,cout,S_v,H_v,H_k,nt_pre,nseq);
+    // snapshot post-prefill CPU state before step 2 mutates it
+    std::vector<float> cstate_pre = cstate;
     std::vector<float> cq1=mk(S_v*H_k*nt_dec*nseq),ck1=mk(S_v*H_k*nt_dec*nseq),
         cv1=mk(S_v*H_v*nt_dec*nseq),cg1=mk(H_v*nt_dec*nseq),cb1=mk(H_v*nt_dec*nseq), cout1;
     ref_step(cq1,ck1,cv1,cg1,cb1,cstate,cout1,S_v,H_v,H_k,nt_dec,nseq);
 
     // ---- GPU chain ----
-    std::vector<float> gstate=mk(S_v*S_v*H_v*nseq), gout;
+    // GPU chain MUST start from the SAME initial state as the CPU chain
+    std::vector<float> gstate=cstate_init, gout;
     std::vector<float> pre_q=cq, pre_k=ck, pre_v=cv, pre_g=cg, pre_b=cb;
     std::vector<float> dec_q=cq1, dec_k=ck1, dec_v=cv1, dec_g=cg1, dec_b=cb1;
     // step 1: prefill nt=2
@@ -140,9 +146,12 @@ int main() {
     printf("  step1 start\n");
     bool ok1=run_gdn(pre_q,pre_k,pre_v,pre_g,pre_b,gstate,gout,S_v,H_v,H_k,nt_pre,nseq);
     printf("  step1 done ok=%d\n", ok1);
-    // compare prefill new_state (gout tail) vs CPU prefill new_state (cout tail)
+    // compare prefill attn + new_state (gout) vs CPU (cout / cstate_pre)
     int pre_bad=0; double pre_err=0;
-    for(size_t i=0;i<state_all;i++){double e=fabs(gout[attn_pre+i]-cout[attn_pre+i]);pre_err=(e>pre_err)?e:pre_err;if(e>1e-3)pre_bad++;}
+    for(size_t i=0;i<attn_pre;i++){double e=fabs(gout[i]-cout[i]);pre_err=(e>pre_err)?e:pre_err;if(e>1e-3)pre_bad++;}
+    printf("prefill attn : max_err=%.6f bad=%d/%zu\n",pre_err,pre_bad,attn_pre);
+    pre_bad=0; pre_err=0;
+    for(size_t i=0;i<state_all;i++){double e=fabs(gout[attn_pre+i]-cstate_pre[i]);pre_err=(e>pre_err)?e:pre_err;if(e>1e-3)pre_bad++;}
     printf("prefill state: max_err=%.6f bad=%d/%zu\n",pre_err,pre_bad,state_all);
     // gstate now holds new_state from step 1 (fed into step 2)
     std::vector<float> dec_out;

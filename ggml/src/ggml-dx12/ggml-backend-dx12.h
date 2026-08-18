@@ -110,6 +110,14 @@ typedef enum {
     DX12_QUANT_IQ2_XXS,
     DX12_QUANT_IQ2_XS,
     DX12_QUANT_IQ3_XXS,
+    // MXFP4 / NVFP4 / ROCmFP4 — 4-bit formats with E8M0 / UE4M3 scales.
+    // These were absent from the enum, so every tensor of these types fell
+    // through the type switch to F16 and the GPU consumed raw 4-bit nibbles
+    // as F16 bit patterns -> the MXFP4 MoE corruption.
+    DX12_QUANT_MXFP4,
+    DX12_QUANT_NVFP4,
+    DX12_QUANT_ROCMFP4,
+    DX12_QUANT_ROCMFP4_FAST,
     DX12_QUANT_COUNT,
 } dx12_quant_type;
 

@@ -191,6 +191,7 @@ recovered-context-*.md
 updated-context-*.md
 SESSION_CONTEXT.md
 bench*.txt
+*_prof_err.txt
 GpuDebuggingLog.txt
 temp_reg.*
 build-trace.md
@@ -205,6 +206,39 @@ DXLA_FIRST_PASS.md
 HOW-TO-FIX*.md
 WHAT-TO-FIX*.md
 WHAT-WE-ARE-FIXING.md
+
+# === fork scratch / session artifacts (not source, excluded from repo) ===
+AUDIT-*.md
+attn_test.txt
+llama1b.txt
+q35_check.txt
+cfg_fresh*.txt
+build_argsort*.txt
+build_argtest*.txt
+build_clamp.txt
+build_deploy*.txt
+build_div.txt
+build_fresh*.txt
+build_srfix.txt
+build_sum.txt
+build_msvc.bat
+build-info.sh
+build-info.txt
+bench_llamacli.bat
+bench_simple.bat
+bench_task.bat
+llama-run.ps1
+run-llamadx.cmd
+CleanUp.md
+LIMITATIONS.txt
+SESSION_FIXES.md
+TEMPLATES.md
+TRACE_BUILD.md
+OPTIMIZATION_ROADMAP.md
+LLAMADX-Usage.md
+KNOWN-ISSUE-*.md
+RDNA4_MEMORY_HIERARCHY_REPORT.md
+*.bak
 
 # === not needed for compilation (kept on disk, excluded from repo) ===
 .github/

@@ -32,6 +32,13 @@ dx12_quant_type dx12_quant_type_from_ggml(uint32_t ggml_type) {
         case 20: return DX12_QUANT_IQ2_XXS;
         case 21: return DX12_QUANT_IQ2_XS;
         case 22: return DX12_QUANT_IQ3_XXS;
+        // MXFP4 / NVFP4 / ROCmFP4 — were silently falling through to F16 here,
+        // which is exactly the MXFP4 MoE corruption (raw 4-bit nibbles consumed
+        // as F16 bit patterns). Give them real types so the dequant path runs.
+        case 39: return DX12_QUANT_MXFP4;
+        case 40: return DX12_QUANT_NVFP4;
+        case 100: return DX12_QUANT_ROCMFP4;
+        case 101: return DX12_QUANT_ROCMFP4_FAST;
         default: return DX12_QUANT_F16; // Safe fallback
     }
 }
@@ -49,6 +56,10 @@ const char* dx12_quant_shader_name(dx12_quant_type type) {
         case DX12_QUANT_Q2_K:    return "dequant_q4_k"; // Fallback
         case DX12_QUANT_Q3_K:    return "dequant_q6_k"; // Fallback
         case DX12_QUANT_Q8_K:    return "dequant_q8_0"; // Fallback
+        case DX12_QUANT_MXFP4:   return "dequant_mxfp4";
+        case DX12_QUANT_NVFP4:   return "dequant_mxfp4";
+        case DX12_QUANT_ROCMFP4: return "dequant_rocmfp4";
+        case DX12_QUANT_ROCMFP4_FAST: return "dequant_rocmfp4";
         default:                 return nullptr;
     }
 }
@@ -68,11 +79,17 @@ const char* dx12_quant_gemm_shader_name(dx12_quant_type weight_quant,
         }
     }
 
-    // Standard tile-based GEMM with on-the-fly dequantization
+    // Standard tile-based GEMM with on-the-fly dequantization.
+    // MXFP4/NVFP4/ROCmFP4 weights are dequantized to F16 at load time (see
+    // dx12_buf_set_tensor), so they route through the F16 GEMM path here.
     switch (weight_quant) {
         case DX12_QUANT_Q4_0: return "mul_mat_q4_0_f16";
         case DX12_QUANT_Q8_0: return "mul_mat_q8_0_f16";
         case DX12_QUANT_Q6_K: return "mm_tiled";
+        case DX12_QUANT_MXFP4:
+        case DX12_QUANT_NVFP4:
+        case DX12_QUANT_ROCMFP4:
+        case DX12_QUANT_ROCMFP4_FAST:
         case DX12_QUANT_F16:  return "mul_mat_f16_f16";
         case DX12_QUANT_F32:  return "mul_mat_f16_f32";
         default:              return "mm_tiled"; // Safe fallback for K-quants

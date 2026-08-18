@@ -1944,6 +1944,18 @@ bool dx12_dispatch_gated_delta_net(dx12_device* dev, dx12_command_list* cmd, ggm
     const ggml_tensor* beta = dst->src[4];
     const ggml_tensor* state= dst->src[5];
 
+    if (getenv("DX12_GDN_DEBUG")) {
+        const ggml_tensor* t[7] = { q, k, v, g, beta, state, dst };
+        const char* names[7]  = { "q", "k", "v", "g", "beta", "state", "dst" };
+        for (int i = 0; i < 7; i++) {
+            fprintf(stderr, "[GDNDBG] %-5s %-28s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] view=%d\n",
+                names[i], t[i]->name,
+                (long long)t[i]->ne[0], (long long)t[i]->ne[1], (long long)t[i]->ne[2], (long long)t[i]->ne[3],
+                t[i]->nb[0], t[i]->nb[1], t[i]->nb[2], t[i]->nb[3],
+                t[i]->view_src ? 1 : 0);
+        }
+    }
+
     struct {
         uint32_t S_v, H_v, n_k_head, n_tokens, n_seqs;
         uint32_t sq1, sq2, sq3;

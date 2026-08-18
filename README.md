@@ -18,6 +18,27 @@ targets. Concretely, as of this writing:
 
 - Core inference (prefill + decode) works and has been benchmarked against the CPU and
   Vulkan backends on real models (see [Benchmarks](#benchmarks)).
+- **4-bit quant dequant-to-F16 at load** (`GGML_TYPE_MXFP4`/`NVFP4`/`ROCmFP4`):
+  `dx12_quant_type_from_ggml()` had no case for the 4-bit types and fell through to
+  F16, so the GEMM consumed raw 4-bit nibbles as F16 bit patterns → garbage logits /
+  runs of `"`. Fixed by adding the enum entries + routing through `tt->to_float` into
+  `mul_mat_f16_f16`, with `dequant_mxfp4.hlsl` (E8M0 scale) and
+  `dequant_rocmfp4.hlsl` (custom UE4M3 table). Both compile clean with DXC
+  1.10.2605.2 cs_6_6.
+- **`mv_f16` wave64 OOB fix**: the old kernel loaded all of B into one fixed
+  `B_lds[4096]` groupshared buffer in a single pass → out-of-bounds groupshared write
+  → GPU hang for `n_embd > 4096` (8B+ models). Rewrote to chunked `B_CHUNK=1024`
+  windows. Wave64 wiring (`DX12_WAVE_SIZE`, `use_w64`, `prefers_wave64`) was already
+  correct and is unchanged.
+- **Dead code stripped** (verified unused before deletion): `patches/` (11 files,
+  1,950 lines — duplicate shaders + corrupt `.patch` files that fail
+  `git apply --check`), `dx12_workgraph.cpp/.h` + test (gated on the never-set
+  `DX12_ENABLE_WORK_GRAPHS`, entry `wg_scale` not in `DX12_SHADERS`),
+  `shaders/mm_kq.hlsl` (190 lines, confirmed-unused K-quant fallback — the verified
+  block-wise LDS K-quant dequant already lives in `mm_tiled.hlsl`), tracked
+  `llama-dx12-bundle.zip` (14 MB), 2 stale `.bak` files. Also removed the twice-written,
+  never-read `offset_in_parent` field from `dx12_buffer.{h,cpp}` and 3 uncalled
+  methods (`has_pso`/`clear`/`enable_hot_reload_watch`) from `dx12_shader_cache`.
 - `test-backend-ops`, the ggml op-correctness harness, now passes completely clean
   end-to-end for the first time: DX12 1680/1680, Vulkan0 15010/15010, 3/3 backends,
   exit 0. It didn't used to get anywhere close - the whole harness used to crash on

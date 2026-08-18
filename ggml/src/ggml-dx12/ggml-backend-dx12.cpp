@@ -102,6 +102,10 @@ const char* dx12_quant_type_name(dx12_quant_type type) {
         case DX12_QUANT_IQ2_XXS:  return "IQ2_XXS";
         case DX12_QUANT_IQ2_XS:   return "IQ2_XS";
         case DX12_QUANT_IQ3_XXS:  return "IQ3_XXS";
+        case DX12_QUANT_MXFP4:     return "MXFP4";
+        case DX12_QUANT_NVFP4:     return "NVFP4";
+        case DX12_QUANT_ROCMFP4:   return "ROCmFP4";
+        case DX12_QUANT_ROCMFP4_FAST: return "ROCmFP4-fast";
         default:                  return "UNKNOWN";
     }
 }
@@ -122,6 +126,10 @@ size_t dx12_quant_type_block_size(dx12_quant_type type) {
         case DX12_QUANT_IQ2_XXS: return 256;
         case DX12_QUANT_IQ2_XS:  return 256;
         case DX12_QUANT_IQ3_XXS: return 256;
+        case DX12_QUANT_MXFP4:   return 32;   // 32 elements per block
+        case DX12_QUANT_NVFP4:   return 64;   // 64 elements per block
+        case DX12_QUANT_ROCMFP4: return 32;
+        case DX12_QUANT_ROCMFP4_FAST: return 32;
         default:                 return 1;
     }
 }
@@ -597,14 +605,22 @@ static void dx12_buf_set_tensor(ggml_backend_buffer_t buf, ggml_tensor* tensor,
         return;
     }
 
-    // K-quant weight tensors: optionally dequantize to F16 on load (opt-in via
-    // DX12_DEQUANT_TO_F16=1). This routes through the fast DXLA F16 GEMM path
-    // instead of the slow scalar mm_kq shader, at the cost of 3.5x VRAM.
+    // K-quant and 4-bit (MXFP4/NVFP4/ROCmFP4) weight tensors: dequantize to F16 on
+    // load. K-quants are opt-in via DX12_DEQUANT_TO_F16=1; the 4-bit types are
+    // ALWAYS dequantized here because the GEMM shaders have no fused on-the-fly
+    // path for them — uploading the raw 4-bit bytes and letting the dispatch
+    // fall through to the F16 selector consumed nibbles as F16 bit patterns,
+    // which is exactly the MXFP4 MoE corruption (garbage logits, runs of
+    // identical tokens).
     static bool s_dequant_f16 = []() {
         const char* env = getenv("DX12_DEQUANT_TO_F16");
         return env && env[0] == '1';
     }();
-    bool is_kquant = s_dequant_f16 &&
+    bool is_4bit = (tensor->type == GGML_TYPE_MXFP4 ||
+                    tensor->type == GGML_TYPE_NVFP4 ||
+                    tensor->type == GGML_TYPE_Q4_0_ROCMFP4 ||
+                    tensor->type == GGML_TYPE_Q4_0_ROCMFP4_FAST);
+    bool is_kquant = (s_dequant_f16 || is_4bit) &&
         (tensor->type == GGML_TYPE_Q4_K ||
          tensor->type == GGML_TYPE_Q5_K ||
          tensor->type == GGML_TYPE_Q6_K);

@@ -18,7 +18,10 @@ RWByteAddressBuffer A : register(u0);  // weights: N x K (F16), row-major
 RWByteAddressBuffer B : register(u1);  // input:  K x 1 (F32)
 RWByteAddressBuffer C : register(u2);  // output: N x 1 (F32)
 
-#define B_LDS_MAX 4096
+// B is loaded in CHUNK-sized windows: K can exceed this for wide models
+// (n_embd 4608+ on 8B+), and a single-pass 4096-float LDS would overflow
+// → OOB groupshared write → GPU hang. Each window is barrier-synced.
+#define B_LDS_MAX 1024
 groupshared float B_lds[B_LDS_MAX];
 
 #ifndef DX12_WAVE_SIZE
@@ -34,32 +37,36 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     uint row  = gid.x * WAVES_PER_GROUP + sub;
     bool valid = row < params.N;
 
-    // Phase 1: All 256 threads cooperatively load B into LDS (single pass)
     uint k_count = params.K;
-    [loop]
-    for (uint i = gtid.x; i < k_count; i += 256) {
-        B_lds[i] = asfloat(B.Load(i * 4));
-    }
-    // Fill any remaining LDS with 0 if K < B_LDS_MAX
-    [loop]
-    for (uint i = gtid.x + k_count; i < B_LDS_MAX; i += 256) {
-        B_lds[i] = 0.0f;
-    }
-    GroupMemoryBarrierWithGroupSync();
+    uint row_offset = row * k_count * 2;  // byte offset to row in A (F16)
+    float acc = 0.0f;
 
-    // Phase 2: Each wave computes one dot product (row of W · B)
-    if (valid) {
-        float acc = 0.0f;
-        uint row_offset = row * k_count * 2;  // byte offset to row in A (F16)
-
+    // Walk K in windows; each window is cooperatively loaded into LDS,
+    // then every wave folds its slice of the dot product into acc.
+    [loop]
+    for (uint chunk = 0; chunk < k_count; chunk += B_LDS_MAX) {
+        uint win = min(B_LDS_MAX, k_count - chunk);
+        // Phase 1: 256 threads cooperatively load this window into LDS
         [loop]
-        for (uint k = lane; k < k_count; k += DX12_WAVE_SIZE) {
-            uint addr = row_offset + k * 2;
-            uint w = A.Load(addr & ~3u);
-            float a = f16tof32((addr & 2u) ? (w >> 16) : w);
-            acc += a * B_lds[k];
+        for (uint i = gtid.x; i < win; i += 256) {
+            B_lds[i] = asfloat(B.Load((chunk + i) * 4));
         }
+        GroupMemoryBarrierWithGroupSync();
 
+        // Phase 2: each wave accumulates its slice of this window
+        if (valid) {
+            [loop]
+            for (uint k = lane; k < win; k += DX12_WAVE_SIZE) {
+                uint addr = row_offset + (chunk + k) * 2;
+                uint w = A.Load(addr & ~3u);
+                float a = f16tof32((addr & 2u) ? (w >> 16) : w);
+                acc += a * B_lds[k];
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (valid) {
         float result = WaveActiveSum(acc);
         if (WaveIsFirstLane()) {
             C.Store(row * 4, asuint(result));

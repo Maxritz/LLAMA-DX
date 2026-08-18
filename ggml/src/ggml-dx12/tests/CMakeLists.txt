@@ -24,7 +24,6 @@ set(TEST_SOURCES
     test_upload_bench.cpp
     test_ring_bench.cpp
     test_gpu_upload_bench.cpp
-    test_dx12_workgraph.cpp
     test_dx12_execute_indirect.cpp
     test_dx12_dot_kernels.cpp
     test_dx12_gdn.cpp
@@ -51,7 +50,6 @@ foreach(TEST_SRC ${TEST_SOURCES})
             ${CMAKE_CURRENT_SOURCE_DIR}/../dx12_shader_cache.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/../dx12_profiler.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/../dx12_ds.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/../dx12_workgraph.cpp
             ${CMAKE_CURRENT_BINARY_DIR}/../dx12_shader_registry.cpp
         )
         target_compile_definitions(${TEST_NAME} PRIVATE GGML_BACKEND_DL GGML_BACKEND_BUILD GGML_BACKEND_SHARED

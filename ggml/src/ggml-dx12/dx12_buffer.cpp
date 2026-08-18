@@ -489,7 +489,6 @@ dx12_buffer* dx12_memory_pool::allocate(size_t size) {
             sub->state = block->state;
             sub->gpu_address = block->gpu_address + block->used;
             sub->parent = block;
-            sub->offset_in_parent = block->used;
             block->used += size;
             return sub;
         }
@@ -512,9 +511,8 @@ dx12_buffer* dx12_memory_pool::allocate(size_t size) {
     sub->used = size;
     sub->state = block->state;
     sub->gpu_address = block->gpu_address;
-    sub->parent = block;
-    sub->offset_in_parent = 0;
-    block->used = size;
+sub->parent = block;
+            block->used = size;
 
     return sub;
 }

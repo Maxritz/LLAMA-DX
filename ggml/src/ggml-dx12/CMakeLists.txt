@@ -169,6 +169,8 @@ set(DX12_SHADERS
     dequant_q6_k
     dequant_q4_k
     dequant_q5_k
+    dequant_mxfp4
+    dequant_rocmfp4
     ei_probe
     cast_f16_f32
     cast_bf16_f16
@@ -202,9 +204,8 @@ set(DX12_SHADERS
     flash_attn_ext_tiled
     fa_split
     fa_combine
-    fwht_row
-    mm_kq
-    ew_bin
+fwht_row
+     ew_bin
     ew_scale
     ew_unary
     ew_glu
@@ -257,6 +258,8 @@ set(DX12_SHADER_THREAD_GROUPS
     dequant_q6_k,64,1,1
     dequant_q4_k,64,1,1
     dequant_q5_k,64,1,1
+    dequant_mxfp4,256,1,1
+    dequant_rocmfp4,256,1,1
     cast_f16_f32,256,1,1
     cast_bf16_f16,256,1,1
     mul_mat_f16_f16,32,32,1
@@ -289,7 +292,6 @@ set(DX12_SHADER_THREAD_GROUPS
     fa_split,256,1,1
     fa_combine,256,1,1
     fwht_row,256,1,1
-    mm_kq,16,16,1
     mm_tiled,16,16,1
     ew_bin,256,1,1
     ew_scale,256,1,1

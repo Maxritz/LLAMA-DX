@@ -47,7 +47,6 @@ struct dx12_buffer {
 
     // For sub-allocation tracking
     dx12_buffer*            parent = nullptr;   // Non-null if sub-allocated
-    size_t                  offset_in_parent = 0;
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════

@@ -38,20 +38,3 @@ ID3D12PipelineState* dx12_shader_cache::load_pso(const char* name, const void* c
     pso_cache[name] = std::move(pso);
     return result;
 }
-
-bool dx12_shader_cache::has_pso(const char* name) {
-    std::lock_guard<std::mutex> lock(mutex);
-    return pso_cache.find(name) != pso_cache.end();
-}
-
-void dx12_shader_cache::clear() {
-    std::lock_guard<std::mutex> lock(mutex);
-    pso_cache.clear();
-}
-
-void dx12_shader_cache::enable_hot_reload_watch(const char* shader_dir) {
-    (void)shader_dir;
-    enable_hot_reload = true;
-    // Full implementation would use ReadDirectoryChangesW
-    // to watch for .hlsl file modifications and trigger recompilation
-}
