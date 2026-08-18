@@ -1,7 +1,8 @@
 /*
  * mv_q4_0.hlsl — Wave32-native (8 rows × 32 lanes, B-LDS preload)
  * Q4_0 block = 18 bytes (f16 d + 16 nibble bytes for 32 elements).
- * Block-aligned per-lane dequant: scale broadcast via WaveReadLaneAt,
+ * Block-aligned per-lane dequant: scale loaded per-lane (wave-uniform per
+ * half-wave, works for both wave32 and wave64),
  * each lane loads ONE dword for its quant byte (vs ~2 loads per element
  * in the old per-element stride). ~50% fewer global loads per block.
  * ALL 256 threads cooperatively load B→LDS, even if their row is out-of-range.
@@ -55,21 +56,22 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
                 if (blk >= block_end) continue;
                 uint base = row_base + blk * 18u;
 
-                float d = 0.0f;
-                if (lane == 0) {
-                    uint sw = A.Load(base & ~3u);
-                    d = f16tof32((base & 2u) ? (sw >> 16) : sw);
-                }
-                d = WaveReadLaneAt(d, 0);
+                // Per-lane (wave-uniform per half-wave) scale load — the old
+                // lane0-guard + WaveReadLaneAt(d,0) broadcast read block b's
+                // scale for the whole 64-lane wave, so lanes 32-63 dequantized
+                // block b+1 with the wrong d (garbage GEMV at wave64).
+                uint sw = A.Load(base & ~3u);
+                float d = f16tof32((base & 2u) ? (sw >> 16) : sw);
 
-                uint byte_idx = lane & 15u;
+                uint elem = lane & 31u;
+                uint byte_idx = elem & 15u;
                 uint byte_addr = base + 2u + byte_idx;
                 uint dword_val = A.Load(byte_addr & ~3u);
                 uint byte_shift = (byte_addr & 3u) * 8u;
                 uint byte_val = (dword_val >> byte_shift) & 0xFFu;
-                float w = (float)((lane >= 16u) ? (byte_val >> 4) : (byte_val & 0xFu)) - 8.0f;
+                float w = (float)((elem >= 16u) ? (byte_val >> 4) : (byte_val & 0xFu)) - 8.0f;
 
-                uint k = blk * 32u + (lane & 31u);
+                uint k = blk * 32u + elem;
                 if (k < params.K) {
                     acc += d * w * B_lds[k - chunk];
                 }
