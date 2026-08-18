@@ -11,7 +11,14 @@ cmake_minimum_required(VERSION 3.25)
 include(FetchContent)
 
 set(DX12_AGILITY_SDK_VERSION "1.721.1" CACHE STRING "DirectX Agility SDK version")
-set(DX12_AGILITY_SDK_PATH "E:/DXllama/sdk" CACHE PATH "Path to local Agility SDK root (preview for SM 6.10/DXLA)")
+set(DX12_AGILITY_SDK_PATH "" CACHE PATH "Path to local Agility SDK root (preview for SM 6.10/DXLA)")
+if(NOT DX12_AGILITY_SDK_PATH)
+    message(FATAL_ERROR "DX12_AGILITY_SDK_PATH must be set to the Agility SDK root (e.g. -DDX12_AGILITY_SDK_PATH=C:/sdk).")
+endif()
+set(DX12_DS_SDK_PATH "" CACHE PATH "Path to DirectStorage SDK root (contains native/include + native/lib)")
+if(NOT DX12_DS_SDK_PATH)
+    message(FATAL_ERROR "DX12_DS_SDK_PATH must be set to the DirectStorage SDK root (e.g. -DDX12_DS_SDK_PATH=C:/ds14).")
+endif()
 
 set(AGILITY_SDK_DIR ${DX12_AGILITY_SDK_PATH})
 message(STATUS "Using Agility SDK from: ${AGILITY_SDK_DIR}")
@@ -19,22 +26,12 @@ message(STATUS "Using Agility SDK from: ${AGILITY_SDK_DIR}")
 # ═══════════════════════════════════════════════════════════════════════════════
 # DXC Compiler Detection
 # ═══════════════════════════════════════════════════════════════════════════════
-# DXC can come from: (1) Windows SDK, (2) Agility SDK, (3) Standalone
-set(_DXC_CANDIDATES
-    "E:/DXllama/dxc-1.10.2605.2/bin/x64/dxc.exe"
-    "C:/Users/rr/Desktop/Notllama-loc/new-DXMLDXAL/dxc-1.10.2605.2/bin/x64/dxc.exe"
-)
+# DXC can come from: (1) -DDXC_EXECUTABLE, (2) Windows SDK, (3) PATH
+if(NOT DXC_EXECUTABLE)
+    find_program(DXC_EXECUTABLE NAMES dxc dxc.exe)
+endif()
 if(NOT DXC_EXECUTABLE OR NOT EXISTS "${DXC_EXECUTABLE}")
     unset(DXC_EXECUTABLE CACHE)
-    foreach(_cand IN LISTS _DXC_CANDIDATES)
-        if(EXISTS "${_cand}")
-            set(DXC_EXECUTABLE "${_cand}" CACHE FILEPATH "DXC compiler")
-            break()
-        endif()
-    endforeach()
-endif()
-
-if(NOT DXC_EXECUTABLE OR NOT EXISTS "${DXC_EXECUTABLE}")
     message(FATAL_ERROR "dxc.exe not found. Install Windows SDK 22621+ or DXC standalone, or pass -DDXC_EXECUTABLE=<path>.")
 endif()
 
@@ -64,7 +61,6 @@ set(DX12_SOURCES
     dx12_ring.cpp
     dx12_descriptor.cpp
     dx12_shader.cpp
-    dx12_quantize.cpp
     dx12_gemm.cpp
     dx12_graph.cpp
     dx12_shader_cache.cpp
@@ -80,7 +76,6 @@ set(DX12_HEADERS
     dx12_ring.h
     dx12_descriptor.h
     dx12_shader.h
-    dx12_quantize.h
     dx12_gemm.h
     dx12_graph.h
     dx12_shader_cache.h
@@ -100,7 +95,7 @@ target_include_directories(ggml-dx12
         ${AGILITY_SDK_DIR}/build/native/include
         ${CMAKE_CURRENT_SOURCE_DIR}/shaders
         ${CMAKE_CURRENT_SOURCE_DIR}/../  # ggml/src/ for ggml-impl.h, ggml-backend-impl.h
-        E:/DXllama/ds14/native/include  # DirectStorage SDK
+        ${DX12_DS_SDK_PATH}/native/include  # DirectStorage SDK
 )
 
 # Link DirectX libraries
@@ -152,8 +147,8 @@ target_compile_features(ggml-dx12 PRIVATE cxx_std_20)
 
 target_link_libraries(ggml-dx12 PUBLIC ggml-base)
 
-# Link DirectStorage library from ds14 SDK
-target_link_directories(ggml-dx12 PUBLIC E:/DXllama/ds14/native/lib/x64)
+# Link DirectStorage library from the DS SDK path
+target_link_directories(ggml-dx12 PUBLIC ${DX12_DS_SDK_PATH}/native/lib/x64)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Shader Compilation

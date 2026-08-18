@@ -112,19 +112,6 @@ bool dx12_gemm_dispatch_dxla_tg(dx12_device* dev,
                                  dx12_buffer* result,
                                  const dx12_gemm_params* params);
 
-/**
- * dx12_gemm_dispatch_quantized — GEMM with on-the-fly dequantization
- *
- * Weights are quantized (Q4_0, Q8_0), activations are F16.
- * Dequantization happens inside the GEMM shader.
- */
-bool dx12_gemm_dispatch_quantized(dx12_device* dev,
-                                   dx12_command_list* cmd,
-                                   dx12_buffer* quantized_weights, // SRV: quantized
-                                   dx12_buffer* activations,       // SRV: F16
-                                   dx12_buffer* result,            // UAV: F16
-                                   const dx12_gemm_params* params);
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // Attention-Specific GEMMs
 // ═══════════════════════════════════════════════════════════════════════════════

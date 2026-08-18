@@ -18,7 +18,6 @@
 #include "dx12_command.h"
 #include "dx12_descriptor.h"
 #include "dx12_shader.h"
-#include "dx12_quantize.h"
 #include "dx12_gemm.h"
 #include "dx12_graph.h"
 #include "dx12_profiler.h"

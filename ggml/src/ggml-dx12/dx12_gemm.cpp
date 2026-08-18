@@ -6,7 +6,6 @@
 
 #include "dx12_gemm.h"
 #include "dx12_shader.h"
-#include "dx12_quantize.h"
 #include <cmath>
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -82,8 +81,10 @@ bool dx12_gemm_dispatch(dx12_device* dev,
             return dx12_gemm_dispatch_dxla_tg(dev, cmd, matrix_a, matrix_b, result, params);
         case DX12_GEMM_STANDARD:
         default:
+            // Quantized weights have no legacy fused-gemm path; production
+            // GEMMs go through dx12_graph.cpp dispatch (mv_*/mm_tiled).
             if (params->quant_a != DX12_QUANT_F16 && params->quant_a != DX12_QUANT_F32) {
-                return dx12_gemm_dispatch_quantized(dev, cmd, matrix_a, matrix_b, result, params);
+                return false;
             }
             return dx12_gemm_dispatch_standard(dev, cmd, matrix_a, matrix_b, result, params);
     }
@@ -301,59 +302,6 @@ bool dx12_gemm_dispatch_dxla_tg(dx12_device* dev,
 // ═══════════════════════════════════════════════════════════════════════════════
 // Quantized GEMM (on-the-fly dequantization)
 // ═══════════════════════════════════════════════════════════════════════════════
-
-bool dx12_gemm_dispatch_quantized(dx12_device* dev,
-                                   dx12_command_list* cmd,
-                                   dx12_buffer* quantized_weights,
-                                   dx12_buffer* activations,
-                                   dx12_buffer* result,
-                                   const dx12_gemm_params* params) {
-    // Select dequant+GEMM fused shader
-    const char* shader_name = dx12_quant_gemm_shader_name(
-        params->quant_a, params->quant_b, false);
-
-    dx12_buffer* bufs[3] = { quantized_weights, activations, result };
-    D3D12_RESOURCE_STATES states[3] = {
-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS
-    };
-    dx12_buffer_transition_batch(cmd, bufs, states, 3);
-
-    uint32_t tile_m = dev->caps.optimal_gemm_tile;
-    uint32_t tile_n = dev->caps.optimal_gemm_tile;
-    uint32_t dispatch_x = (params->N + tile_n - 1) / tile_n;
-    uint32_t dispatch_y = (params->M + tile_m - 1) / tile_m;
-
-    struct quant_gemm_constants {
-        uint32_t M, N, K;
-        uint32_t stride_a, stride_b, stride_c;
-        uint32_t transposed_b;
-        uint32_t quant_type;    // Weight quantization type
-        uint32_t reserved[8];
-    } qgc{};
-
-    qgc.M = params->M;
-    qgc.N = params->N;
-    qgc.K = params->K;
-    qgc.stride_a = params->stride_a ? params->stride_a : params->K;
-    qgc.stride_b = params->stride_b ? params->stride_b : (params->transposed_b ? params->K : params->N);
-    qgc.stride_c = params->stride_c ? params->stride_c : params->N;
-    qgc.transposed_b = params->transposed_b ? 1 : 0;
-    qgc.quant_type = (uint32_t)params->quant_a;
-
-    struct dx12_shader_dispatch dispatch{};
-    dispatch.shader_name = shader_name;
-    dispatch.sig_type = dx12_root_signature_type::gemm;
-    dispatch.thread_group_x = dispatch_x;
-    dispatch.thread_group_y = dispatch_y;
-    dispatch.thread_group_z = params->batch_count;
-
-    dx12_buffer* srvs[2] = { quantized_weights, activations };
-
-    return dx12_shader_dispatch(dev, cmd, dispatch,
-                                &qgc, sizeof(qgc), srvs, 2, result);
-}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Attention Q x K^T

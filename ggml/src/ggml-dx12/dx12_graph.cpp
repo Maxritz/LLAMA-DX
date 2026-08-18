@@ -8,7 +8,6 @@
 #include "dx12_shader.h"
 #include "dx12_gemm.h"
 #include "dx12_profiler.h"
-#include "dx12_quantize.h"
 #include "dx12_ring.h"
 #include "ggml-backend-dx12.h"
 #include <ggml-impl.h>

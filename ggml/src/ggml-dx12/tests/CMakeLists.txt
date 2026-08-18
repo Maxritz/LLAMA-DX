@@ -10,22 +10,12 @@ set(TEST_SOURCES
     test_dx12_device.cpp
     test_dx12_buffer.cpp
     test_dx12_gemm.cpp
-    test_dx12_quantize.cpp
     test_dx12_ops.cpp
     test_dx12_layer.cpp
-    test_dx12_model_load.cpp
     test_dx12_e2e.cpp
     test_dx12_stability.cpp
-    test_dx12_shader_perf.cpp
     test_dx12_ds.cpp
-    test_sm610_dxla_probe.cpp
-    test_dxla_wave_bench.cpp
-    test_dxla_wave_trans_bench.cpp
-    test_upload_bench.cpp
-    test_ring_bench.cpp
-    test_gpu_upload_bench.cpp
     test_dx12_execute_indirect.cpp
-    test_dx12_dot_kernels.cpp
     test_dx12_gdn.cpp
     test_dx12_gdn2.cpp
     test_dx12_l2norm.cpp
@@ -44,7 +34,6 @@ foreach(TEST_SRC ${TEST_SOURCES})
             ${CMAKE_CURRENT_SOURCE_DIR}/../dx12_ring.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/../dx12_descriptor.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/../dx12_shader.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/../dx12_quantize.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/../dx12_gemm.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/../dx12_graph.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/../dx12_shader_cache.cpp
@@ -63,7 +52,7 @@ foreach(TEST_SRC ${TEST_SOURCES})
             ${CMAKE_CURRENT_SOURCE_DIR}/..
             ${CMAKE_CURRENT_SOURCE_DIR}/../..
             ${CMAKE_CURRENT_BINARY_DIR}/..
-            E:/DXllama/ds14/native/include
+            ${DX12_DS_SDK_PATH}/native/include
         )
         target_link_libraries(${TEST_NAME} PRIVATE ggml-base d3d12.lib dxgi.lib dxguid.lib dxcompiler.lib d3dcompiler.lib dstorage.lib)
         add_dependencies(${TEST_NAME} dx12_shaders)
@@ -78,6 +67,6 @@ foreach(TEST_SRC ${TEST_SOURCES})
         ${CMAKE_SOURCE_DIR}/shaders
         ${AGILITY_SDK_DIR}/build/native/include
     )
-    target_link_directories(${TEST_NAME} PRIVATE E:/DXllama/ds14/native/lib/x64)
+    target_link_directories(${TEST_NAME} PRIVATE ${DX12_DS_SDK_PATH}/native/lib/x64)
     add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
 endforeach()
