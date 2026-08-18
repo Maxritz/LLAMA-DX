@@ -48,6 +48,9 @@ float dequant_at(uint row_base, uint k) {
         uint nib = (r < 16u) ? (byte_v & 0xFu) : (byte_v >> 4);
         return d * (float)((int)nib - 8);
     }
+    if (qt == 7u || qt == 8u) {
+        return dequant_fp4_at(A, qt, row_base, k);
+    }
     return dequant_kq(A, qt, row_base, k);
 }
 
@@ -57,6 +60,7 @@ uint row_bytes() {
     if (qt == 1u) return p.K * 2u;
     if (qt == 2u) return (p.K >> 5) * 34u;
     if (qt == 3u) return (p.K >> 5) * 18u;
+    if (qt == 7u || qt == 8u) return fp4_row_bytes(qt, p.K);
     uint blk = (qt == 4u) ? 144u : ((qt == 5u) ? 176u : 210u);
     return (p.K >> 8) * blk;
 }

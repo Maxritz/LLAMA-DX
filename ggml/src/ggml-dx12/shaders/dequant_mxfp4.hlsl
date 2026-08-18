@@ -55,22 +55,14 @@ float e8m0_half(uint x) {
     return asfloat((uint32_t)(x - 1u) << 23u);
 }
 
-// Standard UE4M3 byte -> float (ggml_ue4m3_to_fp32)
+// ggml_ue4m3_to_fp32 * 0.5 (values halved to match the kvalues_fp4 doubled
+// codebook). 0 and 0x7F -> 0; exp==0 -> m*2^-10; else (1+m/8)*2^(e-8).
 float ue4m3(uint x) {
-    if (x == 0xFFu) return asfloat(0x7F800000u);   // +inf
-    if (x == 0u)    return 0.0f;
-    uint sign = (x >> 7) & 1u;
-    uint exp  = (x >> 3) & 0xFu;
-    uint man  = x & 0x7u;
-    uint bits;
-    if (exp == 0u) {
-        bits = (sign << 31) | (man << 19);      // subnormal: m * 2^-14
-    } else if (exp == 0xFu) {
-        bits = (sign << 31) | 0x7F800000u;      // inf/nan
-    } else {
-        bits = (sign << 31) | ((exp + 112u) << 23) | (man << 19);  // (1+m/8) * 2^(e-14)
-    }
-    return asfloat(bits);
+    if (x == 0u || x == 0x7Fu) return 0.0f;
+    uint exp = (x >> 3) & 0xFu;
+    uint man = x & 0x7u;
+    if (exp == 0u) return (float)man * 0.0009765625f;
+    return (1.0f + (float)man / 8.0f) * exp2((float)exp - 8.0f);
 }
 
 [numthreads(256, 1, 1)]

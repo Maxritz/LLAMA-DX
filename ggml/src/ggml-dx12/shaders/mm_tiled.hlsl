@@ -94,6 +94,9 @@ float load_weight_scalar(uint n_g, uint k) {
         uint nib = (r < 16u) ? (byte_v & 0xFu) : (byte_v >> 4);
         return d * (float)((int)nib - 8);
     }
+    if (qt == 7u || qt == 8u) {
+        return dequant_fp4_at(A, qt, n_g * fp4_row_bytes(qt, params.K), k);
+    }
     uint blk_sz = (qt == 4u) ? 144u : ((qt == 5u) ? 176u : 210u);
     uint row_base = n_g * (params.K >> 8) * blk_sz;
     return dequant_kq(A, qt, row_base, k);
@@ -127,6 +130,33 @@ void load_a8(uint row_l, uint c0, uint n_g, uint k0) {
         for (uint e = 0; e < 8; e++) {
             uint nib = hi ? (b8[e] >> 4) : (b8[e] & 0xFu);
             A_t[row_l][c0 + e] = d * (float)((int)nib - 8);
+        }
+        return;
+    }
+    if (qt == 7u) {                       // mxfp4: 17-byte block per 32 elems
+        uint base = (n_g * (params.K >> 5) + (k0 >> 5)) * 17u;
+        float d = e8m0_half(kq_byte(A, base));
+        bool hi = (c0 >= 16u);
+        uint b8[8];
+        load_bytes8(base + 1u + (c0 & 15u), b8);
+        [unroll]
+        for (uint e = 0; e < 8; e++) {
+            uint nib = hi ? (b8[e] >> 4) : (b8[e] & 0xFu);
+            A_t[row_l][c0 + e] = (float)kvalues_fp4[nib] * d;
+        }
+        return;
+    }
+    if (qt == 8u) {                       // nvfp4: 36-byte block per 64 elems
+        uint base = (n_g * (params.K >> 6) + (k0 >> 6)) * 36u;
+        uint s = ((k0 >> 4) & 3u) + ((c0 >= 16u) ? 1u : 0u);
+        float d = ue4m3_half(kq_byte(A, base + s));
+        bool hi = ((c0 & 15u) >= 8u);
+        uint b8[8];
+        load_bytes8(base + 4u + s * 8u + (c0 & 7u), b8);
+        [unroll]
+        for (uint e = 0; e < 8; e++) {
+            uint nib = hi ? (b8[e] >> 4) : (b8[e] & 0xFu);
+            A_t[row_l][c0 + e] = (float)kvalues_fp4[nib] * d;
         }
         return;
     }

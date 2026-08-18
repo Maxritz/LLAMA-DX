@@ -7,10 +7,14 @@
  *
  * B_CHUNK = params.K (full K loaded at once, max 4096 for F32 input)
  * groupshared B_lds size = min(params.K, 4096) * 4 bytes (max 16 KB)
+ *
+ * qtype: 1 = F16, 7 = MXFP4 (dequant on read), 8 = NVFP4
  */
 
+#include "kquants.hlsli"
+
 struct MMParams {
-    uint M, N, K, pad;
+    uint M, N, K, qtype;
 };
 
 ConstantBuffer<MMParams> params : register(b0);
@@ -38,7 +42,8 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     bool valid = row < params.N;
 
     uint k_count = params.K;
-    uint row_offset = row * k_count * 2;  // byte offset to row in A (F16)
+    uint row_bytes = (params.qtype == 1u) ? k_count * 2u : fp4_row_bytes(params.qtype, k_count);
+    uint row_offset = row * row_bytes;
     float acc = 0.0f;
 
     // Walk K in windows; each window is cooperatively loaded into LDS,
@@ -57,9 +62,14 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         if (valid) {
             [loop]
             for (uint k = lane; k < win; k += DX12_WAVE_SIZE) {
-                uint addr = row_offset + (chunk + k) * 2;
-                uint w = A.Load(addr & ~3u);
-                float a = f16tof32((addr & 2u) ? (w >> 16) : w);
+                float a;
+                if (params.qtype == 1u) {
+                    uint addr = row_offset + (chunk + k) * 2;
+                    uint w = A.Load(addr & ~3u);
+                    a = f16tof32((addr & 2u) ? (w >> 16) : w);
+                } else {
+                    a = dequant_fp4_at(A, params.qtype, row_offset, chunk + k);
+                }
                 acc += a * B_lds[k];
             }
         }

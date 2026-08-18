@@ -93,4 +93,65 @@ float dequant_kq(RWByteAddressBuffer B, uint qtype, uint row_base, uint e) {
     return dequant_q6_K(B, row_base, e);
 }
 
+// ── MXFP4 / NVFP4 (qtype 7 / 8) ─────────────────────────────────────────────
+// E2M1-doubled codebook (kvalues_fp4), shared by both formats.
+//   MXFP4 block (17 B, 32 elems): { uint8 e; uint8 qs[16]; }
+//     d = e8m0_to_fp32_half(e)
+//     elem j      = codebook[qs[j] & 0xF] * d
+//     elem j + 16 = codebook[qs[j] >>  4] * d
+//   NVFP4 block (36 B, 64 elems): { uint8 d[4]; uint8 qs[32]; }
+//     sub-block s (0..3): d_s = ue4m3_to_fp32(d[s])   (ggml applies *0.5)
+//     elem s*16 + j      = codebook[qs[s*8+j] & 0xF] * d_s
+//     elem s*16 + j + 8  = codebook[qs[s*8+j] >>  4] * d_s
+static const int kvalues_fp4[16] = {
+     0,  1,  2,  3,  4,  6,  8, 12,
+     0, -1, -2, -3, -4, -6, -8,-12
+};
+
+// ggml_e8m0_to_fp32_half: x<2 -> 0x00200000<<x, else (x-1)<<23
+float e8m0_half(uint x) {
+    if (x < 2u) return asfloat(0x00200000u << x);
+    return asfloat((uint32_t)(x - 1u) << 23u);
+}
+
+// ggml_ue4m3_to_fp32 * 0.5 (values are halved to match the kvalues_fp4
+// doubled-codebook convention). 0 and 0x7F -> 0. exp==0 -> m*2^-10.
+float ue4m3_half(uint x) {
+    if (x == 0u || x == 0x7Fu) return 0.0f;
+    uint e = (x >> 3) & 0xFu;
+    uint m = x & 0x7u;
+    if (e == 0u) return (float)m * 0.0009765625f;
+    return (1.0f + (float)m / 8.0f) * exp2((float)e - 8.0f);
+}
+
+// Byte size of one weight row (row = K contiguous elements) for a 4-bit type.
+uint fp4_row_bytes(uint qtype, uint K) {
+    if (qtype == 7u) return (K >> 5) * 17u;   // mxfp4: 17 B per 32 elems
+    return (K >> 6) * 36u;                    // nvfp4: 36 B per 64 elems
+}
+
+// Per-element dequant. qtype 7 = mxfp4, 8 = nvfp4. row_base = byte offset of
+// this row's first element; e = element index within the row.
+float dequant_fp4_at(RWByteAddressBuffer B, uint qtype, uint row_base, uint e) {
+    if (qtype == 7u) {
+        uint block = e >> 5;
+        uint r = e & 31u;
+        uint base = row_base + block * 17u;
+        float d = e8m0_half(kq_byte(B, base));
+        uint j = r & 15u;
+        uint qb = kq_byte(B, base + 1u + j);
+        int c = (r < 16u) ? kvalues_fp4[qb & 0xFu] : kvalues_fp4[qb >> 4];
+        return (float)c * d;
+    }
+    uint block = e >> 6;
+    uint r = e & 63u;
+    uint s = r >> 4;
+    uint j = r & 15u;
+    uint base = row_base + block * 36u;
+    float d = ue4m3_half(kq_byte(B, base + s));
+    uint qb = kq_byte(B, base + 4u + s * 8u + (j & 7u));
+    int c = (j < 8u) ? kvalues_fp4[qb & 0xFu] : kvalues_fp4[qb >> 4];
+    return (float)c * d;
+}
+
 #endif // KQUANTS_HLSLI

@@ -486,21 +486,17 @@ static size_t dx12_buft_get_max_size(ggml_backend_buffer_type_t buft) {
 
 static size_t dx12_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor* tensor) {
     (void)buft;
-    // 4-bit types and K-quants with dequant-to-F16 enabled: allocate
-    // F16-sized buffers (dequant happens at upload, data is F16 in the
-    // buffer while tensor->type stays quantized for ggml stride math).
+    // K-quants with dequant-to-F16 enabled (env-opt-in): allocate F16-sized
+    // buffers (dequant happens at upload, data is F16 in the buffer while
+    // tensor->type stays quantized for ggml stride math).
     static bool s_dequant_f16 = []() {
         const char* env = getenv("DX12_DEQUANT_TO_F16");
         return env && env[0] == '1';
     }();
-    bool is_4bit = (tensor->type == GGML_TYPE_MXFP4 ||
-                    tensor->type == GGML_TYPE_NVFP4 ||
-                    tensor->type == GGML_TYPE_Q4_0_ROCMFP4 ||
-                    tensor->type == GGML_TYPE_Q4_0_ROCMFP4_FAST);
     bool is_kquant_type = (tensor->type == GGML_TYPE_Q4_K ||
                            tensor->type == GGML_TYPE_Q5_K ||
                            tensor->type == GGML_TYPE_Q6_K);
-    if (is_4bit || (s_dequant_f16 && is_kquant_type)) {
+    if (s_dequant_f16 && is_kquant_type) {
         return (size_t)ggml_nelements(tensor) * sizeof(ggml_fp16_t);
     }
     return ggml_nbytes(tensor);
@@ -611,28 +607,17 @@ static void dx12_buf_set_tensor(ggml_backend_buffer_t buf, ggml_tensor* tensor,
         return;
     }
 
-    // K-quant and 4-bit (MXFP4/NVFP4/ROCmFP4) weight tensors: dequantize to F16 on
-    // load. K-quants are opt-in via DX12_DEQUANT_TO_F16=1; the 4-bit types are
-    // ALWAYS dequantized here because the GEMM shaders have no fused on-the-fly
-    // path for them — uploading the raw 4-bit bytes and letting the dispatch
-    // fall through to the F16 selector consumed nibbles as F16 bit patterns,
-    // which is exactly the MXFP4 MoE corruption (garbage logits, runs of
-    // identical tokens).
+    // K-quant weight tensors: opt-in dequantize-to-F16 at load (env-gated).
+    // MXFP4/NVFP4 stay raw in the buffer — the GEMM shaders dequant them
+    // on-the-fly (qtype 7/8), matching every other quant type's layout.
     static bool s_dequant_f16 = []() {
         const char* env = getenv("DX12_DEQUANT_TO_F16");
         return env && env[0] == '1';
     }();
-    bool is_4bit = (tensor->type == GGML_TYPE_MXFP4 ||
-                    tensor->type == GGML_TYPE_NVFP4 ||
-                    tensor->type == GGML_TYPE_Q4_0_ROCMFP4 ||
-                    tensor->type == GGML_TYPE_Q4_0_ROCMFP4_FAST);
     bool is_kquant_type = (tensor->type == GGML_TYPE_Q4_K ||
                            tensor->type == GGML_TYPE_Q5_K ||
                            tensor->type == GGML_TYPE_Q6_K);
-    // 4-bit types ALWAYS dequant to F16 (no fused shader exists for them —
-    // raw nibbles read as F16 bit patterns were the MXFP4 corruption).
-    // K-quants only when env-opt-in (they have fused dequant shaders).
-    bool dequant_f16 = is_4bit || (s_dequant_f16 && is_kquant_type);
+    bool dequant_f16 = s_dequant_f16 && is_kquant_type;
     ggml_fp16_t* f16_buf = nullptr;
     size_t f16_size = 0;
     if (dequant_f16 && offset == 0) {
@@ -646,17 +631,9 @@ static void dx12_buf_set_tensor(ggml_backend_buffer_t buf, ggml_tensor* tensor,
             tt->to_float(data, tmp, ne);
         }
         ggml_fp32_to_fp16_row(tmp, f16_buf, ne);
-        dx12_log(DX12_LOG_INFO, "DEQUANT %s -> F16 (ne=%lld f16=%zu B, off=%zu) tmp[0..3]=%f %f %f %f",
-                 ggml_type_name(tensor->type), (long long)ne, f16_size, offset,
-                 tmp[0], tmp[1], tmp[2], tmp[3]);
         free(tmp);
         data = f16_buf;
         size = f16_size;
-        dx12_log(DX12_LOG_INFO, "DEQUANT %s -> F16 (ne=%lld f16=%zu B, off=%zu)",
-                 ggml_type_name(tensor->type), (long long)ne, f16_size, offset);
-        // NOTE: tensor->type stays Q4_K — GGML uses it for stride computation.
-        // The F16 data is only in the GPU buffer; dispatch routing must check
-        // the buffer allocation size (F16 == 3.5x quantized) to select the path.
     }
 
     void* mapped = dx12_buffer_map(ctx->gpu_buffer);
