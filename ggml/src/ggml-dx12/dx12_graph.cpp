@@ -47,6 +47,20 @@ static bool dx12_dims_fit_u32(const ggml_tensor* t) {
     return ggml_nbytes(t) < (size_t)UINT32_MAX;
 }
 
+// Byte span of a tensor in its buffer. 4-bit types are dequantized to F16 at
+// load (see dx12_buf_set_tensor), so their buffer span is the F16 size, not
+// ggml_nbytes (which follows the quantized type for stride math).
+static bool dx12_type_is_4bit(const ggml_tensor* t) {
+    return t->type == GGML_TYPE_MXFP4 ||
+           t->type == GGML_TYPE_NVFP4 ||
+           t->type == GGML_TYPE_Q4_0_ROCMFP4 ||
+           t->type == GGML_TYPE_Q4_0_ROCMFP4_FAST;
+}
+static size_t dx12_tensor_buffer_bytes(const ggml_tensor* t) {
+    return dx12_type_is_4bit(t) ? (size_t)ggml_nelements(t) * sizeof(ggml_fp16_t)
+                                : ggml_nbytes(t);
+}
+
 static bool dx12_mul_mat_is_fast2d(const ggml_tensor* dst);
 static bool dx12_dispatch_glu(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst);
 static bool dx12_dispatch_unary_impl(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst,
@@ -86,7 +100,10 @@ bool dx12_op_supported(const ggml_tensor* node) {
             if (as->type != GGML_TYPE_F32 && as->type != GGML_TYPE_F16 &&
                 as->type != GGML_TYPE_Q8_0 && as->type != GGML_TYPE_Q4_0 &&
                 as->type != GGML_TYPE_Q4_K && as->type != GGML_TYPE_Q5_K &&
-                as->type != GGML_TYPE_Q6_K) return false;
+                as->type != GGML_TYPE_Q6_K &&
+                as->type != GGML_TYPE_MXFP4 && as->type != GGML_TYPE_NVFP4 &&
+                as->type != GGML_TYPE_Q4_0_ROCMFP4 &&
+                as->type != GGML_TYPE_Q4_0_ROCMFP4_FAST) return false;
             if (!ggml_is_contiguous(as)) return false;
             if (b->type != GGML_TYPE_F32 || b->nb[0] != 4) return false;
             if (ids->type != GGML_TYPE_I32 || ids->nb[0] != 4) return false;
@@ -963,10 +980,10 @@ static bool dx12_run_mm(dx12_device* dev, dx12_command_list* cmd,
     uint64_t rlo[5], rhi[5];
     for (uint32_t i = 0; i < nsrc; i++) {
         rlo[i] = dispatch.srv_addr[i];
-        rhi[i] = rlo[i] + ggml_nbytes(srcs[i]);
+        rhi[i] = rlo[i] + dx12_tensor_buffer_bytes(srcs[i]);
     }
     rlo[nsrc] = dispatch.uav_addr;
-    rhi[nsrc] = rlo[nsrc] + ggml_nbytes(dst);
+    rhi[nsrc] = rlo[nsrc] + dx12_tensor_buffer_bytes(dst);
     dx12_barrier_pre_dispatch(cmd, cmd->barrier_tracker, bufs, mm_states, nsrc + 1,
                               rlo, rhi, 1u << nsrc);
 
@@ -1036,10 +1053,15 @@ static bool dx12_mul_mat_is_fast2d(const ggml_tensor* dst) {
     // Fast path (mv_*/mm_tiled) reads B as F32. F16 B (F16 KV cache, e.g. OV
     // attention matmul) routes to the strided mms path with b_f16 instead.
     if (b->type != GGML_TYPE_F32) return false;
+    // MXFP4/NVFP4/ROCmFP4 weights are dequantized to F16 at load (buffer
+    // holds F16), so they ride the F16 fast path here.
     return a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16 ||
            a->type == GGML_TYPE_Q8_0 || a->type == GGML_TYPE_Q4_0 ||
            a->type == GGML_TYPE_Q4_K || a->type == GGML_TYPE_Q5_K ||
-           a->type == GGML_TYPE_Q6_K;
+           a->type == GGML_TYPE_Q6_K ||
+           a->type == GGML_TYPE_MXFP4 || a->type == GGML_TYPE_NVFP4 ||
+           a->type == GGML_TYPE_Q4_0_ROCMFP4 ||
+           a->type == GGML_TYPE_Q4_0_ROCMFP4_FAST;
 }
 
 // Strided/batched mul_mat (attention QK/V over KV cache views, permuted srcs)
@@ -1192,6 +1214,16 @@ bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor
         case GGML_TYPE_Q4_K: shader_name = gemv ? (use_w64 ? "mv_kq_w64"   : "mv_kq")   : "mm_tiled"; kq_type = 4; break;
         case GGML_TYPE_Q5_K: shader_name = gemv ? (use_w64 ? "mv_kq_w64"   : "mv_kq")   : "mm_tiled"; kq_type = 5; break;
         case GGML_TYPE_Q6_K: shader_name = gemv ? (use_w64 ? "mv_kq_w64"   : "mv_kq")   : "mm_tiled"; kq_type = 6; break;
+        // MXFP4/NVFP4/ROCmFP4: dequantized to F16 at load, ride the F16 path.
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_NVFP4:
+        case GGML_TYPE_Q4_0_ROCMFP4:
+        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
+            shader_name = gemv ? (use_w64 ? "mv_f16_w64" : "mv_f16") : "mm_tiled";
+            kq_type = 1;
+            dx12_log(DX12_LOG_INFO, "MUL_MAT 4bit->F16: %s type=%s gemv=%d M=%u N=%u K=%u",
+                     shader_name, ggml_type_name(a->type), gemv, M, N, K);
+            break;
         default:
             dx12_log(DX12_LOG_ERROR, "MUL_MAT: unsupported weight type %s", ggml_type_name(a->type));
             return false;
@@ -1226,8 +1258,9 @@ bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS
         };
         uint64_t rlo[3] = { dispatch.srv_addr[0], dispatch.srv_addr[1], dispatch.uav_addr };
-        uint64_t rhi[3] = { rlo[0] + ggml_nbytes(a), rlo[1] + ggml_nbytes(b),
-                            rlo[2] + ggml_nbytes(dst) };
+        uint64_t rhi[3] = { rlo[0] + dx12_tensor_buffer_bytes(a),
+                            rlo[1] + dx12_tensor_buffer_bytes(b),
+                            rlo[2] + dx12_tensor_buffer_bytes(dst) };
         dx12_barrier_pre_dispatch(cmd, cmd->barrier_tracker, mm_bufs, mm_states, 3,
                                   rlo, rhi, 1u << 2);
     }
@@ -1494,6 +1527,12 @@ bool dx12_dispatch_mul_mat_id(dx12_device* dev, dx12_command_list* cmd, ggml_ten
         case GGML_TYPE_Q4_K: qtype = 4; break;
         case GGML_TYPE_Q5_K: qtype = 5; break;
         case GGML_TYPE_Q6_K: qtype = 6; break;
+        // Dequantized to F16 at load -> ride the F16 expert path.
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_NVFP4:
+        case GGML_TYPE_Q4_0_ROCMFP4:
+        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
+            qtype = 1; break;
         default:
             dx12_log(DX12_LOG_ERROR, "MUL_MAT_ID: unsupported weight type %s",
                      ggml_type_name(as->type));
@@ -1516,6 +1555,14 @@ bool dx12_dispatch_mul_mat_id(dx12_device* dev, dx12_command_list* cmd, ggml_ten
     p.d_nb1   = (uint32_t)dst->nb[1];
     p.d_nb2   = (uint32_t)dst->nb[2];
     p.w_nb2   = (uint32_t)as->nb[2];
+    // Dequantized 4-bit experts: buffer holds F16 (2 B/elem) but as->nb[2]
+    // still carries the quantized stride. Override with the F16 expert stride.
+    if (qtype == 1 && (as->type == GGML_TYPE_MXFP4 ||
+                       as->type == GGML_TYPE_NVFP4 ||
+                       as->type == GGML_TYPE_Q4_0_ROCMFP4 ||
+                       as->type == GGML_TYPE_Q4_0_ROCMFP4_FAST)) {
+        p.w_nb2 = (uint32_t)((size_t)as->ne[0] * as->ne[1] * sizeof(ggml_fp16_t));
+    }
 
     uint32_t n_slots = (uint32_t)(dst->ne[1] * dst->ne[2]);
     return dx12_run_mm(dev, cmd, "mv_id", &p, sizeof(p),
