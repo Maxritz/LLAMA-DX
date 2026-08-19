@@ -52,6 +52,9 @@ float dequant_at(uint row_base, uint k) {
     if (qt == 7u || qt == 8u) {
         return dequant_fp4_at(A, qt, row_base, k);
     }
+    if (qt == 11u) return dequant_q4_1(A, row_base, k);
+    if (qt == 12u) return dequant_q5_0(A, row_base, k);
+    if (qt == 13u) return dequant_q5_1(A, row_base, k);
     return dequant_kq(A, qt, row_base, k);
 }
 
@@ -61,7 +64,12 @@ uint row_bytes() {
     if (qt == 1u) return p.K * 2u;
     if (qt == 2u) return (p.K >> 5) * 34u;
     if (qt == 3u) return (p.K >> 5) * 18u;
+    if (qt == 11u) return (p.K >> 5) * 18u;
+    if (qt == 12u) return (p.K >> 5) * 22u;
+    if (qt == 13u) return (p.K >> 5) * 24u;
     if (qt == 7u || qt == 8u) return fp4_row_bytes(qt, p.K);
+    if (qt == 9u) return (p.K >> 8) * 84u;
+    if (qt == 10u) return (p.K >> 8) * 110u;
     uint blk = (qt == 4u) ? 144u : ((qt == 5u) ? 176u : 210u);
     return (p.K >> 8) * blk;
 }

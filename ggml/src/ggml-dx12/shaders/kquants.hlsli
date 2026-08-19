@@ -18,6 +18,12 @@ float kq_f16(RWByteAddressBuffer B, uint addr) {
     return f16tof32((addr & 2u) ? (w >> 16) : w);
 }
 
+float dequant_q2_K(RWByteAddressBuffer B, uint row_base, uint e);
+float dequant_q3_K(RWByteAddressBuffer B, uint row_base, uint e);
+float dequant_q4_1(RWByteAddressBuffer B, uint row_base, uint e);
+float dequant_q5_0(RWByteAddressBuffer B, uint row_base, uint e);
+float dequant_q5_1(RWByteAddressBuffer B, uint row_base, uint e);
+
 // get_scale_min_k4: 6-bit scale/min unpack from scales[12]
 void kq_scale_min(RWByteAddressBuffer B, uint sbase, uint j, out float sc, out float mn) {
     if (j < 4) {
@@ -90,7 +96,112 @@ float dequant_q6_K(RWByteAddressBuffer B, uint row_base, uint e) {
 float dequant_kq(RWByteAddressBuffer B, uint qtype, uint row_base, uint e) {
     if (qtype == 4u) return dequant_q4_K(B, row_base, e);
     if (qtype == 5u) return dequant_q5_K(B, row_base, e);
-    return dequant_q6_K(B, row_base, e);
+    if (qtype == 6u) return dequant_q6_K(B, row_base, e);
+    if (qtype == 9u) return dequant_q2_K(B, row_base, e);
+    if (qtype == 10u) return dequant_q3_K(B, row_base, e);
+    return 0.0f;
+}
+
+// ── Q4_1: 18 bytes/32. d f16@0, m f16@2, qs[16]@4 (4-bit) ──
+float dequant_q4_1(RWByteAddressBuffer B, uint row_base, uint e) {
+    uint blk = e >> 5;
+    uint r = e & 31u;
+    uint base = row_base + blk * 18u;
+    float d = kq_f16(B, base);
+    float m = kq_f16(B, base + 2);
+    uint q = kq_byte(B, base + 4 + (r >> 1));
+    uint nib = (r & 1u) ? (q >> 4) : (q & 0xFu);
+    return (float)nib * d + m;
+}
+
+// ── Q5_0: 22 bytes/32. d f16@0, qh[4]@2, qs[16]@6 (4-bit + 1 bit) ──
+float dequant_q5_0(RWByteAddressBuffer B, uint row_base, uint e) {
+    uint blk = e >> 5;
+    uint r = e & 31u;
+    uint base = row_base + blk * 22u;
+    float d = kq_f16(B, base);
+    uint qh = B.Load(base + 2 & ~3u) >> (((base + 2) & 3u) * 8u);
+    qh = qh | (B.Load((base + 2 & ~3u) + 4u) >> (((base + 2) & 3u) * 8u)) << 8u;
+    uint q = kq_byte(B, base + 6 + (r >> 1));
+    uint nib = (r & 1u) ? (q >> 4) : (q & 0xFu);
+    uint hi = (r & 1u) ? (((qh >> (12u + (r >> 1))) & 1u) << 4)
+                       : (((qh >> (r >> 1)) & 1u) << 4);
+    int val = (int)(nib | hi) - 16;
+    return d * (float)val;
+}
+
+// ── Q5_1: 24 bytes/32. d f16@0, m f16@2, qh[4]@4, qs[16]@8 (4-bit + 1 bit) ──
+float dequant_q5_1(RWByteAddressBuffer B, uint row_base, uint e) {
+    uint blk = e >> 5;
+    uint r = e & 31u;
+    uint base = row_base + blk * 24u;
+    float d = kq_f16(B, base);
+    float m = kq_f16(B, base + 2);
+    uint qh = B.Load(base + 4 & ~3u) >> (((base + 4) & 3u) * 8u);
+    qh = qh | (B.Load((base + 4 & ~3u) + 4u) >> (((base + 4) & 3u) * 8u)) << 8u;
+    uint q = kq_byte(B, base + 8 + (r >> 1));
+    uint nib = (r & 1u) ? (q >> 4) : (q & 0xFu);
+    uint hi = (r & 1u) ? (((qh >> (12u + (r >> 1))) & 1u) << 4)
+                       : (((qh >> (r >> 1)) & 1u) << 4);
+    return (float)(nib | hi) * d + m;
+}
+
+// ── Q2_K: 84 bytes/256. d f16@0, dmin f16@2, scales[16]@4, qs[64]@20 ──
+// Per 128-half: 8 scales (2 per 32-group j), q bytes packed 4x2-bit.
+float dequant_q2_K(RWByteAddressBuffer B, uint row_base, uint e) {
+    uint blk = e >> 8;
+    uint r = e & 255u;
+    uint base = row_base + blk * 84u;
+    float d    = kq_f16(B, base);
+    float dmin = kq_f16(B, base + 2);
+    uint n128 = r >> 7;
+    uint j    = (r >> 5) & 3u;
+    uint sub  = (r >> 4) & 1u;
+    uint l16  = r & 15u;
+    uint sc   = kq_byte(B, base + 4 + n128 * 8u + j * 2u + sub);
+    uint qb   = kq_byte(B, base + 20 + n128 * 32u + sub * 16u + l16);
+    uint shift = j * 2u;
+    int val   = (int)((qb >> shift) & 3u);
+    return d * (float)(sc & 0xFu) * (float)val - dmin * (float)(sc >> 4);
+}
+
+// ── Q3_K: 110 bytes/256. d f16@0, scales[12]@4, hmask[32]@16, qs[64]@48 ──
+// scales[12] unpacked via the kmask trick into 16 signed 6-bit scale bytes.
+float dequant_q3_K(RWByteAddressBuffer B, uint row_base, uint e) {
+    uint blk = e >> 8;
+    uint r = e & 255u;
+    uint base = row_base + blk * 110u;
+    float d = kq_f16(B, base);
+
+    const uint kmask1 = 0x03030303u;
+    const uint kmask2 = 0x0f0f0f0fu;
+    uint aux0 = kq_byte(B, base + 4)  | (kq_byte(B, base + 5)  << 8) |
+                (kq_byte(B, base + 6)  << 16) | (kq_byte(B, base + 7)  << 24);
+    uint aux1 = kq_byte(B, base + 8)  | (kq_byte(B, base + 9)  << 8) |
+                (kq_byte(B, base + 10) << 16) | (kq_byte(B, base + 11) << 24);
+    uint aux2 = kq_byte(B, base + 12) | (kq_byte(B, base + 13) << 8) |
+                (kq_byte(B, base + 14) << 16) | (kq_byte(B, base + 15) << 24);
+    uint tmp = aux2;
+    aux2 = ((aux0 >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+    uint aux3 = ((aux1 >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+    aux0 = (aux0 & kmask2) | (((tmp >> 0) & kmask1) << 4);
+    aux1 = (aux1 & kmask2) | (((tmp >> 2) & kmask1) << 4);
+
+    uint n128 = r >> 7;
+    uint j    = (r >> 5) & 3u;
+    uint sub  = (r >> 4) & 1u;
+    uint l16  = r & 15u;
+    uint is   = n128 * 8u + j * 2u + sub;
+    // scale byte = aux[is>>1] byte (is&1)
+    uint auxsel = (is >> 1) == 0u ? aux0 : ((is >> 1) == 1u ? aux1 : ((is >> 1) == 2u ? aux2 : aux3));
+    uint sc = (auxsel >> (((is & 1u)) * 8u)) & 0xFFu;
+    float dl = d * (float)((int)sc - 32);
+    uint qb = kq_byte(B, base + 48 + n128 * 32u + sub * 16u + l16);
+    uint hm = kq_byte(B, base + 16 + n128 * 32u + sub * 16u + l16);
+    uint shift = j * 2u;
+    uint mbit  = 1u << j;
+    int val = (int)((qb >> shift) & 3u) - ((hm & mbit) ? 0 : 4);
+    return dl * (float)val;
 }
 
 // ── MXFP4 / NVFP4 (qtype 7 / 8) ─────────────────────────────────────────────

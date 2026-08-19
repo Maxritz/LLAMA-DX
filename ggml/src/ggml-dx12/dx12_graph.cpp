@@ -95,6 +95,9 @@ bool dx12_op_supported(const ggml_tensor* node) {
                 as->type != GGML_TYPE_Q8_0 && as->type != GGML_TYPE_Q4_0 &&
                 as->type != GGML_TYPE_Q4_K && as->type != GGML_TYPE_Q5_K &&
                 as->type != GGML_TYPE_Q6_K &&
+                as->type != GGML_TYPE_Q2_K && as->type != GGML_TYPE_Q3_K &&
+                as->type != GGML_TYPE_Q4_1 && as->type != GGML_TYPE_Q5_0 &&
+                as->type != GGML_TYPE_Q5_1 &&
                 as->type != GGML_TYPE_MXFP4 && as->type != GGML_TYPE_NVFP4) return false;
             if (!ggml_is_contiguous(as)) return false;
             if (b->type != GGML_TYPE_F32 || b->nb[0] != 4) return false;
@@ -1060,6 +1063,9 @@ static bool dx12_mul_mat_is_fast2d(const ggml_tensor* dst) {
            a->type == GGML_TYPE_Q8_0 || a->type == GGML_TYPE_Q4_0 ||
            a->type == GGML_TYPE_Q4_K || a->type == GGML_TYPE_Q5_K ||
            a->type == GGML_TYPE_Q6_K ||
+           a->type == GGML_TYPE_Q2_K || a->type == GGML_TYPE_Q3_K ||
+           a->type == GGML_TYPE_Q4_1 || a->type == GGML_TYPE_Q5_0 ||
+           a->type == GGML_TYPE_Q5_1 ||
            a->type == GGML_TYPE_MXFP4 || a->type == GGML_TYPE_NVFP4;
 }
 
@@ -1192,6 +1198,11 @@ bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor
         case GGML_TYPE_Q4_K: shader_name = gemv ? (use_w64 ? "mv_kq_w64"   : "mv_kq")   : "mm_tiled"; kq_type = 4; break;
         case GGML_TYPE_Q5_K: shader_name = gemv ? (use_w64 ? "mv_kq_w64"   : "mv_kq")   : "mm_tiled"; kq_type = 5; break;
         case GGML_TYPE_Q6_K: shader_name = gemv ? (use_w64 ? "mv_kq_w64"   : "mv_kq")   : "mm_tiled"; kq_type = 6; break;
+        case GGML_TYPE_Q2_K: shader_name = gemv ? (use_w64 ? "mv_kq_w64"   : "mv_kq")   : "mm_tiled"; kq_type = 9; break;
+        case GGML_TYPE_Q3_K: shader_name = gemv ? (use_w64 ? "mv_kq_w64"   : "mv_kq")   : "mm_tiled"; kq_type = 10; break;
+        case GGML_TYPE_Q4_1: shader_name = gemv ? (use_w64 ? "mv_q4_0_w64" : "mv_q4_0") : "mm_tiled"; kq_type = 11; break;
+        case GGML_TYPE_Q5_0: shader_name = gemv ? (use_w64 ? "mv_kq_w64"   : "mv_kq")   : "mm_tiled"; kq_type = 12; break;
+        case GGML_TYPE_Q5_1: shader_name = gemv ? (use_w64 ? "mv_kq_w64"   : "mv_kq")   : "mm_tiled"; kq_type = 13; break;
         // MXFP4/NVFP4 dequant on-the-fly in the GEMM shaders (qtype 7/8);
         // the buffer holds raw 4-bit bytes like every other quant type.
         case GGML_TYPE_MXFP4: shader_name = gemv ? (use_w64 ? "mv_f16_w64" : "mv_f16") : "mm_tiled"; kq_type = 7; break;
@@ -1499,6 +1510,11 @@ bool dx12_dispatch_mul_mat_id(dx12_device* dev, dx12_command_list* cmd, ggml_ten
         case GGML_TYPE_Q4_K: qtype = 4; break;
         case GGML_TYPE_Q5_K: qtype = 5; break;
         case GGML_TYPE_Q6_K: qtype = 6; break;
+        case GGML_TYPE_Q2_K: qtype = 9; break;
+        case GGML_TYPE_Q3_K: qtype = 10; break;
+        case GGML_TYPE_Q4_1: qtype = 11; break;
+        case GGML_TYPE_Q5_0: qtype = 12; break;
+        case GGML_TYPE_Q5_1: qtype = 13; break;
         // MXFP4/NVFP4 dequant on-the-fly in mv_id (qtype 7/8).
         case GGML_TYPE_MXFP4: qtype = 7; break;
         case GGML_TYPE_NVFP4: qtype = 8; break;
@@ -1536,20 +1552,26 @@ bool dx12_dispatch_mul_mat_id(dx12_device* dev, dx12_command_list* cmd, ggml_ten
     if (dx12_expert_stream_get(dev, as, &stre) && stre.cache && dev->ds_ctx) {
         const dx12_buffer* ids_buf = dx12_backend_buffer_from_tensor(ids);
         uint64_t ids_gpu = dx12_backend_tensor_gpu_addr(ids);
-        if (!ids_buf || !ids_gpu) return false;
+        if (!ids_buf || !ids_gpu) {
+            dx12_log(DX12_LOG_ERROR, "MUL_MAT_ID stream: ids not bound");
+            return false;
+        }
 
-            uint32_t n_ids = p.n_used * n_slots;
-            if (n_ids > 0) {
-                // Read back the expert ids (small: n_used x n_tokens I32).
-                size_t ids_bytes = (size_t)n_ids * 4;
-                uint64_t ids_off = ids_gpu - ids_buf->gpu_address;
-                dx12_buffer* rb = dx12_buffer_create(dev, ids_bytes, dx12_heap_type::readback);
-                if (!rb) return false;
-                dx12_command_list* rcmd = dx12_cmd_list_create(dev);
-                dx12_buffer_transition(rcmd, (dx12_buffer*)ids_buf, D3D12_RESOURCE_STATE_COPY_SOURCE);
-                dx12_buffer_copy(rcmd, rb, 0, (dx12_buffer*)ids_buf, ids_off, ids_bytes);
-                dx12_cmd_list_submit_and_wait(rcmd);
-                const int32_t* got = (const int32_t*)dx12_buffer_map(rb);
+        uint32_t n_ids = p.n_used * n_slots;
+        if (n_ids > 0) {
+            // Read back the expert ids (small: n_used x n_tokens I32).
+            size_t ids_bytes = (size_t)n_ids * 4;
+            uint64_t ids_off = ids_gpu - ids_buf->gpu_address;
+            dx12_buffer* rb = dx12_buffer_create(dev, ids_bytes, dx12_heap_type::readback);
+            if (!rb) {
+                dx12_log(DX12_LOG_ERROR, "MUL_MAT_ID stream: rb alloc fail");
+                return false;
+            }
+            dx12_command_list* rcmd = dx12_cmd_list_create(dev);
+            dx12_buffer_transition(rcmd, (dx12_buffer*)ids_buf, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            dx12_buffer_copy(rcmd, rb, 0, (dx12_buffer*)ids_buf, ids_off, ids_bytes);
+            dx12_cmd_list_submit_and_wait(rcmd);
+            const int32_t* got = (const int32_t*)dx12_buffer_map(rb);
 
             // Unique expert ids this dispatch.
             uint32_t exp_ids[4096];
@@ -1565,11 +1587,19 @@ bool dx12_dispatch_mul_mat_id(dx12_device* dev, dx12_command_list* cmd, ggml_ten
             dx12_buffer_destroy(rb);
             dx12_cmd_list_destroy(rcmd);
 
+            dx12_log(DX12_LOG_INFO, "MUL_MAT_ID stream: n_ids=%u n_exp=%u first_ids={%u,%u,%u,%u,%u,%u,%u,%u}",
+                     n_ids, n_exp,
+                     n_exp > 0 ? exp_ids[0] : 999u, n_exp > 1 ? exp_ids[1] : 999u,
+                     n_exp > 2 ? exp_ids[2] : 999u, n_exp > 3 ? exp_ids[3] : 999u,
+                     n_exp > 4 ? exp_ids[4] : 999u, n_exp > 5 ? exp_ids[5] : 999u,
+                     n_exp > 6 ? exp_ids[6] : 999u, n_exp > 7 ? exp_ids[7] : 999u);
+
             if (n_exp > 0) {
                 uint64_t offsets[4096];
                 if (!dx12_expert_cache_ensure(stre.cache, dev->ds_ctx, exp_ids, n_exp,
                                               stre.file_base, stre.expert_stride,
                                               offsets, true)) {
+                    dx12_log(DX12_LOG_ERROR, "MUL_MAT_ID stream: expert_cache_ensure failed (n_exp=%u)", n_exp);
                     return false;
                 }
                 // Build the per-expert address table: table[e] = ring offset.

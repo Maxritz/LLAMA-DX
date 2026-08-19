@@ -97,7 +97,16 @@ float load_weight_scalar(uint n_g, uint k) {
     if (qt == 7u || qt == 8u) {
         return dequant_fp4_at(A, qt, n_g * fp4_row_bytes(qt, params.K), k);
     }
-    uint blk_sz = (qt == 4u) ? 144u : ((qt == 5u) ? 176u : 210u);
+    if (qt == 11u) {
+        return dequant_q4_1(A, n_g * (params.K >> 5) * 18u, k);
+    }
+    if (qt == 12u) {
+        return dequant_q5_0(A, n_g * (params.K >> 5) * 22u, k);
+    }
+    if (qt == 13u) {
+        return dequant_q5_1(A, n_g * (params.K >> 5) * 24u, k);
+    }
+    uint blk_sz = (qt == 4u) ? 144u : ((qt == 5u) ? 176u : ((qt == 6u) ? 210u : ((qt == 9u) ? 84u : 110u)));
     uint row_base = n_g * (params.K >> 8) * blk_sz;
     return dequant_kq(A, qt, row_base, k);
 }
@@ -233,8 +242,16 @@ void load_a8(uint row_l, uint c0, uint n_g, uint k0) {
         }
         return;
     }
-    if (qt == 1u) {                       // f16
-        // Fast path: one 16-byte Load4 (8 halves). Uniform conditions:
+    // New quants (Q2_K/Q3_K/Q4_1/Q5_0/Q5_1): per-element dequant fallback.
+    if (qt == 9u || qt == 10u || qt == 11u || qt == 12u || qt == 13u) {
+        [unroll]
+        for (uint e = 0; e < 8; e++) {
+            uint kk = k + e;
+            A_t[row_l][c0 + e] = (kk < params.K) ? load_weight_scalar(n_g, kk) : 0.0f;
+        }
+        return;
+    }
+    if (qt == 1u) {                       // f16        // Fast path: one 16-byte Load4 (8 halves). Uniform conditions:
         // K%8==0 keeps every row 16B-aligned; full slice must be in range.
         if ((params.K & 7u) == 0u && k0 + TILE_K <= params.K) {
             uint addr = (n_g * params.K + k) * 2;
