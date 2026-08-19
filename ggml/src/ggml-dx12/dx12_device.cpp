@@ -587,9 +587,11 @@ dx12_result dx12_device_create(int32_t adapter_index, dx12_device** out_device) 
     }
 #endif
 
-    // Create command queue — COMPUTE for diagnostic run (compute engine).
+    // Create command queue — DIRECT default, COMPUTE when DX12_FORCE_COMPUTE_LIST=1
     D3D12_COMMAND_QUEUE_DESC queue_desc{};
-    queue_desc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+    queue_desc.Type = dx12_use_compute_lists()
+        ? D3D12_COMMAND_LIST_TYPE_COMPUTE
+        : D3D12_COMMAND_LIST_TYPE_DIRECT;
     queue_desc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
     queue_desc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
     queue_desc.NodeMask = 0;
@@ -789,6 +791,17 @@ bool dx12_device_check_lost(dx12_device* dev) {
         return true;
     }
     return false;
+}
+
+bool dx12_use_compute_lists() {
+    // COMPUTE lists run shaders on the compute engine, but on RDNA4 the AMD
+    // driver wedges D3D12CreateDevice (0x887E0003) for later processes after
+    // one COMPUTE-list run until reboot. Default DIRECT (stable on both).
+    static const bool force = []() {
+        const char* e = getenv("DX12_FORCE_COMPUTE_LIST");
+        return e && atoi(e) == 1;
+    }();
+    return force;
 }
 
 void dx12_device_wait_idle(dx12_device* dev) {

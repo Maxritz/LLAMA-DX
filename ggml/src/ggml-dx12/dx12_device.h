@@ -161,6 +161,11 @@ bool dx12_device_check_lost(dx12_device* dev);
  */
 void dx12_device_wait_idle(dx12_device* dev);
 
+// True when DX12_FORCE_COMPUTE_LIST=1 (run shaders on the compute engine).
+// Default is DIRECT command lists: COMPUTE wedges the RDNA4 AMD driver for
+// later processes after one run until reboot.
+bool dx12_use_compute_lists();
+
 /**
  * dx12_device_wait_for_fence — Wait for specific fence value
  */

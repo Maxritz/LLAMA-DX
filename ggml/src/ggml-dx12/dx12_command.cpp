@@ -25,8 +25,12 @@ dx12_command_list* dx12_cmd_list_create(dx12_device* dev) {
         return nullptr;
     }
 
-    // COMPUTE list type — diagnostic run to capture validation errors.
-    D3D12_COMMAND_LIST_TYPE list_type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+    // Command list type: DIRECT by default (stable on RDNA2 + RDNA4).
+    // COMPUTE runs on the compute engine but wedges the RDNA4 driver for
+    // later processes; opt in via DX12_FORCE_COMPUTE_LIST=1.
+    D3D12_COMMAND_LIST_TYPE list_type = dx12_use_compute_lists()
+        ? D3D12_COMMAND_LIST_TYPE_COMPUTE
+        : D3D12_COMMAND_LIST_TYPE_DIRECT;
     HRESULT hr = dev->device->CreateCommandAllocator(
         list_type,
         IID_PPV_ARGS(&cmd->allocator));
@@ -101,7 +105,7 @@ bool dx12_cmd_list_reset(dx12_command_list* cmd) {
         // RDNA4 workaround: allocator->Reset() returns E_FAIL even after the
         // allocator has been used and GPU work has completed. Recreate the
         // allocator and command list from scratch instead.
-        D3D12_COMMAND_LIST_TYPE list_type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+        D3D12_COMMAND_LIST_TYPE list_type = dx12_use_compute_lists() ? D3D12_COMMAND_LIST_TYPE_COMPUTE : D3D12_COMMAND_LIST_TYPE_DIRECT;
         hr = cmd->device->device->CreateCommandAllocator(list_type, IID_PPV_ARGS(&cmd->allocator));
         if (FAILED(hr)) {
             dx12_log(DX12_LOG_ERROR, "cmd_list_reset: CreateCommandAllocator failed hr=0x%08X", hr);

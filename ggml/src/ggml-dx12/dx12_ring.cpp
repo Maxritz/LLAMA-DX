@@ -13,7 +13,7 @@ dx12_ring_context* dx12_ring_create(dx12_device* dev, uint32_t capacity) {
     ring->capacity = capacity;
     ring->slots.resize(capacity);
 
-    D3D12_COMMAND_LIST_TYPE list_type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+    D3D12_COMMAND_LIST_TYPE list_type = dx12_use_compute_lists() ? D3D12_COMMAND_LIST_TYPE_COMPUTE : D3D12_COMMAND_LIST_TYPE_DIRECT;
 
     for (uint32_t i = 0; i < capacity; i++) {
         auto& slot = ring->slots[i];
@@ -91,7 +91,7 @@ dx12_ring_slot* dx12_ring_acquire(dx12_ring_context* ring) {
     // E_INVALIDARG on some drivers. We never Reset a fresh allocator (it returns
     // E_FAIL on AMD RDNA4), just hand over the open list.
     if (slot.first_use) {
-        D3D12_COMMAND_LIST_TYPE list_type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+        D3D12_COMMAND_LIST_TYPE list_type = dx12_use_compute_lists() ? D3D12_COMMAND_LIST_TYPE_COMPUTE : D3D12_COMMAND_LIST_TYPE_DIRECT;
         HRESULT hr = ring->dev->device->CreateCommandAllocator(list_type, IID_PPV_ARGS(&slot.allocator));
         if (FAILED(hr)) {
             dx12_log(DX12_LOG_ERROR, "ring_acquire: first_create allocator failed hr=0x%08X", hr);
@@ -117,7 +117,7 @@ dx12_ring_slot* dx12_ring_acquire(dx12_ring_context* ring) {
         if (FAILED(hr)) {
             // RDNA4 workaround: allocator->Reset() may fail even after
             // use. Recreate allocator and command list from scratch.
-            D3D12_COMMAND_LIST_TYPE list_type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+            D3D12_COMMAND_LIST_TYPE list_type = dx12_use_compute_lists() ? D3D12_COMMAND_LIST_TYPE_COMPUTE : D3D12_COMMAND_LIST_TYPE_DIRECT;
             hr = ring->dev->device->CreateCommandAllocator(list_type, IID_PPV_ARGS(&slot.allocator));
             if (FAILED(hr)) {
                 dx12_log(DX12_LOG_ERROR, "ring_acquire: CreateCommandAllocator failed hr=0x%08X", hr);
@@ -138,7 +138,7 @@ dx12_ring_slot* dx12_ring_acquire(dx12_ring_context* ring) {
                 dx12_log(DX12_LOG_ERROR, "ring_acquire: cmd_list->Reset failed hr=0x%08X, recreating slot", hr);
                 slot.d3d_list.Reset();
                 slot.allocator.Reset();
-                D3D12_COMMAND_LIST_TYPE list_type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+                D3D12_COMMAND_LIST_TYPE list_type = dx12_use_compute_lists() ? D3D12_COMMAND_LIST_TYPE_COMPUTE : D3D12_COMMAND_LIST_TYPE_DIRECT;
                 hr = ring->dev->device->CreateCommandAllocator(list_type, IID_PPV_ARGS(&slot.allocator));
                 if (FAILED(hr)) {
                     dx12_log(DX12_LOG_ERROR, "ring_acquire: CreateCommandAllocator failed hr=0x%08X", hr);
