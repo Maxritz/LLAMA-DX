@@ -125,8 +125,8 @@ float dequant_iq2_xxs(RWByteAddressBuffer B, uint row_base, uint e) {
     [unroll]
     for (uint i = 0; i < 4; i++) a1 |= kq_byte(B, addr + 4u + i) << (i * 8u);
     uint grid_idx = (a0 >> (8u * l)) & 0xFFu;
-    uint64_t g = IQ2XXS_GRID[grid_idx];
-    float gv = (float)((g >> (8u * j)) & 0xFFu);
+    uint2 gr = IQ2XXS_GRID[grid_idx];
+    float gv = (float)((j < 4u) ? ((gr.x >> (8u * j)) & 0xFFu) : ((gr.y >> (8u * (j - 4u))) & 0xFFu));
     uint sign_idx = (a1 >> (7u * l)) & 127u;
     uint signs = KSIGNS_IQ2XS[sign_idx];
     float sgn = (signs & KMASK_IQ2XS[j]) ? -1.0f : 1.0f;
