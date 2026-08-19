@@ -1144,28 +1144,6 @@ bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor
     // Much better weight-read coalescing than the tiled kernel at M == 1.
     bool gemv = (M == 1) && ((N + 7) / 8 <= DX12_MAX_GROUPS);
 
-    // DXLA Wave path for F16 prefill (M > 1).
-    // GEMV (M == 1) stays on scalar mv_f16 — it's VRAM-bandwidth-bound,
-    // not compute-bound. DXLA wave's 16×16 tiles waste 15/16 lanes at M=1.
-    if (a->type == GGML_TYPE_F16 && dev->caps.dxla_wave && M > 1) {
-        dx12_buffer* buf_a = dx12_backend_buffer_from_tensor(a);
-        dx12_buffer* buf_b = dx12_backend_buffer_from_tensor(b);
-        dx12_buffer* buf_c = dx12_backend_buffer_from_tensor(dst);
-        if (!buf_a || !buf_b || !buf_c) return false;
-        dx12_gemm_params params{};
-        params.M = M;
-        params.N = N;
-        params.K = K;
-        params.quant_a = DX12_QUANT_F16;
-        params.quant_b = DX12_QUANT_F16;
-        params.alpha = 1.0f;
-        params.batch_count = 1;
-        params.transposed_b = false;
-        params.stride_a = K;
-        params.stride_b = K;
-        params.stride_c = N;
-        return dx12_gemm_dispatch_dxla_wave(dev, cmd, buf_a, buf_b, buf_c, &params);
-    }
     // Quantized DXLA wave paths (Q4_0/Q8_0/Q4_K) removed: those shaders read
     // ByteAddressBuffer with byte-address/4 and fill only 32/256 of the A tile
     // — garbage output and DEVICE_HUNG on -p 128 (see TRACE-gemv-direct-path-opt.md).
@@ -1192,7 +1170,8 @@ bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor
         case GGML_TYPE_F32:  shader_name = gemv ? (use_w64 ? "mv_f32_w64"  : "mv_f32")  : "mm_tiled"; kq_type = 0; break;
         case GGML_TYPE_F16:  shader_name = gemv ? (use_w64 ? "mv_f16_w64"  : "mv_f16")  : "mm_tiled"; kq_type = 1; break;
         case GGML_TYPE_Q8_0:
-            shader_name = gemv ? (use_w64 ? "mv_q8_0_w64" : "mv_q8_0") : "mm_tiled";
+            // Prefill uses the INT8 dot4 GEMM (2x FP32 rate on RDNA2/4).
+            shader_name = gemv ? (use_w64 ? "mv_q8_0_w64" : "mv_q8_0") : "mm_q8_0_dot4";
             kq_type = 2;
             break;
         case GGML_TYPE_Q4_0: shader_name = gemv ? (use_w64 ? "mv_q4_0_w64" : "mv_q4_0") : "mm_tiled"; kq_type = 3; break;
@@ -1274,7 +1253,7 @@ bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor
     }
 
     // mm_tiled: 64x64 C tile per 16x16 group; mm_kq (unused fallback): 16
-    uint32_t tile = (strcmp(shader_name, "mm_tiled") == 0) ? 64 : 16;
+    uint32_t tile = (strcmp(shader_name, "mm_tiled") == 0 || strcmp(shader_name, "mm_q8_0_dot4") == 0) ? 64 : 16;
     uint32_t tile_n = (N + tile - 1) / tile;
 
     D3D12_GPU_VIRTUAL_ADDRESS b_base = dispatch.srv_addr[1];

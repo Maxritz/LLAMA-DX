@@ -178,6 +178,8 @@ set(DX12_SHADERS
     mm_f32
     mm_f16
     mm_q8_0
+    mm_q8_0_dot4
+    dot4_probe
     mm_q4_0
     mm_tiled
     mms_f32
@@ -218,12 +220,6 @@ fwht_row
     gdn_ar
     argsort_desc
     sum_rows
-    # DXLA shaders — SM 6.10 (dx::linalg cooperative matrix)
-    mul_mat_dxla_wave_f16_f16
-    mul_mat_dxla_wave_q4_0_f16
-    mul_mat_dxla_tg_f16_f16
-    attn_qk_dxla
-    attn_ov_dxla
     soft_max
     silu
     gelu
@@ -266,6 +262,8 @@ set(DX12_SHADER_THREAD_GROUPS
     mm_f32,16,16,1
     mm_f16,16,16,1
     mm_q8_0,16,16,1
+    mm_q8_0_dot4,16,16,1
+    dot4_probe,1,1,1
     mm_q4_0,16,16,1
     mms_f32,16,16,1
     mms_f16,16,16,1
@@ -306,15 +304,6 @@ set(DX12_SHADER_THREAD_GROUPS
     gdn_ar,128,1,1
     argsort_desc,256,1,1
     sum_rows,256,1,1
-mul_mat_dxla_wave_f16_f16,32,1,1
-     mul_mat_dxla_wave_f16_f16_trans,32,1,1
-     mul_mat_dxla_wave_q4_0_f16,32,1,1
-     mul_mat_dxla_wave_q4_k_f16,32,1,1
-     mul_mat_dxla_wave_q6_k_f16,32,1,1
-     mul_mat_dxla_wave_q8_0_f16,32,1,1
-    mul_mat_dxla_tg_f16_f16,256,1,1
-    attn_qk_dxla,256,1,1
-    attn_ov_dxla,256,1,1
     soft_max,256,1,1
     silu,256,1,1
     gelu,256,1,1
@@ -339,22 +328,6 @@ mul_mat_dxla_wave_f16_f16,32,1,1
 set(DX12_CSO_FILES "")
 set(DX12_SHADER_NAMES "")
 set(DX12_CSO_ARRAYS "")
-
-# DXLA shaders require SM 6.10 for dx::linalg cooperative matrix
-set(DX12_SHADERS_DXLA
-    mul_mat_dxla_wave_f16_f16
-    mul_mat_dxla_wave_f16_f16_trans
-    mul_mat_dxla_wave_q4_0_f16
-    mul_mat_dxla_wave_q4_k_f16
-    mul_mat_dxla_wave_q6_k_f16
-    mul_mat_dxla_wave_q8_0_f16
-    mul_mat_dxla_tg_f16_f16
-    mul_mat_dxla_tg_q6_k_f16
-    attn_qk_dxla
-    attn_ov_dxla
-)
-# Remove DXLA shaders from main list (they get special compile rules)
-list(REMOVE_ITEM DX12_SHADERS ${DX12_SHADERS_DXLA})
 
 foreach(SHADER_NAME ${DX12_SHADERS})
     # _w64 suffix: compile the base .hlsl with DX12_WAVE_SIZE=64.
@@ -394,36 +367,6 @@ foreach(SHADER_NAME ${DX12_SHADERS})
     list(APPEND DX12_CSO_FILES ${CSO_FILE})
     
     # Build C array name list
-    string(REPLACE "." "_" ARRAY_NAME "cso_${SHADER_NAME}")
-    list(APPEND DX12_CSO_ARRAYS "${ARRAY_NAME}")
-    list(APPEND DX12_SHADER_NAMES "${SHADER_NAME}")
-endforeach()
-
-# DXLA shaders: cs_6_10 for dx::linalg cooperative matrix support
-foreach(SHADER_NAME ${DX12_SHADERS_DXLA})
-    set(HLSL_FILE ${DX12_SHADER_DIR}/${SHADER_NAME}.hlsl)
-    set(CSO_FILE ${DX12_CSO_DIR}/${SHADER_NAME}.cso)
-    
-    add_custom_command(
-        OUTPUT ${CSO_FILE}
-COMMAND ${DXC_EXECUTABLE}
-             -T cs_6_10
-             -E main
-             -enable-16bit-types
-             -O3
-             -Vd
-             -HV 2021
-             -I "${DX12_SHADER_DIR}"
-             -I "${DXC_INCLUDE_DIR}"
-             -Fo ${CSO_FILE}
-             ${HLSL_FILE}
-         DEPENDS ${HLSL_FILE} ${DX12_SHADER_DIR}/common.hlsli ${DX12_SHADER_DIR}/kquants.hlsli
-        COMMENT "Compiling DXLA ${SHADER_NAME}.hlsl -> ${SHADER_NAME}.cso (cs_6_10)"
-        VERBATIM
-    )
-    
-    list(APPEND DX12_CSO_FILES ${CSO_FILE})
-    
     string(REPLACE "." "_" ARRAY_NAME "cso_${SHADER_NAME}")
     list(APPEND DX12_CSO_ARRAYS "${ARRAY_NAME}")
     list(APPEND DX12_SHADER_NAMES "${SHADER_NAME}")

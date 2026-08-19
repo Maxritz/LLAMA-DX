@@ -185,8 +185,12 @@ bool dx12_shader_dispatch(dx12_device* dev,
         dx12_cmd_list_set_compute_root_unordered_access_view(cmd, uav_slot, dst_addr);
         if (dispatch.sig_type == dx12_root_signature_type::mm ||
             dispatch.sig_type == dx12_root_signature_type::gdn) {
-            // Fill spare UAV params so no root descriptor is left unset
-            for (uint32_t p = uav_slot + 1; p <= 6; p++) {
+            // Fill spare UAV params so no root descriptor is left unset.
+            // Bound is the signature's LAST param index (mm=5, gdn=7) —
+            // binding past it is out-of-bounds and hangs the GPU on
+            // COMPUTE command lists (AMD direct lists tolerated it).
+            uint32_t max_param = (dispatch.sig_type == dx12_root_signature_type::gdn) ? 7u : 5u;
+            for (uint32_t p = uav_slot + 1; p <= max_param; p++) {
                 dx12_cmd_list_set_compute_root_unordered_access_view(cmd, p, dst_addr);
             }
         }

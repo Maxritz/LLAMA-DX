@@ -25,14 +25,8 @@ dx12_command_list* dx12_cmd_list_create(dx12_device* dev) {
         return nullptr;
     }
 
-    // DIRECT is default. COMPUTE causes device removal (0x887A0001) on AMD RDNA4 + Agility SDK 1.721.1.
-    // Set DX12_FORCE_COMPUTE_LIST=1 to test COMPUTE list type for diagnostic purposes.
-    D3D12_COMMAND_LIST_TYPE list_type =
-#ifdef DX12_FORCE_COMPUTE_LIST
-        D3D12_COMMAND_LIST_TYPE_COMPUTE;
-#else
-        D3D12_COMMAND_LIST_TYPE_DIRECT;
-#endif
+    // COMPUTE list type — diagnostic run to capture validation errors.
+    D3D12_COMMAND_LIST_TYPE list_type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
     HRESULT hr = dev->device->CreateCommandAllocator(
         list_type,
         IID_PPV_ARGS(&cmd->allocator));
@@ -107,7 +101,7 @@ bool dx12_cmd_list_reset(dx12_command_list* cmd) {
         // RDNA4 workaround: allocator->Reset() returns E_FAIL even after the
         // allocator has been used and GPU work has completed. Recreate the
         // allocator and command list from scratch instead.
-        D3D12_COMMAND_LIST_TYPE list_type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        D3D12_COMMAND_LIST_TYPE list_type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
         hr = cmd->device->device->CreateCommandAllocator(list_type, IID_PPV_ARGS(&cmd->allocator));
         if (FAILED(hr)) {
             dx12_log(DX12_LOG_ERROR, "cmd_list_reset: CreateCommandAllocator failed hr=0x%08X", hr);

@@ -20,6 +20,7 @@ set(TEST_SOURCES
     test_dx12_gdn2.cpp
     test_dx12_l2norm.cpp
     test_dx12_argsort.cpp
+    test_dx12_q8dot4.cpp
 )
 
 foreach(TEST_SRC ${TEST_SOURCES})

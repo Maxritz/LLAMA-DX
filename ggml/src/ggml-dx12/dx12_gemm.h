@@ -25,18 +25,13 @@
 
 typedef enum {
     DX12_GEMM_STANDARD,       // Tile-based HLSL (Component 2 shaders)
-    DX12_GEMM_DXLA_WAVE,      // 16x16 wave-scope DXLA (SM 6.10)
-    DX12_GEMM_DXLA_TG,        // 32x32 threadgroup-scope DXLA
 } dx12_gemm_path;
 
 /**
  * dx12_select_gemm_path — Choose optimal GEMM implementation
  *
- * Considers:
- * - GPU capabilities (DXLA support, wave size)
- * - Matrix dimensions (small = wave, large = threadgroup)
- * - Quantization type (DXLA may not support all quant formats)
- * - User preference (can force standard path)
+ * DXLA (dx::linalg) removed; always standard. Production GEMMs go through
+ * the graph dispatch (mv_*, mm_tiled, mm_q8_0_dot4).
  */
 dx12_gemm_path dx12_select_gemm_path(dx12_device* dev,
                                       uint32_t M, uint32_t N, uint32_t K,
@@ -91,26 +86,6 @@ bool dx12_gemm_dispatch_standard(dx12_device* dev,
                                   dx12_buffer* matrix_b,
                                   dx12_buffer* result,
                                   const dx12_gemm_params* params);
-
-/**
- * dx12_gemm_dispatch_dxla_wave — Wave-scope DXLA GEMM (16x16 tiles)
- */
-bool dx12_gemm_dispatch_dxla_wave(dx12_device* dev,
-                                   dx12_command_list* cmd,
-                                   dx12_buffer* matrix_a,
-                                   dx12_buffer* matrix_b,
-                                   dx12_buffer* result,
-                                   const dx12_gemm_params* params);
-
-/**
- * dx12_gemm_dispatch_dxla_tg — ThreadGroup-scope DXLA GEMM (32x32 tiles)
- */
-bool dx12_gemm_dispatch_dxla_tg(dx12_device* dev,
-                                 dx12_command_list* cmd,
-                                 dx12_buffer* matrix_a,
-                                 dx12_buffer* matrix_b,
-                                 dx12_buffer* result,
-                                 const dx12_gemm_params* params);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Attention-Specific GEMMs

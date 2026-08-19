@@ -408,14 +408,6 @@ void dx12_detect_device_caps(dx12_device* dev) {
                                           &opts16, sizeof(opts16));
     dev->options16_available = SUCCEEDED(hr16);
 
-    // --- DXLA detection ---
-    // DX Linear Algebra - coarse tier check gates everything
-    D3D12_FEATURE_DATA_LINEAR_ALGEBRA_SUPPORT linalg{};
-    HRESULT hr_linalg = d->CheckFeatureSupport(D3D12_FEATURE_LINEAR_ALGEBRA_SUPPORT,
-                                                &linalg, sizeof(linalg));
-    bool has_linalg = SUCCEEDED(hr_linalg) &&
-                      linalg.LinearAlgebraTier >= D3D12_LINEAR_ALGEBRA_TIER_1_0;
-
     // Fill caps structure
     dx12_device_caps& c = dev->caps;
     memset(&c, 0, sizeof(c));
@@ -429,99 +421,6 @@ void dx12_detect_device_caps(dx12_device* dev) {
     c.resource_binding_tier = dev->options.ResourceBindingTier;
     c.gpu_upload_heap = dev->options16_available &&
                          opts16.GPUUploadHeapSupported;
-
-    // --- DXLA granular query ---
-    // DXLA granular query - per-scope, per-operation
-    if (has_linalg) {
-        // Wave-scope matrix multiply — two-step query (step1: count, step2: shapes)
-        {
-            D3D12_FEATURE_DATA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT wave_query{};
-            wave_query.OperationType = D3D12_LINEAR_ALGEBRA_OPERATION_TYPE_WAVE_MATRIX_MULTIPLY;
-            wave_query.WaveMatrixMultiply.Inputs.WaveSize = 32;
-            wave_query.WaveMatrixMultiply.Inputs.MatrixAComponentType = D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT16;
-            wave_query.WaveMatrixMultiply.Inputs.MatrixBComponentType = D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT16;
-            wave_query.WaveMatrixMultiply.Inputs.AccumulatorComponentType = D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT32;
-            wave_query.WaveMatrixMultiply.NumShapes = 0;
-            wave_query.WaveMatrixMultiply.Shapes = nullptr;
-
-            HRESULT hr_step1 = d->CheckFeatureSupport(
-                D3D12_FEATURE_LINEAR_ALGEBRA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT,
-                &wave_query, sizeof(wave_query));
-
-            dx12_log(DX12_LOG_INFO, "DXLA wave step1: hr=0x%08X flags=0x%X NumShapes=%u",
-                     hr_step1, wave_query.WaveMatrixMultiply.SupportFlags,
-                     wave_query.WaveMatrixMultiply.NumShapes);
-
-            c.dxla_wave = false;
-            if (SUCCEEDED(hr_step1) && wave_query.WaveMatrixMultiply.NumShapes > 0) {
-                uint32_t n = wave_query.WaveMatrixMultiply.NumShapes;
-                std::vector<D3D12_LINEAR_ALGEBRA_MATRIX_MULTIPLY_SHAPE> shapes(n);
-                wave_query.WaveMatrixMultiply.Shapes = shapes.data();
-                wave_query.WaveMatrixMultiply.NumShapes = n;
-
-                HRESULT hr_step2 = d->CheckFeatureSupport(
-                    D3D12_FEATURE_LINEAR_ALGEBRA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT,
-                    &wave_query, sizeof(wave_query));
-
-                dx12_log(DX12_LOG_INFO, "DXLA wave step2: hr=0x%08X flags=0x%X shapes=%u",
-                         hr_step2, wave_query.WaveMatrixMultiply.SupportFlags,
-                         wave_query.WaveMatrixMultiply.NumShapes);
-
-                c.dxla_wave = (wave_query.WaveMatrixMultiply.SupportFlags & D3D12_LINEAR_ALGEBRA_MULTIPLICATION_SUPPORT_FLAG_SUPPORTED) != 0;
-
-                uint32_t show_count = n < 8 ? n : 8u;
-                for (uint32_t i = 0; i < show_count; i++) {
-                    dx12_log(DX12_LOG_INFO, "  wave shape[%u]: M=%u N=%u K=%u",
-                             i, shapes[i].M, shapes[i].N, shapes[i].K);
-                }
-            }
-        }
-
-        // ThreadGroup-scope matrix multiply
-        {
-            D3D12_FEATURE_DATA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT tg_query{};
-            tg_query.OperationType = D3D12_LINEAR_ALGEBRA_OPERATION_TYPE_THREADGROUP_MATRIX_MULTIPLY;
-            tg_query.ThreadGroupMatrixMultiply.WaveInputs.WaveSize = 32;
-            tg_query.ThreadGroupMatrixMultiply.WaveInputs.MatrixAComponentType = D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT16;
-            tg_query.ThreadGroupMatrixMultiply.WaveInputs.MatrixBComponentType = D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT16;
-            tg_query.ThreadGroupMatrixMultiply.WaveInputs.AccumulatorComponentType = D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT32;
-            tg_query.ThreadGroupMatrixMultiply.Shape = { 64, 64, 64 };
-            HRESULT hr_tg = d->CheckFeatureSupport(D3D12_FEATURE_LINEAR_ALGEBRA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT,
-                                                    &tg_query, sizeof(tg_query));
-            c.dxla_threadgroup = SUCCEEDED(hr_tg) &&
-                (tg_query.ThreadGroupMatrixMultiply.SupportFlags & D3D12_LINEAR_ALGEBRA_MULTIPLICATION_SUPPORT_FLAG_SUPPORTED);
-        }
-
-        // Wave-scope INT8 matrix multiply — check if hardware supports it independently
-        {
-            D3D12_FEATURE_DATA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT i8_query{};
-            i8_query.OperationType = D3D12_LINEAR_ALGEBRA_OPERATION_TYPE_WAVE_MATRIX_MULTIPLY;
-            i8_query.WaveMatrixMultiply.Inputs.WaveSize = 32;
-            i8_query.WaveMatrixMultiply.Inputs.MatrixAComponentType = D3D12_LINEAR_ALGEBRA_DATATYPE_SINT8;
-            i8_query.WaveMatrixMultiply.Inputs.MatrixBComponentType = D3D12_LINEAR_ALGEBRA_DATATYPE_SINT8;
-            i8_query.WaveMatrixMultiply.Inputs.AccumulatorComponentType = D3D12_LINEAR_ALGEBRA_DATATYPE_SINT32;
-            i8_query.WaveMatrixMultiply.NumShapes = 0;
-            i8_query.WaveMatrixMultiply.Shapes = nullptr;
-
-            HRESULT hr_i8 = d->CheckFeatureSupport(
-                D3D12_FEATURE_LINEAR_ALGEBRA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT,
-                &i8_query, sizeof(i8_query));
-
-            dx12_log(DX12_LOG_INFO, "DXLA wave INT8: hr=0x%08X flags=0x%X NumShapes=%u",
-                     hr_i8, i8_query.WaveMatrixMultiply.SupportFlags,
-                     i8_query.WaveMatrixMultiply.NumShapes);
-
-            c.dxla_int8 = SUCCEEDED(hr_i8) &&
-                (i8_query.WaveMatrixMultiply.SupportFlags & D3D12_LINEAR_ALGEBRA_MULTIPLICATION_SUPPORT_FLAG_SUPPORTED);
-        }
-
-        // Component type support - derived from queries above (overridden for INT8)
-        c.dxla_f16 = true;
-        c.dxla_f32 = (c.vendor == DX12_VENDOR_NVIDIA);
-        c.dxla_bf16 = (c.vendor == DX12_VENDOR_INTEL) ||
-                       (c.vendor == DX12_VENDOR_NVIDIA);
-        c.dxla_int4 = (c.vendor == DX12_VENDOR_NVIDIA);
-    }
 
     // GPU info from adapter desc
     wcstombs(c.adapter_name, dev->adapter_desc.Description, sizeof(c.adapter_name) - 1);
@@ -579,10 +478,13 @@ dx12_result dx12_device_create(int32_t adapter_index, dx12_device** out_device) 
     if (!out_device) return DX12_ERROR_INVALID_ARGUMENT;
     *out_device = nullptr;
 
-    // --- SM 6.10 experimental features ---
-    // D3D12Core.dll is loaded before main() via D3D12SDKVersion export above.
-    // Required for dx::linalg cooperative matrix ops (Shader Model 6.10).
-    // Requires: Windows Developer Mode + Agility SDK 1.721+ + preview driver.
+    // --- SM 6.10 experimental features (DXLA dx::linalg) ---
+    // DISABLED by default: requires AMD_GPU_DEBUG_PREVIEW preview-driver mode.
+    // With that env var set but no Agility D3D12Core.dll bundled, the inbox
+    // d3d12.dll fails D3D12CreateDevice with 0x887E0003 (NOT_CURRENTLY_AVAILABLE)
+    // and the backend silently degrades (~10x slower). We target SM 6.7, so no
+    // SM 6.10 shaders are compiled. Define DX12_ENABLE_SM610 to re-enable.
+#ifdef DX12_ENABLE_SM610
     static bool s_features_enabled = false;
     if (!s_features_enabled) {
         _putenv_s("AMD_GPU_DEBUG_PREVIEW", "1");
@@ -595,6 +497,7 @@ dx12_result dx12_device_create(int32_t adapter_index, dx12_device** out_device) 
             dx12_log(DX12_LOG_WARN, "D3D12EnableExperimentalFeatures failed: 0x%08X", hr_exp);
         }
     }
+#endif
 
     // Enable debug layer in debug builds
 #ifdef DX12_DEBUG_LAYER
@@ -684,9 +587,9 @@ dx12_result dx12_device_create(int32_t adapter_index, dx12_device** out_device) 
     }
 #endif
 
-    // Create command queue
+    // Create command queue — COMPUTE for diagnostic run (compute engine).
     D3D12_COMMAND_QUEUE_DESC queue_desc{};
-    queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    queue_desc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
     queue_desc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
     queue_desc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
     queue_desc.NodeMask = 0;

@@ -51,6 +51,27 @@ targets. Concretely, as of this writing:
 - Several features (DirectStorage model loading, the FlashAttention-2-style tiled
   prefill kernel) are recent, single-machine-verified additions that haven't had the
   scrutiny of independent review or a wider range of hardware.
+- **Compute-engine dispatch (SM 6.7, no preview driver)**: all command lists and the
+  single command queue run as `D3D12_COMMAND_LIST_TYPE_COMPUTE` — shader work stays
+  on the compute engine, not the 3D engine. The AMD preview-driver path
+  (`AMD_GPU_DEBUG_PREVIEW` + `D3D12EnableExperimentalFeatures(SM 6.10)`) is now
+  gated behind `DX12_ENABLE_SM610` (default off) and must not be set without the
+  bundled Agility D3D12Core.dll, or device creation fails with 0x887E0003 and the
+  backend silently degrades ~10x. Targets SM 6.7 (`cs_6_6`) everywhere.
+- **Fixed out-of-bounds root parameter in the mm/gdn signatures**
+  (`dx12_shader.cpp`): the spare-UAV fill loop wrote root index 6 when the mm
+  signature only declares 6 params (0-5). Direct command lists tolerated it; the
+  COMPUTE command lists hang/reset the GPU on it. Bound is now per-signature
+  (mm=5, gdn=7).
+- **DXLA (dx::linalg) removed entirely**: the SM 6.10 cooperative-matrix shaders,
+  the wave/TG dispatch paths, and the feature-detection queries are gone. It
+  required the preview driver and was never dispatched in the default build.
+- **Q8_0 prefill now uses an INT8 dot4 GEMM** (`mm_q8_0_dot4.hlsl`): weights stay
+  packed int8, activations are quantized in-shader (per-8 chunk scale), and the
+  inner loop uses `dot4add_i8packed` (`v_dot4_i32_i8`, 2x FP32 rate on RDNA).
+  Measured +20% prefill on RDNA2 (RX 6700 XT: 2063 -> 2509 t/s pp128). Validated
+  against a CPU reference harness (`test_dx12_q8dot4.cpp`, 562/562 MUL_MAT in
+  `test-backend-ops`).
 - Upstream `llama.cpp`'s own contribution bar (see
   [AGENTS.md](AGENTS.md)/[CONTRIBUTING.md](CONTRIBUTING.md)) expects a maintainer to be
   able to review, integrate, and support a change indefinitely. This backend isn't at
