@@ -1538,17 +1538,18 @@ bool dx12_dispatch_mul_mat_id(dx12_device* dev, dx12_command_list* cmd, ggml_ten
         uint64_t ids_gpu = dx12_backend_tensor_gpu_addr(ids);
         if (!ids_buf || !ids_gpu) return false;
 
-        uint32_t n_ids = p.n_used * n_slots;
-        if (n_ids > 0) {
-            // Read back the expert ids (small: n_used x n_tokens I32).
-            size_t ids_bytes = (size_t)n_ids * 4;
-            dx12_buffer* rb = dx12_buffer_create(dev, ids_bytes, dx12_heap_type::readback);
-            if (!rb) return false;
-            dx12_command_list* rcmd = dx12_cmd_list_create(dev);
-            dx12_buffer_transition(rcmd, (dx12_buffer*)ids_buf, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            dx12_buffer_copy(rcmd, rb, 0, (dx12_buffer*)ids_buf, 0, ids_bytes);
-            dx12_cmd_list_submit_and_wait(rcmd);
-            const int32_t* got = (const int32_t*)dx12_buffer_map(rb);
+            uint32_t n_ids = p.n_used * n_slots;
+            if (n_ids > 0) {
+                // Read back the expert ids (small: n_used x n_tokens I32).
+                size_t ids_bytes = (size_t)n_ids * 4;
+                uint64_t ids_off = ids_gpu - ids_buf->gpu_address;
+                dx12_buffer* rb = dx12_buffer_create(dev, ids_bytes, dx12_heap_type::readback);
+                if (!rb) return false;
+                dx12_command_list* rcmd = dx12_cmd_list_create(dev);
+                dx12_buffer_transition(rcmd, (dx12_buffer*)ids_buf, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                dx12_buffer_copy(rcmd, rb, 0, (dx12_buffer*)ids_buf, ids_off, ids_bytes);
+                dx12_cmd_list_submit_and_wait(rcmd);
+                const int32_t* got = (const int32_t*)dx12_buffer_map(rb);
 
             // Unique expert ids this dispatch.
             uint32_t exp_ids[4096];

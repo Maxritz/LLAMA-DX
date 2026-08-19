@@ -28,8 +28,8 @@ ConstantBuffer<MvIdParams> p : register(b0);
 RWByteAddressBuffer A : register(u0);
 RWByteAddressBuffer B : register(u1);
 RWByteAddressBuffer I : register(u2);
-RWByteAddressBuffer C : register(u3);
-RWByteAddressBuffer T : register(u4); // expert -> byte offset in A (streamed mode)
+RWByteAddressBuffer T : register(u3); // expert -> byte offset in A (streamed mode)
+RWByteAddressBuffer C : register(u4);
 
 float dequant_at(uint row_base, uint k) {
     uint qt = p.qtype;
