@@ -97,7 +97,7 @@ bool dx12_op_supported(const ggml_tensor* node) {
                 as->type != GGML_TYPE_Q6_K &&
                 as->type != GGML_TYPE_Q2_K && as->type != GGML_TYPE_Q3_K &&
                 as->type != GGML_TYPE_Q4_1 && as->type != GGML_TYPE_Q5_0 &&
-                as->type != GGML_TYPE_Q5_1 &&
+                as->type != GGML_TYPE_Q5_1 && as->type != GGML_TYPE_IQ2_XXS &&
                 as->type != GGML_TYPE_MXFP4 && as->type != GGML_TYPE_NVFP4) return false;
             if (!ggml_is_contiguous(as)) return false;
             if (b->type != GGML_TYPE_F32 || b->nb[0] != 4) return false;
@@ -1065,7 +1065,7 @@ static bool dx12_mul_mat_is_fast2d(const ggml_tensor* dst) {
            a->type == GGML_TYPE_Q6_K ||
            a->type == GGML_TYPE_Q2_K || a->type == GGML_TYPE_Q3_K ||
            a->type == GGML_TYPE_Q4_1 || a->type == GGML_TYPE_Q5_0 ||
-           a->type == GGML_TYPE_Q5_1 ||
+           a->type == GGML_TYPE_Q5_1 || a->type == GGML_TYPE_IQ2_XXS ||
            a->type == GGML_TYPE_MXFP4 || a->type == GGML_TYPE_NVFP4;
 }
 
@@ -1203,6 +1203,7 @@ bool dx12_dispatch_mul_mat(dx12_device* dev, dx12_command_list* cmd, ggml_tensor
         case GGML_TYPE_Q4_1: shader_name = gemv ? (use_w64 ? "mv_q4_0_w64" : "mv_q4_0") : "mm_tiled"; kq_type = 11; break;
         case GGML_TYPE_Q5_0: shader_name = gemv ? (use_w64 ? "mv_kq_w64"   : "mv_kq")   : "mm_tiled"; kq_type = 12; break;
         case GGML_TYPE_Q5_1: shader_name = gemv ? (use_w64 ? "mv_kq_w64"   : "mv_kq")   : "mm_tiled"; kq_type = 13; break;
+        case GGML_TYPE_IQ2_XXS: shader_name = gemv ? (use_w64 ? "mv_kq_w64" : "mv_kq") : "mm_tiled"; kq_type = 14; break;
         // MXFP4/NVFP4 dequant on-the-fly in the GEMM shaders (qtype 7/8);
         // the buffer holds raw 4-bit bytes like every other quant type.
         case GGML_TYPE_MXFP4: shader_name = gemv ? (use_w64 ? "mv_f16_w64" : "mv_f16") : "mm_tiled"; kq_type = 7; break;
@@ -1515,6 +1516,7 @@ bool dx12_dispatch_mul_mat_id(dx12_device* dev, dx12_command_list* cmd, ggml_ten
         case GGML_TYPE_Q4_1: qtype = 11; break;
         case GGML_TYPE_Q5_0: qtype = 12; break;
         case GGML_TYPE_Q5_1: qtype = 13; break;
+        case GGML_TYPE_IQ2_XXS: qtype = 14; break;
         // MXFP4/NVFP4 dequant on-the-fly in mv_id (qtype 7/8).
         case GGML_TYPE_MXFP4: qtype = 7; break;
         case GGML_TYPE_NVFP4: qtype = 8; break;

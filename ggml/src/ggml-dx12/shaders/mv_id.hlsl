@@ -70,6 +70,7 @@ uint row_bytes() {
     if (qt == 7u || qt == 8u) return fp4_row_bytes(qt, p.K);
     if (qt == 9u) return (p.K >> 8) * 84u;
     if (qt == 10u) return (p.K >> 8) * 110u;
+    if (qt == 14u) return (p.K >> 8) * 66u;
     uint blk = (qt == 4u) ? 144u : ((qt == 5u) ? 176u : 210u);
     return (p.K >> 8) * blk;
 }

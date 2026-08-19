@@ -9,6 +9,8 @@
 #ifndef KQUANTS_HLSLI
 #define KQUANTS_HLSLI
 
+#include "iq_tables.hlsli"
+
 uint kq_byte(RWByteAddressBuffer B, uint addr) {
     return (B.Load(addr & ~3u) >> ((addr & 3u) * 8u)) & 0xFFu;
 }
@@ -23,6 +25,7 @@ float dequant_q3_K(RWByteAddressBuffer B, uint row_base, uint e);
 float dequant_q4_1(RWByteAddressBuffer B, uint row_base, uint e);
 float dequant_q5_0(RWByteAddressBuffer B, uint row_base, uint e);
 float dequant_q5_1(RWByteAddressBuffer B, uint row_base, uint e);
+float dequant_iq2_xxs(RWByteAddressBuffer B, uint row_base, uint e);
 
 // get_scale_min_k4: 6-bit scale/min unpack from scales[12]
 void kq_scale_min(RWByteAddressBuffer B, uint sbase, uint j, out float sc, out float mn) {
@@ -99,7 +102,36 @@ float dequant_kq(RWByteAddressBuffer B, uint qtype, uint row_base, uint e) {
     if (qtype == 6u) return dequant_q6_K(B, row_base, e);
     if (qtype == 9u) return dequant_q2_K(B, row_base, e);
     if (qtype == 10u) return dequant_q3_K(B, row_base, e);
+    if (qtype == 14u) return dequant_iq2_xxs(B, row_base, e);
     return 0.0f;
+}
+
+// ── IQ2_XXS: 66 bytes/256. d f16@0, qs[64]@2 (8 groups of 2 u32) ──
+// Codebook: iq2xxs_grid[256] x 8 bytes + ksigns_iq2xs.
+float dequant_iq2_xxs(RWByteAddressBuffer B, uint row_base, uint e) {
+    uint blk = e >> 8;
+    uint r = e & 255u;
+    uint base = row_base + blk * 66u;
+    float d = kq_f16(B, base);
+    uint ib32 = r >> 5;
+    uint r32  = r & 31u;
+    uint l = r32 >> 3;
+    uint j = r32 & 7u;
+
+    uint a0 = 0u, a1 = 0u;
+    uint addr = base + 2u + ib32 * 8u;
+    [unroll]
+    for (uint i = 0; i < 4; i++) a0 |= kq_byte(B, addr + i) << (i * 8u);
+    [unroll]
+    for (uint i = 0; i < 4; i++) a1 |= kq_byte(B, addr + 4u + i) << (i * 8u);
+    uint grid_idx = (a0 >> (8u * l)) & 0xFFu;
+    uint64_t g = IQ2XXS_GRID[grid_idx];
+    float gv = (float)((g >> (8u * j)) & 0xFFu);
+    uint sign_idx = (a1 >> (7u * l)) & 127u;
+    uint signs = KSIGNS_IQ2XS[sign_idx];
+    float sgn = (signs & KMASK_IQ2XS[j]) ? -1.0f : 1.0f;
+    float db = d * (0.5f + (float)(a1 >> 28)) * 0.25f;
+    return db * gv * sgn;
 }
 
 // ── Q4_1: 18 bytes/32. d f16@0, m f16@2, qs[16]@4 (4-bit) ──

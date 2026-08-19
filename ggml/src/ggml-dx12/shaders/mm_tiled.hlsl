@@ -106,7 +106,7 @@ float load_weight_scalar(uint n_g, uint k) {
     if (qt == 13u) {
         return dequant_q5_1(A, n_g * (params.K >> 5) * 24u, k);
     }
-    uint blk_sz = (qt == 4u) ? 144u : ((qt == 5u) ? 176u : ((qt == 6u) ? 210u : ((qt == 9u) ? 84u : 110u)));
+    uint blk_sz = (qt == 4u) ? 144u : ((qt == 5u) ? 176u : ((qt == 6u) ? 210u : ((qt == 9u) ? 84u : ((qt == 10u) ? 110u : 66u))));
     uint row_base = n_g * (params.K >> 8) * blk_sz;
     return dequant_kq(A, qt, row_base, k);
 }
@@ -242,8 +242,8 @@ void load_a8(uint row_l, uint c0, uint n_g, uint k0) {
         }
         return;
     }
-    // New quants (Q2_K/Q3_K/Q4_1/Q5_0/Q5_1): per-element dequant fallback.
-    if (qt == 9u || qt == 10u || qt == 11u || qt == 12u || qt == 13u) {
+    // New quants (Q2_K/Q3_K/Q4_1/Q5_0/Q5_1/IQ2_XXS): per-element fallback.
+    if (qt == 9u || qt == 10u || qt == 11u || qt == 12u || qt == 13u || qt == 14u) {
         [unroll]
         for (uint e = 0; e < 8; e++) {
             uint kk = k + e;
