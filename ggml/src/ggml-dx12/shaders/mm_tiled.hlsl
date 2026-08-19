@@ -148,7 +148,7 @@ void load_a8(uint row_l, uint c0, uint n_g, uint k0) {
     }
     if (qt == 8u) {                       // nvfp4: 36-byte block per 64 elems
         uint base = (n_g * (params.K >> 6) + (k0 >> 6)) * 36u;
-        uint s = ((k0 >> 4) & 3u) + ((c0 >= 16u) ? 1u : 0u);
+        uint s = ((k0 + c0) >> 4) & 3u;
         float d = ue4m3_half(kq_byte(A, base + s));
         bool hi = ((c0 & 15u) >= 8u);
         uint b8[8];
