@@ -106,7 +106,22 @@ float load_weight_scalar(uint n_g, uint k) {
     if (qt == 13u) {
         return dequant_q5_1(A, n_g * (params.K >> 5) * 24u, k);
     }
-    uint blk_sz = (qt == 4u) ? 144u : ((qt == 5u) ? 176u : ((qt == 6u) ? 210u : ((qt == 9u) ? 84u : ((qt == 10u) ? 110u : 66u))));
+    if (qt == 21u) {
+        return dequant_iq4_nl(A, n_g * (params.K >> 5) * 18u, k);
+    }
+    uint blk_sz = 136u;
+    if (qt == 4u) blk_sz = 144u;
+    else if (qt == 5u) blk_sz = 176u;
+    else if (qt == 6u) blk_sz = 210u;
+    else if (qt == 9u) blk_sz = 84u;
+    else if (qt == 10u) blk_sz = 110u;
+    else if (qt == 14u) blk_sz = 66u;
+    else if (qt == 15u) blk_sz = 74u;
+    else if (qt == 16u) blk_sz = 82u;
+    else if (qt == 17u) blk_sz = 98u;
+    else if (qt == 18u) blk_sz = 110u;
+    else if (qt == 19u) blk_sz = 50u;
+    else if (qt == 20u) blk_sz = 56u;
     uint row_base = n_g * (params.K >> 8) * blk_sz;
     return dequant_kq(A, qt, row_base, k);
 }
@@ -242,8 +257,8 @@ void load_a8(uint row_l, uint c0, uint n_g, uint k0) {
         }
         return;
     }
-    // New quants (Q2_K/Q3_K/Q4_1/Q5_0/Q5_1/IQ2_XXS): per-element fallback.
-    if (qt == 9u || qt == 10u || qt == 11u || qt == 12u || qt == 13u || qt == 14u) {
+    // IQ family + new quants: per-element fallback.
+    if (qt >= 9u) {
         [unroll]
         for (uint e = 0; e < 8; e++) {
             uint kk = k + e;
@@ -391,3 +406,4 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         }
     }
 }
+

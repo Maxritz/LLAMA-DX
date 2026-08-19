@@ -71,6 +71,14 @@ uint row_bytes() {
     if (qt == 9u) return (p.K >> 8) * 84u;
     if (qt == 10u) return (p.K >> 8) * 110u;
     if (qt == 14u) return (p.K >> 8) * 66u;
+    if (qt == 15u) return (p.K >> 8) * 74u;
+    if (qt == 16u) return (p.K >> 8) * 82u;
+    if (qt == 17u) return (p.K >> 8) * 98u;
+    if (qt == 18u) return (p.K >> 8) * 110u;
+    if (qt == 19u) return (p.K >> 8) * 50u;
+    if (qt == 20u) return (p.K >> 8) * 56u;
+    if (qt == 21u) return (p.K >> 5) * 18u;
+    if (qt == 22u) return (p.K >> 8) * 136u;
     uint blk = (qt == 4u) ? 144u : ((qt == 5u) ? 176u : 210u);
     return (p.K >> 8) * blk;
 }
@@ -111,3 +119,4 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         C.Store(n * 4u + u * p.d_nb1 + t * p.d_nb2, asuint(row_sum));
     }
 }
+
