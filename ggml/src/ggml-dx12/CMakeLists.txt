@@ -64,8 +64,9 @@ set(DX12_SOURCES
     dx12_gemm.cpp
     dx12_graph.cpp
     dx12_shader_cache.cpp
-    dx12_profiler.cpp
-    dx12_ds.cpp
+dx12_profiler.cpp
+dx12_ds.cpp
+dx12_expert_cache.cpp
 )
 
 set(DX12_HEADERS

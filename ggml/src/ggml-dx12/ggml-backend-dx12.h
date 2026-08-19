@@ -156,6 +156,26 @@ struct ggml_tensor;
 struct ggml_backend_reg* ggml_backend_dx12_reg(void);
 
 /**
+ * dx12_backend_register_expert_stream — Register a MoE weight tensor for
+ * on-demand per-expert streaming from the model file.
+ *
+ * Called by the model loader for expert tensors (ffn_gate_exps /
+ * ffn_up_exps / ffn_down_exps etc). The backend allocates a small GPU ring
+ * of `slots * expert_stride` bytes instead of relying on the full tensor
+ * being resident, and the MUL_MAT_ID dispatch fetches missing experts from
+ * the file via DirectStorage on demand (LRU eviction).
+ *
+ * @param backend        DX12 backend instance
+ * @param w              the MoE weight tensor (src0 of a MUL_MAT_ID)
+ * @param file_offset    byte offset of expert 0 in the model file
+ * @param expert_stride  bytes per expert slice (nbytes / n_experts)
+ */
+void dx12_backend_register_expert_stream(struct ggml_backend* backend,
+                                         struct ggml_tensor* w,
+                                         uint64_t file_offset,
+                                         uint64_t expert_stride);
+
+/**
  * ggml_backend_dx12_init — Create a DX12 backend instance
  *
  * @param adapter_index: GPU to use (0 = default/best, -1 = auto-select)

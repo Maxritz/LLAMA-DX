@@ -21,7 +21,7 @@
 struct MvIdParams {
     uint N, K, qtype, n_used;
     uint b_ne1, b_nb1, b_nb2, ids_nb1;
-    uint d_nb1, d_nb2, w_nb2, pad;
+    uint d_nb1, d_nb2, w_nb2, use_table;
 };
 
 ConstantBuffer<MvIdParams> p : register(b0);
@@ -29,6 +29,7 @@ RWByteAddressBuffer A : register(u0);
 RWByteAddressBuffer B : register(u1);
 RWByteAddressBuffer I : register(u2);
 RWByteAddressBuffer C : register(u3);
+RWByteAddressBuffer T : register(u4); // expert -> byte offset in A (streamed mode)
 
 float dequant_at(uint row_base, uint k) {
     uint qt = p.qtype;
@@ -79,7 +80,11 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     // expert id for this slot; ids element (u,t) at u*4 + t*ids_nb1
     uint e = I.Load(u * 4u + t * p.ids_nb1);
 
-    uint w_row_base = e * p.w_nb2 + n * row_bytes();
+    // Contiguous mode: expert e's base = e * w_nb2 (bytes per expert matrix).
+    // Streamed mode (use_table=1): base = T[e] = ring-buffer offset of the
+    // expert's slice (experts scatter across cache slots).
+    uint w_row_base = (p.use_table != 0u) ? T.Load(e * 4u) : (e * p.w_nb2);
+    w_row_base += n * row_bytes();
     uint b_base = (u % p.b_ne1) * p.b_nb1 + t * p.b_nb2;
 
     float acc = 0.0f;

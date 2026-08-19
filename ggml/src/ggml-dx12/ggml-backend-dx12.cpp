@@ -23,6 +23,7 @@
 #include "dx12_profiler.h"
 #include "dx12_ring.h"
 #include "dx12_ds.h"
+#include "dx12_expert_cache.h"
  
 #include <ggml.h>
 #include <ggml-backend.h>
@@ -1645,6 +1646,16 @@ ggml_backend_reg_t ggml_backend_dx12_reg(void) {
     }
 
     return &g_dx12_reg;
+}
+
+// ── On-demand expert streaming (loader hook) ──
+void dx12_backend_register_expert_stream(ggml_backend_t backend,
+                                         ggml_tensor* w,
+                                         uint64_t file_offset,
+                                         uint64_t expert_stride) {
+    auto* ctx = (ggml_backend_dx12_context*)backend->context;
+    if (!ctx || !ctx->device || !w) return;
+    dx12_expert_stream_register(ctx->device, w, file_offset, expert_stride);
 }
 
 GGML_BACKEND_DL_IMPL(ggml_backend_dx12_reg)

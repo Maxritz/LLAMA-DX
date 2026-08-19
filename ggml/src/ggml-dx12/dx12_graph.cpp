@@ -9,11 +9,15 @@
 #include "dx12_gemm.h"
 #include "dx12_profiler.h"
 #include "dx12_ring.h"
+#include "dx12_expert_cache.h"
 #include "ggml-backend-dx12.h"
 #include <ggml-impl.h>
 #include <atomic>
 #include <cstring>
 #include <cstdio>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 
 // Forward declarations
 static bool dx12_dispatch_mul_mat_fused_act(dx12_device* dev, dx12_command_list* cmd, ggml_tensor* dst, uint32_t act_op);
@@ -928,7 +932,9 @@ static bool dx12_run_mm(dx12_device* dev, dx12_command_list* cmd,
                         const char* shader, const void* cbv, size_t cbv_size,
                         const ggml_tensor* s0, const ggml_tensor* s1, const ggml_tensor* s2,
                         ggml_tensor* dst, uint32_t dx, uint32_t dy, uint32_t dz,
-                        const ggml_tensor* s3 = nullptr) {
+                        const ggml_tensor* s3 = nullptr,
+                        dx12_buffer* raw_s3 = nullptr,
+                        dx12_buffer* raw_s0 = nullptr) {
     // Empty tensors (e.g. zero-row views) produce zero-group dispatches,
     // which this driver does not tolerate — legal no-op instead.
     if (dx == 0 || dy == 0 || dz == 0) return true;
@@ -939,9 +945,17 @@ static bool dx12_run_mm(dx12_device* dev, dx12_command_list* cmd,
     uint32_t nsrc = 0;
 
     struct dx12_shader_dispatch dispatch{};
-    for (uint32_t i = 0; i < 4 && srcs[i]; i++) {
-        srv_bufs[i] = dx12_backend_buffer_from_tensor(srcs[i]);
-        dispatch.srv_addr[i] = dx12_backend_tensor_gpu_addr(srcs[i]);
+    for (uint32_t i = 0; i < 4 && (srcs[i] || (raw_s3 && i == 3) || (raw_s0 && i == 0)); i++) {
+        if (raw_s0 && i == 0) {
+            srv_bufs[i] = raw_s0;
+            dispatch.srv_addr[i] = raw_s0->gpu_address;
+        } else if (raw_s3 && i == 3) {
+            srv_bufs[i] = raw_s3;
+            dispatch.srv_addr[i] = raw_s3->gpu_address;
+        } else {
+            srv_bufs[i] = dx12_backend_buffer_from_tensor(srcs[i]);
+            dispatch.srv_addr[i] = dx12_backend_tensor_gpu_addr(srcs[i]);
+        }
         if (!srv_bufs[i] || !dispatch.srv_addr[i]) {
             dx12_log(DX12_LOG_ERROR, "%s: source %u not bound", shader, i);
             return false;
@@ -968,7 +982,7 @@ static bool dx12_run_mm(dx12_device* dev, dx12_command_list* cmd,
     uint64_t rlo[5], rhi[5];
     for (uint32_t i = 0; i < nsrc; i++) {
         rlo[i] = dispatch.srv_addr[i];
-        rhi[i] = rlo[i] + dx12_tensor_buffer_bytes(srcs[i]);
+        rhi[i] = rlo[i] + (raw_s3 && i == 3 ? raw_s3->size : dx12_tensor_buffer_bytes(srcs[i]));
     }
     rlo[nsrc] = dispatch.uav_addr;
     rhi[nsrc] = rlo[nsrc] + dx12_tensor_buffer_bytes(dst);
@@ -1497,7 +1511,7 @@ bool dx12_dispatch_mul_mat_id(dx12_device* dev, dx12_command_list* cmd, ggml_ten
     struct {
         uint32_t N, K, qtype, n_used;
         uint32_t b_ne1, b_nb1, b_nb2, ids_nb1;
-        uint32_t d_nb1, d_nb2, w_nb2, pad;
+        uint32_t d_nb1, d_nb2, w_nb2, use_table;
     } p{};
     p.N       = (uint32_t)as->ne[1];
     p.K       = (uint32_t)as->ne[0];
@@ -1512,6 +1526,81 @@ bool dx12_dispatch_mul_mat_id(dx12_device* dev, dx12_command_list* cmd, ggml_ten
     p.w_nb2   = (uint32_t)as->nb[2];
 
     uint32_t n_slots = (uint32_t)(dst->ne[1] * dst->ne[2]);
+
+    // ── On-demand expert streaming ──
+    // If the weight tensor was registered via dx12_backend_register_expert_stream,
+    // missing experts are fetched from the model file into the GPU ring cache
+    // (DirectStorage), then mv_id reads each expert from its ring slot through
+    // the address table instead of the contiguous tensor layout.
+    dx12_expert_stream_entry stre;
+    if (dx12_expert_stream_get(dev, as, &stre) && stre.cache && dev->ds_ctx) {
+        const dx12_buffer* ids_buf = dx12_backend_buffer_from_tensor(ids);
+        uint64_t ids_gpu = dx12_backend_tensor_gpu_addr(ids);
+        if (!ids_buf || !ids_gpu) return false;
+
+        uint32_t n_ids = p.n_used * n_slots;
+        if (n_ids > 0) {
+            // Read back the expert ids (small: n_used x n_tokens I32).
+            size_t ids_bytes = (size_t)n_ids * 4;
+            dx12_buffer* rb = dx12_buffer_create(dev, ids_bytes, dx12_heap_type::readback);
+            if (!rb) return false;
+            dx12_command_list* rcmd = dx12_cmd_list_create(dev);
+            dx12_buffer_transition(rcmd, (dx12_buffer*)ids_buf, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            dx12_buffer_copy(rcmd, rb, 0, (dx12_buffer*)ids_buf, 0, ids_bytes);
+            dx12_cmd_list_submit_and_wait(rcmd);
+            const int32_t* got = (const int32_t*)dx12_buffer_map(rb);
+
+            // Unique expert ids this dispatch.
+            uint32_t exp_ids[4096];
+            uint32_t n_exp = 0;
+            for (uint32_t i = 0; i < n_ids && n_exp < 4096; i++) {
+                int32_t e = got[i];
+                if (e < 0) continue;
+                bool seen = false;
+                for (uint32_t j = 0; j < n_exp; j++) if (exp_ids[j] == (uint32_t)e) { seen = true; break; }
+                if (!seen) exp_ids[n_exp++] = (uint32_t)e;
+            }
+            dx12_buffer_unmap(rb);
+            dx12_buffer_destroy(rb);
+            dx12_cmd_list_destroy(rcmd);
+
+            if (n_exp > 0) {
+                uint64_t offsets[4096];
+                if (!dx12_expert_cache_ensure(stre.cache, dev->ds_ctx, exp_ids, n_exp,
+                                              stre.file_base, stre.expert_stride,
+                                              offsets, true)) {
+                    return false;
+                }
+                // Build the per-expert address table: table[e] = ring offset.
+                uint32_t n_experts = (uint32_t)as->ne[2];
+                static std::unordered_map<dx12_device*, dx12_buffer*> g_tables;
+                static std::mutex g_table_mutex;
+                dx12_buffer* table = nullptr;
+                {
+                    std::lock_guard<std::mutex> lk(g_table_mutex);
+                    auto it = g_tables.find(dev);
+                    if (it == g_tables.end()) {
+                        table = dx12_buffer_create(dev, (size_t)n_experts * 4, dx12_heap_type::upload);
+                        g_tables[dev] = table;
+                    } else table = it->second;
+                }
+                if (!table) return false;
+                std::vector<uint32_t> tab((size_t)n_experts, 0u);
+                for (uint32_t i = 0; i < n_exp; i++) {
+                    if (exp_ids[i] < n_experts) tab[exp_ids[i]] = (uint32_t)offsets[i];
+                }
+                dx12_buffer_upload(table, tab.data(), (size_t)n_experts * 4);
+
+                p.use_table = 1;
+                return dx12_run_mm(dev, cmd, "mv_id", &p, sizeof(p),
+                                   as, b, ids, dst,
+                                   (p.N + 7) / 8, 1, n_slots,
+                                   nullptr, table, stre.cache->ring);
+            }
+        }
+    }
+    p.use_table = 0;
+
     return dx12_run_mm(dev, cmd, "mv_id", &p, sizeof(p),
                        as, b, ids, dst,
                        (p.N + 7) / 8, 1, n_slots);
