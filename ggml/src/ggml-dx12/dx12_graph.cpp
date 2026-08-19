@@ -357,15 +357,6 @@ bool dx12_op_supported(const ggml_tensor* node) {
         }
 
         case GGML_OP_GATED_DELTA_NET: {
-            // GDN on DX12 writes out of bounds (harness sentinel mismatch,
-            // garbage recurrent state corrupts qwen35 models). Disabled by
-            // default -> runs on CPU (correct, slower). DX12_ENABLE_GDN=1
-            // opts back in for debugging the gdn_ar kernel.
-            static const bool gdn_enabled = []() {
-                const char* env = getenv("DX12_ENABLE_GDN");
-                return env && env[0] == '1';
-            }();
-            if (!gdn_enabled) return false;
             const ggml_tensor* q    = node->src[0];
             const ggml_tensor* k    = node->src[1];
             const ggml_tensor* v    = node->src[2];
@@ -386,7 +377,8 @@ bool dx12_op_supported(const ggml_tensor* node) {
                 v->type != GGML_TYPE_F32 || g->type != GGML_TYPE_F32 ||
                 beta->type != GGML_TYPE_F32 || state->type != GGML_TYPE_F32) return false;
             if (node->type != GGML_TYPE_F32) return false;
-            if (v->ne[0] % 32 != 0 || v->ne[0] > 128) return false; // ROWS_PER_LANE=4 covers <=128
+            if (v->ne[0] % 32 != 0 || v->ne[0] > 256) return false; // ROWS_PER_LANE=8 covers <=256
+            if (q->ne[0] % 32 != 0 || q->ne[0] > 256) return false; // S_k bounds
             if (v->ne[2] % q->ne[2] != 0 || v->ne[3] % q->ne[3] != 0) return false;
             if (v->ne[1] % q->ne[1] != 0) return false;  // H_v % H_k == 0
             if (state->ne[0] != v->ne[0] || state->ne[1] != v->ne[0]) return false;
@@ -1979,8 +1971,8 @@ bool dx12_dispatch_gated_delta_net(dx12_device* dev, dx12_command_list* cmd, ggm
         }
     }
 
-    struct {
-        uint32_t S_v, H_v, n_k_head, n_tokens, n_seqs;
+     struct {
+        uint32_t S_v, S_k, H_v, n_k_head, n_tokens, n_seqs;
         uint32_t sq1, sq2, sq3;
         uint32_t sv1, sv2, sv3;
         uint32_t sg1, sg2, sg3;
@@ -1990,6 +1982,7 @@ bool dx12_dispatch_gated_delta_net(dx12_device* dev, dx12_command_list* cmd, ggm
         uint32_t pad;
     } p{};
     p.S_v      = (uint32_t)v->ne[0];
+    p.S_k      = (uint32_t)q->ne[0];
     p.H_v      = (uint32_t)v->ne[1];
     p.n_k_head = (uint32_t)q->ne[1];
     p.n_tokens = (uint32_t)v->ne[2];

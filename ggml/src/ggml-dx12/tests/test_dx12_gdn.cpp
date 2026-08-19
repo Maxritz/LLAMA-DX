@@ -104,7 +104,7 @@ int main() {
     auto* br = dx12_buffer_create(g_dev, gpu_bytes, dx12_heap_type::readback);
 
     struct {
-        uint32_t S_v, H_v, n_k_head, n_tokens, n_seqs;
+        uint32_t S_v, S_k, H_v, n_k_head, n_tokens, n_seqs;
         uint32_t sq1, sq2, sq3;
         uint32_t sv1, sv2, sv3;
         uint32_t sg1, sg2, sg3;
@@ -113,7 +113,7 @@ int main() {
         float scale;
         uint32_t pad;
     } p{};
-    p.S_v = S_v; p.H_v = H_v; p.n_k_head = H_k; p.n_tokens = n_tokens; p.n_seqs = n_seqs;
+    p.S_v = S_v; p.S_k = S_v; p.H_v = H_v; p.n_k_head = H_k; p.n_tokens = n_tokens; p.n_seqs = n_seqs;
     // contiguous tensors: q/k [S_v, H_k, nt, seq]
     p.sq1 = S_v; p.sq2 = S_v*H_k; p.sq3 = S_v*H_k*n_tokens;
     p.sv1 = S_v; p.sv2 = S_v*H_v; p.sv3 = S_v*H_v*n_tokens;

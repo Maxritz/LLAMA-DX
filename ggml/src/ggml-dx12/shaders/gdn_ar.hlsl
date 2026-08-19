@@ -16,7 +16,7 @@
  *     out[c]   = sum_i S[i][c] * q[i] * scale
  *
  * Thread mapping: one 32-lane wave per column c. Lane l owns rows
- * l, l+32, ... (ROWS_PER_LANE = S_v/32, up to 4 -> S_v <= 128). Row-dot
+ * l, l+32, ... (ROWS_PER_LANE = S_v/32, up to 8 -> S_v <= 256). Row-dot
  * reductions use WaveActiveSum. State stored transposed: block (seq,head)
  * is S_v*S_v floats, element (i,c) at [c*S_v + i].
  *
@@ -33,11 +33,11 @@
  * gid.x*4 + w.
  *
  * Constraints (op_supported): F32 q,k,v,g,beta,state contiguous rows,
- * g->ne[0]==1 (scalar gate), K==1, S_v % 32 == 0, S_v <= 128, n_tokens>=1.
+ * g->ne[0]==1 (scalar gate), K==1, S_v % 32 == 0, S_v <= 256, n_tokens>=1.
  */
 
 struct GdnParams {
-    uint  S_v, H_v, n_k_head, n_tokens, n_seqs;
+    uint  S_v, S_k, H_v, n_k_head, n_tokens, n_seqs;
     uint  sq1, sq2, sq3;       // q/k strides in floats (head/token/seq)
     uint  sv1, sv2, sv3;       // v strides
     uint  sg1, sg2, sg3;       // g strides
@@ -56,7 +56,7 @@ RWByteAddressBuffer B : register(u4);
 RWByteAddressBuffer S : register(u5);   // input state (in)
 RWByteAddressBuffer D : register(u6);   // output + new state tail
 
-#define ROWS_PER_LANE 4   // covers S_v up to 128 (32 lanes * 4)
+#define ROWS_PER_LANE 8   // covers S_v up to 256 (32 lanes * 8)
 
 [WaveSize(32)]
 [numthreads(128, 1, 1)]
@@ -81,7 +81,9 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     [unroll]
     for (uint r = 0; r < ROWS_PER_LANE; r++) {
         uint i = r * 32u + lane;
-        s_shard[r] = asfloat(S.Load((s_block + col * p.S_v + i) * 4u));
+        s_shard[r] = (i < p.S_v)
+            ? asfloat(S.Load((s_block + col * p.S_v + i) * 4u))
+            : 0.0f;
     }
 
     for (uint t = 0; t < p.n_tokens; t++) {
@@ -95,8 +97,12 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         [unroll]
         for (uint r = 0; r < ROWS_PER_LANE; r++) {
             uint i = r * 32u + lane;
-            k_reg[r] = asfloat(K.Load((q_base + i) * 4u));
-            q_reg[r] = asfloat(Q.Load((q_base + i) * 4u));
+            k_reg[r] = (i < p.S_k)
+                ? asfloat(K.Load((q_base + i) * 4u))
+                : 0.0f;
+            q_reg[r] = (i < p.S_k)
+                ? asfloat(Q.Load((q_base + i) * 4u))
+                : 0.0f;
         }
 
         float g_val = exp(asfloat(G.Load(g_base * 4u)));
@@ -137,6 +143,8 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     [unroll]
     for (uint r = 0; r < ROWS_PER_LANE; r++) {
         uint i = r * 32u + lane;
-        D.Store((ns_block + col * p.S_v + i) * 4u, asuint(s_shard[r]));
+        if (i < p.S_v) {
+            D.Store((ns_block + col * p.S_v + i) * 4u, asuint(s_shard[r]));
+        }
     }
 }
