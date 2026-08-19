@@ -1534,6 +1534,7 @@ bool llama_model_loader::load_all_data(
     bool (*ds_set_model_file)(ggml_backend_t, const char *) = nullptr;
     bool (*ds_load_tensor_async)(ggml_backend_t, struct ggml_tensor *, uint64_t, uint64_t, size_t) = nullptr;
     void (*ds_flush_and_wait)(ggml_backend_t) = nullptr;
+    void (*ds_register_expert_stream)(ggml_backend_t, struct ggml_tensor *, uint64_t, uint64_t) = nullptr;
     std::string ds_open_path;
 
     if (!use_mmap && !check_tensors) {
@@ -1544,6 +1545,7 @@ bool llama_model_loader::load_all_data(
             ds_set_model_file    = (decltype(ds_set_model_file))    ggml_backend_reg_get_proc_address(reg, "ggml_backend_dx12_set_model_file");
             ds_load_tensor_async = (decltype(ds_load_tensor_async)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dx12_load_tensor_async");
             ds_flush_and_wait    = (decltype(ds_flush_and_wait))    ggml_backend_reg_get_proc_address(reg, "ggml_backend_dx12_flush_and_wait");
+            ds_register_expert_stream = (decltype(ds_register_expert_stream)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dx12_register_expert_stream");
             if (ds_set_model_file && ds_load_tensor_async && ds_flush_and_wait) {
                 ds_backend = ggml_backend_dev_init(ds_dev, nullptr);
                 if (ds_backend) {
@@ -1557,6 +1559,20 @@ bool llama_model_loader::load_all_data(
             }
         }
     }
+
+    // On-demand expert streaming: a single tensor holding all MoE experts
+    // (Qwen-style ffn_*_exps, ne[2] == n_expert) is registered with the
+    // backend so the MUL_MAT_ID dispatch fetches only the working set from
+    // the file via DirectStorage. The full-tensor read/upload is skipped.
+    const uint32_t n_expert = [this]() -> uint32_t {
+        const int idx = gguf_find_key(metadata, llm_kv(LLM_KV_EXPERT_COUNT).c_str());
+        if (idx < 0) return 0;
+        return gguf_get_val_u32(metadata, idx);
+    }();
+    auto is_expert_matrix = [&](const ggml_tensor * t) -> bool {
+        return n_expert > 1 && t->ne[2] == (int64_t)n_expert &&
+               ds_backend && ds_register_expert_stream;
+    };
 
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         const auto * weight = get_weight(ggml_get_name(cur));
@@ -1572,6 +1588,18 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+
+        // Expert matrix tensor: register for on-demand streaming, skip the
+        // full read/upload. The dispatch fetches experts from the file on
+        // demand into the GPU ring cache.
+        if (is_expert_matrix(cur)) {
+            uint64_t expert_stride = n_size / (uint64_t)n_expert;
+            ds_register_expert_stream(ds_backend, cur, weight->offs, expert_stride);
+            size_done += n_size;
+            LLAMA_LOG_INFO("%s: streaming expert tensor '%s' (%zu MB, %u experts) on demand\n",
+                           __func__, ggml_get_name(cur), n_size >> 20, n_expert);
+            continue;
+        }
 
         if (use_mmap) {
             const auto & mapping = mappings.at(weight->idx);

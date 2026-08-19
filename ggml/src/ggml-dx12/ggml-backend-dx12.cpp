@@ -1621,6 +1621,9 @@ static void * dx12_reg_get_proc_address(ggml_backend_reg_t reg, const char * nam
     if (strcmp(name, "ggml_backend_dx12_set_model_file") == 0) {
         return (void*)ggml_backend_dx12_set_model_file;
     }
+    if (strcmp(name, "ggml_backend_dx12_register_expert_stream") == 0) {
+        return (void*)dx12_backend_register_expert_stream;
+    }
     return nullptr;
 }
 
