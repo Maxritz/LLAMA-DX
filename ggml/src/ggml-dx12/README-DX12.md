@@ -119,6 +119,16 @@ Op coverage (each verified via `test-backend-ops` before being claimed in
 Not yet implemented (CPU fallback): FLASH_ATTN_EXT, ALiBi softmax, K-quants (Q4_K etc. —
 those weight tensors are placed in CPU buffers automatically by llama.cpp), MoE ops.
 
+### GDN (GATED_DELTA_NET) on GPU
+
+GDN runs on the GPU when shapes meet `dx12_op_supported` constraints (F32
+tensors, `S_v % 32 == 0`, `S_v <= 256`, `K == 1`, scalar gate `g->ne[0] == 1`).
+Decode throughput on Qwen3.5-NVFP4 improved from ~12.6 t/s (CPU) to ~26.6 t/s (GPU).
+
+**Note:** GDN was previously disabled due to an out-of-bounds write in the old
+`gdn_ar` shader (no bounds checks when `S_v < 256`); the shader now has bounds
+checks and is re-enabled by default.
+
 ## 5. Execution model
 
 - **Honest `supports_op`:** the backend claims only op/shape/type combinations with a

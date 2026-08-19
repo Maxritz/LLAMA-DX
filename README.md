@@ -96,6 +96,13 @@ compute shaders:
   [Maxritz/llama.cpp-ROCM-Test](https://github.com/Maxritz/llama.cpp-ROCM-Test).
   Architecture-only — not DX12-specific, works on both backends (Vulkan recommended,
   see [Known open issues](#known-open-issues)).
+- **Full-GPU recurrent inference** via GDN (`GATED_DELTA_NET`) and SSM (`SSM_CONV`,
+  `SSM_SCAN`) kernels, so Qwen3.5-NVFP4, Mamba-2, and other recurrent models run
+  entirely on the GPU without CPU fallbacks for the recurrent layers. Decode
+  throughput on Qwen3.5-NVFP4 rose from ~12.6 t/s (GDN on CPU) to ~26.6 t/s (GDN on GPU).
+  GDN was previously disabled due to an out-of-bounds write in the old `gdn_ar`
+  shader; the shader now has bounds checks (`ROWS_PER_LINE=8`, `S_v <= 256`) and is
+  re-enabled by default.
 
 Shader model 6.10 / experimental features stay available but **DXLA (DirectX Linear
 Algebra) wave-matrix paths stay off by default** — the AMD preview driver used for
